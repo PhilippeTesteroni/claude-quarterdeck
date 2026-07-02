@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Rust fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Cargo test (deck-core + src-tauri, no GUI needed)
+        run: cargo test --workspace
+
+      - name: UI tests
+        run: npm run ui:test
+
+      - name: Build UI assets
+        run: npm run ui:build
+
+      - name: Tauri build (packaged artifacts, unsigned)
+        run: npm run build
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quarterdeck-${{ matrix.os }}
+          path: |
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.dmg
+            target/release/bundle/**/*.app
+          if-no-files-found: warn
+          retention-days: 14
