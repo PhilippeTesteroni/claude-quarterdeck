@@ -71,6 +71,10 @@ pub enum HooksConfigError {
     /// Filesystem error.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// Writing the merged settings back failed (e.g. the file is read-only or
+    /// open in another program). R-7.6: state what happened + the fix.
+    #[error("could not write {path}: {source}. The file may be read-only or open in another program — fix that, then try again.")]
+    Write { path: String, source: io::Error },
     /// Serializing the merged settings back to JSON failed.
     #[error("failed to serialize settings: {0}")]
     Serialize(serde_json::Error),
@@ -118,7 +122,7 @@ pub fn install_hooks(settings_path: &Path, command: &str) -> Result<HooksChange,
         return Ok(HooksChange::default());
     }
     let backup = create_backup(settings_path, &now_backup_ts(), BACKUP_KEEP)?;
-    write_settings_atomic(settings_path, &root)?;
+    write_or_rollback_backup(settings_path, &root, backup.as_deref())?;
     Ok(HooksChange {
         changed: true,
         backup,
@@ -142,13 +146,34 @@ pub fn uninstall_hooks(
         return Ok(HooksChange::default());
     }
     let backup = create_backup(settings_path, &now_backup_ts(), BACKUP_KEEP)?;
-    write_settings_atomic(settings_path, &root)?;
+    write_or_rollback_backup(settings_path, &root, backup.as_deref())?;
     Ok(HooksChange {
         changed: true,
         backup,
         events_added: Vec::new(),
         entries_removed,
     })
+}
+
+/// Atomically write `root` to `settings_path`; on failure, delete the backup we
+/// just created (`backup`) so a change that never landed doesn't leave an orphan
+/// backup behind — which, on repeated Install/Repair clicks against a read-only
+/// file, would otherwise pile up and consume the 3-slot rotation (R-4.1) for a
+/// config that was never modified.
+fn write_or_rollback_backup(
+    settings_path: &Path,
+    root: &Value,
+    backup: Option<&Path>,
+) -> Result<(), HooksConfigError> {
+    match write_settings_atomic(settings_path, root) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if let Some(b) = backup {
+                let _ = fs::remove_file(b);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Merge our hook entries into an already-parsed settings `root`, returning the
@@ -324,7 +349,12 @@ fn write_settings_atomic(path: &Path, root: &Value) -> Result<(), HooksConfigErr
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = fs::remove_file(&tmp);
-            Err(e.into())
+            // R-7.6: a bare "Access is denied. (os error 5)" doesn't tell the
+            // user what to do — wrap it with the target path and the fix.
+            Err(HooksConfigError::Write {
+                path: path.display().to_string(),
+                source: e,
+            })
         }
     }
 }

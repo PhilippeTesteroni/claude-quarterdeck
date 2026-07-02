@@ -227,6 +227,14 @@ fn anchor_near_tray(popup: &WebviewWindow, tray_rect: Rect) -> Result<(), String
 /// user takes focus explicitly on first click/Tab, per spec.
 pub fn show_ask_window(app: &AppHandle) -> Result<(), String> {
     let ask = ask_window(app)?;
+    // Already up: don't re-center + re-show on every enqueue. A rapid burst of
+    // asks otherwise thrashes WebView2 show()/center()/hide() churn (a native
+    // fault risk), and re-centering would also yank the window out from under a
+    // user who is mid-answer. The queue is FIFO and the window stays put (R-8.3);
+    // new asks surface via the pushed state snapshot + the "N more waiting" badge.
+    if ask.is_visible().unwrap_or(false) {
+        return Ok(());
+    }
     center_on_active_display(&ask)?;
     ask.show().map_err(|err| err.to_string())
 }
@@ -250,12 +258,27 @@ fn compute_center_position(
 }
 
 fn center_on_active_display(window: &WebviewWindow) -> Result<(), String> {
-    let cursor = window.cursor_position().map_err(|err| err.to_string())?;
-    let monitor = window
-        .monitor_from_point(cursor.x, cursor.y)
-        .map_err(|err| err.to_string())?
-        .or(window.current_monitor().map_err(|err| err.to_string())?)
-        .or(window.primary_monitor().map_err(|err| err.to_string())?);
+    // The cursor tells us which display the user is looking at, so the ask window
+    // centers there. But `cursor_position()` (Win32 `GetCursorPos`) *errors* when
+    // the process isn't attached to the active input desktop — a locked
+    // workstation (Win+L / secure desktop), an RDP-disconnected session, or a
+    // fast-user-switch. That is exactly the ask feature's target scenario (user
+    // runs long agents, steps away, LOCKS the screen). A `?` here would make that
+    // error fatal: `show_ask_window` would return `Err` before ever calling
+    // `ask.show()`, so the always-on-top ask window (R-8.3) would never appear.
+    // Treat a cursor error as "unknown display" and join the existing
+    // current/primary fallback chain instead of propagating.
+    let from_cursor = window
+        .cursor_position()
+        .ok()
+        .and_then(|cursor| window.monitor_from_point(cursor.x, cursor.y).ok().flatten());
+    let monitor = match from_cursor {
+        Some(monitor) => Some(monitor),
+        None => window
+            .current_monitor()
+            .map_err(|err| err.to_string())?
+            .or(window.primary_monitor().map_err(|err| err.to_string())?),
+    };
     let Some(monitor) = monitor else {
         return Ok(());
     };

@@ -1,14 +1,18 @@
 //! Session title derivation and project naming (SPEC §5). Title precedence
 //! (R-5.2), `<project>` = `basename(cwd)`, and Cyrillic/Unicode safety (R-5.3).
 //!
-//! All string handling is char-based, never byte-based, so multi-byte paths and
-//! prompts (Cyrillic, emoji) are never split mid-codepoint.
+//! All string handling is grapheme-cluster-based, never byte- or scalar-based,
+//! so multi-byte paths and prompts (Cyrillic, emoji) are never split
+//! mid-codepoint AND a compound glyph — a ZWJ emoji sequence (e.g. the family
+//! emoji), a flag, or a skin-tone-modified emoji, each several `char`s rendered
+//! as ONE cluster — is never severed mid-cluster.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Hard cap on a rendered title (R-5.2: "≤60 chars").
 pub const MAX_TITLE_CHARS: usize = 60;
@@ -40,18 +44,30 @@ pub fn project_name(cwd: Option<&str>) -> String {
 }
 
 /// Collapse all whitespace runs to single spaces, trim, and cap at
-/// [`MAX_TITLE_CHARS`] characters (appending `…` when truncated).
+/// [`MAX_TITLE_CHARS`] grapheme clusters (appending `…` when truncated).
 #[must_use]
 pub fn normalize_title(s: &str) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&collapsed, MAX_TITLE_CHARS)
+    truncate_graphemes(&collapsed, MAX_TITLE_CHARS)
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+/// Truncate `s` to at most `max` grapheme clusters, appending `…` when it was
+/// shortened. Grapheme-aware (not merely scalar-value-aware), so a compound
+/// glyph — a ZWJ emoji sequence (e.g. 👨‍👩‍👧‍👦, seven scalars rendered as one
+/// cluster), a regional-indicator flag, or a skin-tone-modified emoji — is never
+/// severed mid-cluster into a lone prefix or a dangling ZWJ (R-5.3 Unicode
+/// safety). Any whitespace exposed at the cut is trimmed before the ellipsis.
+/// Shared with the toast-body truncation in `src-tauri/notify.rs`.
+#[must_use]
+pub fn truncate_graphemes(s: &str, max: usize) -> String {
+    let clusters: Vec<&str> = s.graphemes(true).collect();
+    if clusters.len() <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let keep = max.saturating_sub(1);
+    let mut out: String = clusters[..keep].concat();
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
     out.push('…');
     out
 }

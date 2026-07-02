@@ -13,6 +13,8 @@
  * screenshot script for deterministic frames).
  */
 
+import { isTauri } from '@tauri-apps/api/core';
+
 import type {
   AskAnswerKind,
   AskRow,
@@ -197,6 +199,25 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
     hooksInstalled: false,
     settings: { ...defaultSettings(), onboardingDone: false, mcpEnabled: false, launchAtLogin: false },
     sessions: [],
+    asks: [],
+  }),
+  // Onboarding still incomplete for THIS data dir (e.g. a reinstall / new data
+  // dir) but hooks already work and sessions flow. The onboarding card must not
+  // stack above the live list (R-10.2); the list wins.
+  'onboarding-with-sessions': () => ({
+    hooksInstalled: true,
+    settings: { ...defaultSettings(), onboardingDone: false },
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Wire the composition root',
+        status: 'working',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(12),
+      }),
+    ],
     asks: [],
   }),
   cyrillic: () => ({
@@ -459,6 +480,17 @@ export function _mockAnswerAsk(askId: string, answer: string, kind: AskAnswerKin
 
 export function _mockScenarioNames(): string[] {
   return Object.keys(SCENARIOS);
+}
+
+// Test-only headless hooks for the Playwright e2e harness, attached only in mock
+// mode (no Tauri host). The suite uses `answerAsk` to drive an unrelated
+// `deck://state` push (answering a queued, non-primary ask) and prove a
+// re-render preserves an in-progress ask answer + focus (R-8).
+if (!isTauri()) {
+  (window as unknown as { __qdMock?: Record<string, unknown> }).__qdMock = {
+    answerAsk: _mockAnswerAsk,
+    scenarioNames: _mockScenarioNames,
+  };
 }
 
 // --- Background timeline (visual storytelling for manual dev use) ---------

@@ -126,4 +126,15 @@ test.describe('onboarding card (R-10.2)', () => {
     // No sessions in the `onboarding` fixture -> lands on the empty state.
     await expect(page.locator('.qd-empty-title')).toBeVisible();
   });
+
+  test('does not stack the onboarding card above a populated session list (R-10.2)', async ({ page }) => {
+    // onboardingDone is still false for this data dir, but hooks already work and
+    // a session is flowing. The card must NOT render over the live list (that
+    // contradicts its own "Install hooks so sessions show up here" copy); the
+    // list wins.
+    await gotoPopup(page, 'onboarding-with-sessions');
+    await expect(page.locator('.qd-onboarding')).toHaveCount(0);
+    await expect(page.locator('.qd-row-project')).toHaveText('quarterdeck');
+    await expect(page.locator('#qd-footer')).not.toHaveCSS('display', 'none');
+  });
 });

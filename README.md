@@ -82,7 +82,7 @@ toast and a distinct, harder-to-miss "needs you" alert.
    - **Install hooks** — required for sessions to show up at all (see below).
    - **Launch at login?** — explicit yes/no, off by default.
    - **Enable agent questions** — sets up the MCP tool so agents can ask you
-     things (see [Agent questions](#agent-channel)).
+     things (see [Agent questions](#agent-questions-ask-channel)).
 
    You can run every one of these later from the gear icon → Settings.
 

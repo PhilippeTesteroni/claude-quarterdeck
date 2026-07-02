@@ -5,6 +5,7 @@
 //! placeholder for [`build`] + [`update`] during composition.)
 
 use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::AppHandle;
 
@@ -13,6 +14,9 @@ use crate::windows;
 
 /// Id of the single tray icon Quarterdeck runs.
 pub const TRAY_ID: &str = "quarterdeck-tray";
+
+/// Menu id of the tray "Quit Quarterdeck" item.
+const QUIT_MENU_ID: &str = "quarterdeck-quit";
 
 /// Worst-of aggregate tray status (SPEC §1, R-2.6): red > yellow > green >
 /// gray. Gray also covers "no sessions" and "sessions exist but all are
@@ -70,9 +74,31 @@ impl TrayStatus {
 /// once at startup by T7's composition in `lib.rs`; icon/tooltip updates
 /// afterwards go through [`update`].
 pub fn build(app: &AppHandle) -> tauri::Result<TrayIcon> {
+    // Right-click context menu with an explicit Quit (critical): the popup/ask
+    // WebView2 windows share one machine-global user-data profile
+    // (`%LOCALAPPDATA%\pro.philippgross.quarterdeck\EBWebView`, one browser
+    // process per profile). Without an in-app Quit, a user who wants to restart
+    // Quarterdeck can only kill it from Task Manager — and an immediate relaunch
+    // races that still-exiting WebView2 process ("The requested resource is in
+    // use", 0x800700AA), leaving both windows permanently uncreatable and the
+    // tray silently dead. `app.exit(0)` shuts the app down cleanly so WebView2
+    // releases the profile before any relaunch. (The single-instance guard in
+    // `lib.rs` already prevents the concurrent-launch variant.)
+    let quit = MenuItem::with_id(app, QUIT_MENU_ID, "Quit Quarterdeck", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&quit])?;
+
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(TrayStatus::Gray.icon())
         .tooltip(tooltip_for(&Counts::default()))
+        .menu(&menu)
+        // Left-click still toggles the popup (below); the menu is right-click only.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id.as_ref() == QUIT_MENU_ID {
+                tracing::info!("quit requested from tray menu");
+                app.exit(0);
+            }
+        })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,

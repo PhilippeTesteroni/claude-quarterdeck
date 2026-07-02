@@ -248,7 +248,18 @@ $env:QUARTERDECK_CLAUDE_DIR = $smokeClaudeDir
 5. **Read `$smokeDataDir\logs\quarterdeck.log`** — confirm it exists, is
    rotating-sized-capped (R-10.4), and has no `ERROR`-level lines from the
    session you just ran (`WARN`s about e.g. a best-effort skill/MCP step
-   failing are fine to eyeball, `ERROR`s are not).
+   failing are fine to eyeball, `ERROR`s are not). One benign exception to
+   filter out: Tauri's own asset resolver logs `ERROR asset not found:
+   favicon.ico` once per window (WebView2 auto-requests a default favicon our
+   pages don't declare) on *every* healthy boot — it is framework noise, not a
+   Quarterdeck fault. Grep excluding it, e.g.:
+
+   ```powershell
+   Select-String -Path $smokeDataDir\logs\quarterdeck.log -Pattern ERROR |
+     Where-Object { $_.Line -notmatch 'favicon\.ico' }
+   ```
+
+   Any *other* `ERROR` line is a real problem.
 
 6. Tear down: close Quarterdeck, `claude mcp remove --scope user quarterdeck`
    if step 3 registered it globally instead of into the isolated dir (check

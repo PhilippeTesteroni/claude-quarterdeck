@@ -17,14 +17,31 @@ let latest: StateSnapshot | null = null;
 let countdownEl: HTMLElement | null = null;
 let countdownTarget: number | null = null;
 let freeTextInput: HTMLInputElement | null = null;
+/** Id of the ask currently rendered, so a re-render of the SAME ask (triggered
+ * by an unrelated session's `deck://state` push) can restore the in-progress
+ * free-text answer + focus instead of wiping it (R-8). */
+let renderedAskId: string | null = null;
 
 function findSession(sessions: SessionRow[], id?: string): SessionRow | undefined {
   if (!id) return undefined;
   return sessions.find((s) => s.id === id);
 }
 
+/** Ask ids already answered from this window, so a second answer for the SAME
+ * ask (a stray double-click on an option, or a click racing a leftover Enter in
+ * the free-text field) is dropped. Both answer_ask calls would write the same
+ * `<data>/answers/<askId>.json`, the second overwriting the first, and the
+ * watcher (debounced) delivers only the last content — silently discarding the
+ * user's first answer with no feedback. Single-flight prevents the second send. */
+const answered = new Set<string>();
+
 function send(ask: AskRow, answer: string, kind: AskAnswerKind): void {
-  void invoke('answer_ask', { askId: ask.id, answer, kind });
+  if (answered.has(ask.id)) return;
+  answered.add(ask.id);
+  // Let the user retry only if the answer never reached the backend.
+  void invoke('answer_ask', { askId: ask.id, answer, kind }).catch(() => {
+    answered.delete(ask.id);
+  });
 }
 
 function renderIdentity(ask: AskRow, sessions: SessionRow[]): HTMLElement {
@@ -156,8 +173,26 @@ function renderEmpty(): void {
 
 function render(snap: StateSnapshot): void {
   const [primary, ...rest] = snap.asks;
+
+  // R-8 data-loss guard: `push_state()` broadcasts to every window on ANY
+  // session's state change (a sibling session finishing, a liveness tick, …),
+  // not just this ask's. Capture the in-progress free-text answer + focus before
+  // rebuilding so an unrelated push can't silently wipe the one interactive
+  // surface the ask channel provides.
+  const preserved =
+    freeTextInput && renderedAskId !== null
+      ? {
+          askId: renderedAskId,
+          value: freeTextInput.value,
+          focused: document.activeElement === freeTextInput,
+          selStart: freeTextInput.selectionStart,
+          selEnd: freeTextInput.selectionEnd,
+        }
+      : null;
+
   if (!primary) {
     elBadge.hidden = true;
+    renderedAskId = null;
     renderEmpty();
     return;
   }
@@ -168,6 +203,21 @@ function render(snap: StateSnapshot): void {
     elBadge.hidden = true;
   }
   renderAsk(primary, snap.sessions);
+  renderedAskId = primary.id;
+
+  // Only restore when the SAME ask is still on top (its question/options are
+  // immutable, so the typed text still applies) and it has a free-text field.
+  if (preserved && preserved.askId === primary.id && freeTextInput) {
+    freeTextInput.value = preserved.value;
+    if (preserved.focused) {
+      freeTextInput.focus();
+      try {
+        freeTextInput.setSelectionRange(preserved.selStart ?? preserved.value.length, preserved.selEnd ?? preserved.value.length);
+      } catch {
+        /* value already restored; selection is best-effort. */
+      }
+    }
+  }
 }
 
 onState((snap) => {

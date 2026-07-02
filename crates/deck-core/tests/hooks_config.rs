@@ -477,3 +477,50 @@ fn command_line_contains_marker() {
     ));
     assert!(cmd.contains(MARKER));
 }
+
+/// R-4.1 / R-7.6: a read-only settings.json must not be corrupted, must not
+/// leave an orphan backup for a change that never landed, and must surface an
+/// actionable error (not a bare OS message). Windows-only: on Unix a read-only
+/// *file* in a writable dir can still be renamed over, so the write succeeds.
+#[cfg(windows)]
+#[test]
+// Clearing read-only is exactly the intent here (restore write access on
+// Windows so the temp dir cleans up); the "world-writable on Unix" caveat the
+// lint warns about doesn't apply — this test only compiles on Windows.
+#[allow(clippy::permissions_set_readonly_false)]
+fn readonly_settings_refuses_write_without_orphan_backup() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("settings.json");
+    fs::write(&path, "{}\n").unwrap();
+    let original = fs::read_to_string(&path).unwrap();
+
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&path, perms).unwrap();
+
+    let err = install_hooks(&path, CMD).expect_err("read-only write must fail");
+
+    // Error names the file + the fix (R-7.6), not a bare "os error 5".
+    let msg = err.to_string();
+    assert!(msg.contains("settings.json"), "error names the file: {msg}");
+    assert!(msg.contains("read-only"), "error states the fix: {msg}");
+
+    // Clear read-only so we can inspect + clean up.
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&path, perms).unwrap();
+
+    // Original untouched.
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    // No orphan backup and no stray temp file left behind.
+    let leftovers: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "settings.json")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no orphan backup/temp for a write that never happened, got {leftovers:?}"
+    );
+}

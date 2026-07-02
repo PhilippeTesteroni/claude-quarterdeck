@@ -55,6 +55,18 @@ const ENGINE_TICK: Duration = Duration::from_secs(10);
 /// How long the engine loop blocks waiting for a spool path before it re-checks
 /// whether a tick is due.
 const LOOP_SLICE: Duration = Duration::from_millis(400);
+/// Safety-net rescan cadence for the spool directory (R-2.5, R-3.5). The
+/// `notify`-rs watcher is the primary, immediate ingest path, but OS file-watch
+/// delivery is not guaranteed: under a burst of files each written by a
+/// freshly-spawned hook process — exactly how real Claude Code hooks fire, one
+/// interpreter per event (R-4.4) — Windows' `ReadDirectoryChangesW` can drop a
+/// whole burst, stranding spool files unseen until the next restart (which
+/// recovers them via the startup replay path). This periodic directory scan
+/// ingests anything the watcher missed, bounding worst-case latency to one
+/// interval instead of "until the user restarts Quarterdeck". Kept short so a
+/// missed `SessionEnd` still clears its row promptly (R-2.5): a scan of a
+/// near-always-empty directory is a single cheap `read_dir`.
+const SPOOL_SWEEP: Duration = Duration::from_secs(1);
 
 static ASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -254,7 +266,23 @@ struct SysProcs {
 impl SysProcs {
     fn refreshed() -> Self {
         let mut sys = sysinfo::System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        // Refresh names/existence ONLY (`ProcessRefreshKind::nothing()`), not the
+        // full `everything()` default `refresh_processes` uses. Liveness (R-6.1)
+        // only needs `process_name(pid)`, which comes from the base process-list
+        // enumeration. The optional details `everything()` fetches (cmdline,
+        // user, exe, cwd, …) each `OpenProcess` + query per process, which HANGS
+        // on Windows while the machine is churning through a burst of
+        // freshly-spawned-and-exiting hook interpreters (`powershell.exe`/
+        // `node.exe`, R-4.4) — the app's core parallel-sessions case. That hang
+        // is on this same thread as the spool-ingest loop (R-3.6), so it would
+        // freeze all spool ingestion until restart, silently stranding a whole
+        // burst of Stop/SessionEnd events (R-2.5). Names-only never opens those
+        // handles.
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
         Self { sys }
     }
 }
@@ -298,7 +326,11 @@ fn basename(p: &str) -> String {
 fn paths_eq(a: &str, b: &str) -> bool {
     let (na, nb) = (norm_path(a), norm_path(b));
     if cfg!(windows) {
-        na.eq_ignore_ascii_case(&nb)
+        // NTFS is case-insensitive for the whole Unicode range, not just ASCII:
+        // `eq_ignore_ascii_case` would miss a Cyrillic case-only difference
+        // (e.g. `Мой-Проект` vs `МОЙ-ПРОЕКТ`) even though Windows treats them as
+        // the same directory. `to_lowercase` folds case Unicode-wide (R-5.3/R-8.2).
+        na.to_lowercase() == nb.to_lowercase()
     } else {
         na == nb
     }
@@ -578,7 +610,10 @@ impl Shell {
         }
         let base = basename(ctx);
         for v in &views {
-            if !v.cwd.is_empty() && basename(&v.cwd) == base {
+            // Reuse `paths_eq` so the basename fallback folds case the same
+            // (Unicode-wide) way the full-path match does (R-8.2, R-5.3) — a
+            // plain `==` here would miss a Cyrillic case-only difference.
+            if !v.cwd.is_empty() && paths_eq(&basename(&v.cwd), &base) {
                 return (Some(v.id.clone()), Some(v.project.clone()));
             }
         }
@@ -677,7 +712,30 @@ impl Shell {
         let project = project
             .or_else(|| req.context.as_deref().map(basename))
             .unwrap_or_else(|| "Agent".to_string());
-        let key = session_id.unwrap_or_else(|| format!("notify-{}", now_ms()));
+        // R-9.4: throttle notifications per calling context (cwd), not per call.
+        // A per-call `now_ms()` key was unique every time, so the 10 s (key, kind)
+        // collapse never applied and a looping agent could flood the desktop.
+        //
+        // The key is ALWAYS namespaced under `notify-…`, even for a matched
+        // session: a `notify_user` FYI must not share the throttle bucket with
+        // that session's genuine `(session_id, Attention)` status-change alert.
+        // If it did, a chatty agent calling `notify_user` on its cwd every <10 s
+        // would keep the bucket hot and throttle away the session's real
+        // permission-prompt "needs you" toast (R-9.2) — the app's core purpose.
+        // Matched calls still throttle per session (`notify-<sid>`), unmatched
+        // per context, so `notify_user`'s own R-9.4 flood guard is unaffected.
+        let key = match session_id {
+            Some(sid) => format!("notify-{sid}"),
+            None => match req
+                .context
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(ctx) => format!("notify-{ctx}"),
+                None => "notify-agent".to_string(),
+            },
+        };
         self.notifier.notify(
             ToastKind::Attention,
             &key,
@@ -762,15 +820,38 @@ impl Shell {
             answer: parsed.answer,
             kind: parsed.kind,
         };
-        if let Some(tx) = ask.responder.take() {
-            let _ = tx.send(answer);
-        }
+        // Whether the answer actually reached the blocked `ask_user` call. The
+        // send fails when the MCP side already gave up (its `timeout_seconds`
+        // fired and it returned `timeout`, dropping the receiver) or the ask was
+        // orphaned (no responder). In that race — up to one engine tick wide,
+        // before `sweep_expired_asks` removes the row — the ask is still visible
+        // and answerable; we must NOT then flip the session to Working as if the
+        // agent received the answer (it didn't).
+        let delivered = match ask.responder.take() {
+            Some(tx) => tx.send(answer).is_ok(),
+            None => false,
+        };
         if let Some(sid) = &ask.session_id {
             let mut store = self.store.lock().expect("store poisoned");
-            match parsed.kind {
-                AskAnswerKind::Option | AskAnswerKind::Text => store.note_ask_answered(sid),
-                AskAnswerKind::Timeout | AskAnswerKind::Dismissed => store.note_ask_cleared(sid),
+            if delivered {
+                match parsed.kind {
+                    AskAnswerKind::Option | AskAnswerKind::Text => store.note_ask_answered(sid),
+                    AskAnswerKind::Timeout | AskAnswerKind::Dismissed => {
+                        store.note_ask_cleared(sid)
+                    }
+                }
+            } else {
+                // Agent already stopped waiting: just drop the pending-ask
+                // override so the status recomputes from the last hook state
+                // (R-2.4), rather than mis-reporting the session as Working.
+                store.note_ask_cleared(sid);
             }
+        }
+        if !delivered {
+            tracing::warn!(
+                ask_id = %id,
+                "answer arrived after the ask was no longer awaiting (timed out/orphaned); not delivered to the agent"
+            );
         }
         let _ = std::fs::remove_file(self.ask_file_path(&ask.id));
         let _ = std::fs::remove_file(path);
@@ -960,19 +1041,69 @@ fn run_engine(shell: Arc<Shell>) {
         }
     };
 
+    // Close the replay→watch gap (R-3.5): a hook could drop a spool file in the
+    // window between the initial `drain_spool` directory read and the watcher
+    // becoming active — `notify` only reports events after `watch()`, and there
+    // is no periodic rescan, so such a file would sit unseen until the next
+    // launch. Re-drain once now that the watch is live to sweep up anything
+    // stranded. Toasts stay suppressed (still "while we were coming up"); the
+    // watcher may also report these paths, but `ingest_file` no-ops a file a
+    // drain already consumed.
+    match events::drain_spool(&spool_dir, &quarantine_dir, now_ms()) {
+        Ok(outcome) => {
+            let swept = outcome.events.len();
+            for item in outcome.events {
+                {
+                    let mut store = shell.store.lock().expect("store poisoned");
+                    let _ = store.on_event(&item.event);
+                }
+                let _ = std::fs::remove_file(&item.path);
+            }
+            if swept > 0 {
+                tracing::info!(swept, "startup replay→watch gap swept (R-3.5)");
+                shell.push_state();
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "startup gap re-drain failed"),
+    }
+
     let mut last_tick = Instant::now();
+    let mut last_sweep = Instant::now();
     loop {
         match watcher.paths.recv_timeout(LOOP_SLICE) {
             Ok(path) => {
-                ingest_path(&shell, &quarantine_dir, &path);
+                // Drain the whole debounce-window burst, then push ONE state
+                // snapshot. `push_state()` clones + serializes a full snapshot,
+                // emits `deck://state`, and repaints the tray — O(session-count)
+                // work that must not run per ingested file, or a replay/flood of
+                // N events would fire N full broadcasts in a tight loop (chaos
+                // ingestion outpacing the UI). Toasts still fire per event inside
+                // `ingest_path` (each status change matters and is throttled);
+                // only the UI/tray push is coalesced.
+                let mut changed = ingest_path(&shell, &quarantine_dir, &path);
                 while let Ok(path) = watcher.paths.try_recv() {
-                    ingest_path(&shell, &quarantine_dir, &path);
+                    changed |= ingest_path(&shell, &quarantine_dir, &path);
+                }
+                if changed {
+                    shell.push_state();
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::warn!("spool watcher channel closed; engine loop exiting");
                 break;
+            }
+        }
+
+        // Safety-net rescan (R-2.5, R-3.5): catch any spool files the OS
+        // file-watch dropped (see `SPOOL_SWEEP`). Runs on this same loop thread
+        // as the watcher-driven ingest above, so it never races it — whichever
+        // reaches a file first ingests and removes it; the other finds it gone
+        // (`ingest_file` no-ops a vanished path).
+        if last_sweep.elapsed() >= SPOOL_SWEEP {
+            last_sweep = Instant::now();
+            if sweep_spool(&shell, &spool_dir, &quarantine_dir) {
+                shell.push_state();
             }
         }
 
@@ -983,9 +1114,47 @@ fn run_engine(shell: Arc<Shell>) {
     }
 }
 
-fn ingest_path(shell: &Arc<Shell>, quarantine_dir: &Path, path: &Path) {
+/// Safety-net rescan of the spool directory: ingest (in receipt-time order,
+/// firing toasts) any files the live `notify` watcher missed. Reuses
+/// [`events::drain_spool`], so it also enforces the R-3.5 spool cap, discards
+/// events older than 24 h, and quarantines malformed files. Normally a no-op
+/// (the watcher already consumed and deleted everything, so the directory is
+/// empty and this is a single cheap `read_dir`); does real work only when the
+/// OS dropped a file-watch event. Returns whether any event was applied (so the
+/// caller coalesces one `push_state`). See [`SPOOL_SWEEP`].
+fn sweep_spool(shell: &Arc<Shell>, spool_dir: &Path, quarantine_dir: &Path) -> bool {
+    let outcome = match events::drain_spool(spool_dir, quarantine_dir, now_ms()) {
+        Ok(o) => o,
+        Err(err) => {
+            tracing::warn!(error = %err, "spool safety-net sweep failed");
+            return false;
+        }
+    };
+    if outcome.events.is_empty() {
+        return false;
+    }
+    tracing::warn!(
+        recovered = outcome.events.len(),
+        "spool safety-net sweep ingested files the live watcher missed (R-2.5/R-3.5)"
+    );
+    for item in outcome.events {
+        let effects = {
+            let mut store = shell.store.lock().expect("store poisoned");
+            store.on_event(&item.event)
+        };
+        let _ = std::fs::remove_file(&item.path);
+        shell.fire_effects(effects);
+    }
+    true
+}
+
+/// Ingest one spool file: parse, apply to the store, fire its toasts. Returns
+/// `true` iff an event was applied (so the caller knows the UI state changed and
+/// can coalesce a single `push_state()` after draining a whole burst — see the
+/// engine loop). Deliberately does NOT push state itself.
+fn ingest_path(shell: &Arc<Shell>, quarantine_dir: &Path, path: &Path) -> bool {
     if path.extension().and_then(|e| e.to_str()) != Some("json") {
-        return;
+        return false;
     }
     match events::ingest_file(path, quarantine_dir, now_ms()) {
         Ok(Some(event)) => {
@@ -995,10 +1164,13 @@ fn ingest_path(shell: &Arc<Shell>, quarantine_dir: &Path, path: &Path) {
             };
             let _ = std::fs::remove_file(path);
             shell.fire_effects(effects);
-            shell.push_state();
+            true
         }
-        Ok(None) => {}
-        Err(err) => tracing::warn!(error = %err, ?path, "failed to ingest spool file"),
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!(error = %err, ?path, "failed to ingest spool file");
+            false
+        }
     }
 }
 
@@ -1010,7 +1182,39 @@ fn run_tick(shell: &Arc<Shell>) {
     };
     shell.fire_effects(effects);
     shell.sweep_expired_asks();
+    enforce_disk_caps();
     shell.push_state();
+}
+
+/// Enforce the R-3.5 spool cap and the quarantine cap on the live path (the
+/// running app), oldest-first. `drain_spool` only enforces the spool cap once at
+/// startup; this keeps both directories bounded for a long-running instance.
+fn enforce_disk_caps() {
+    match events::enforce_spool_cap(&settings::spool_dir()) {
+        Ok(n) if n > 0 => tracing::warn!(removed = n, "spool cap enforced on live path (R-3.5)"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(error = %err, "failed to enforce spool cap"),
+    }
+    match events::enforce_quarantine_cap(&settings::spool_quarantine_dir()) {
+        Ok(n) if n > 0 => tracing::warn!(removed = n, "quarantine cap enforced"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(error = %err, "failed to enforce quarantine cap"),
+    }
+    // R-3.5 hygiene: sweep stray non-`.json` leftovers (e.g. a `<id>.json.tmp`
+    // from a hook killed mid atomic-write) that no ingest path consumes and the
+    // spool cap never counts, so they can't accumulate on disk unbounded.
+    match events::sweep_stray_spool_files(
+        &settings::spool_dir(),
+        &settings::spool_quarantine_dir(),
+        now_ms(),
+        events::STRAY_FILE_MIN_AGE_MS,
+    ) {
+        Ok(n) if n > 0 => {
+            tracing::warn!(swept = n, "stray non-json spool files quarantined (R-3.5)")
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(error = %err, "failed to sweep stray spool files"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1224,10 @@ fn run_tick(shell: &Arc<Shell>) {
 
 fn run_answers(shell: Arc<Shell>) {
     let answers_dir = settings::answers_dir();
+    // Startup drain: resolve any answer files already on disk before the watcher
+    // is live (written while we were down, or whose create event a prior run's
+    // watcher never delivered). Mirrors `run_engine`'s startup `drain_spool`.
+    drain_answers(&shell, &answers_dir);
     let watcher = match watcher::SpoolWatcher::spawn(&answers_dir, watcher::DEFAULT_DEBOUNCE) {
         Ok(w) => w,
         Err(err) => {
@@ -1027,11 +1235,45 @@ fn run_answers(shell: Arc<Shell>) {
             return;
         }
     };
+    let mut last_sweep = Instant::now();
     loop {
         match watcher.paths.recv_timeout(LOOP_SLICE) {
             Ok(path) => shell.resolve_answer(&path),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Safety-net rescan (mirrors the spool `SPOOL_SWEEP` in `run_engine`).
+        // `resolve_answer` fires ONLY on a watcher-delivered path, but OS
+        // file-watch delivery is not guaranteed — Windows `ReadDirectoryChangesW`
+        // can drop the create/modify event for `<data>/answers/<askId>.json`. On
+        // this path a dropped event is unrecoverable: the answer file sits on disk
+        // forever, the oneshot responder never fires, and the blocked `ask_user`
+        // returns `timeout` despite the human having answered (the row already
+        // vanished from the popup, so they can't re-answer). A periodic directory
+        // scan resolves anything the watcher missed, bounding worst-case delivery
+        // latency to one interval instead of "never".
+        if last_sweep.elapsed() >= SPOOL_SWEEP {
+            last_sweep = Instant::now();
+            drain_answers(&shell, &answers_dir);
+        }
+    }
+}
+
+/// Resolve every `*.json` answer file currently in `answers_dir` — a safety net
+/// for watch events the OS dropped (see the sweep in [`run_answers`]).
+/// [`Shell::resolve_answer`] removes each file it handles (delivering, or
+/// quarantining a malformed one, or consuming an already-resolved one), so this
+/// is normally a no-op single `read_dir` and races the watcher harmlessly:
+/// whichever reaches a file first handles it; the other finds it gone.
+fn drain_answers(shell: &Arc<Shell>, answers_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(answers_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            shell.resolve_answer(&path);
         }
     }
 }
@@ -1134,6 +1376,25 @@ fn perform_uninstall_hooks() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn sync_autostart(app: &AppHandle<Wry>, enable: bool) {
+    // Test-isolation guard (R-3.3). `autolaunch().enable()/.disable()` registers
+    // or unregisters the app in the REAL machine's login items (Windows registry
+    // Run key / macOS LaunchAgent) using the current exe path — a machine-wide
+    // side effect that no data-dir override contains. `QUARTERDECK_DATA_DIR` is
+    // the documented test-isolation surface (all QA/E2E launches set it); when it
+    // is present we must not mutate the real login-item config. The
+    // `launchAtLogin` setting is still persisted and surfaced to the UI — only the
+    // real-OS registration is skipped, so a toggle stays observable in the
+    // isolated settings.json without touching the host machine.
+    let isolated = std::env::var("QUARTERDECK_DATA_DIR")
+        .map(|dir| !dir.is_empty())
+        .unwrap_or(false);
+    if isolated {
+        tracing::debug!(
+            enable,
+            "skipping real autostart sync under QUARTERDECK_DATA_DIR isolation (R-3.3)"
+        );
+        return;
+    }
     let manager = app.autolaunch();
     let current = manager.is_enabled().unwrap_or(false);
     let result = if enable && !current {
@@ -1305,7 +1566,39 @@ pub fn run() {
         "Quarterdeck starting"
     );
 
-    tauri::Builder::default()
+    // R-10.4 / live-smoke step 5: the log is THE diagnostic surface. A panic
+    // during startup — a plugin/`setup` `expect`, `generate_context!`, a
+    // background worker thread — would otherwise leave only "Quarterdeck
+    // starting" in the log and vanish with just a stderr backtrace the user (and
+    // the smoke reader) never see. Route panics through the tracing subscriber so
+    // the failure is always recorded; chain the default hook so stderr still gets
+    // the backtrace. On the (default) unwind strategy the async log writer is
+    // flushed when `_log_guard` drops as the panic unwinds out of `run()`.
+    {
+        let default_panic_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!(panic = %info, "Quarterdeck panicked");
+            default_panic_hook(info);
+        }));
+    }
+
+    let result = tauri::Builder::default()
+        // R-3.3 / critical: a single-instance guard. A second launch would
+        // otherwise collide on the shared per-identifier WebView2 profile
+        // (`%LOCALAPPDATA%\pro.philippgross.quarterdeck\EBWebView`, one browser
+        // process per profile, unaffected by QUARTERDECK_DATA_DIR): both windows
+        // fail to create and the app runs on as a UI-less zombie with no visible
+        // error. This plugin makes the second instance hand off to the first
+        // (surfacing the popup) and exit, so the collision can't happen. It MUST
+        // be registered first.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tracing::info!("second instance launched; surfacing the existing window");
+            run_on_main(app, |app| {
+                if let Err(err) = windows::open_popup(app) {
+                    tracing::warn!(error = %err, "failed to surface popup for second instance");
+                }
+            });
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -1411,8 +1704,17 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Quarterdeck");
+        .run(tauri::generate_context!());
+
+    // R-10.4 / live-smoke step 5: the log is the diagnostic surface. A failed
+    // Tauri/WebView2 startup (e.g. a locked/corrupt shared WebView2 profile)
+    // must not exit with only "Quarterdeck starting" in the log — route the
+    // error through the subscriber, flush it, then exit non-zero.
+    if let Err(err) = result {
+        tracing::error!(error = %err, "Quarterdeck exited with a fatal error");
+        drop(_log_guard); // flush the async log writer before we exit
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -1427,6 +1729,21 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn sysprocs_names_only_refresh_still_resolves_the_current_process_name() {
+        // Regression guard for the R-6.1 liveness hang fix: `SysProcs::refreshed`
+        // now refreshes with `ProcessRefreshKind::nothing()` (names/existence
+        // only) to avoid the per-process handle queries that hang under a burst
+        // of transient hook interpreters. Liveness still needs `process_name`, so
+        // assert the name is populated for our own live PID.
+        let procs = SysProcs::refreshed();
+        let name = procs.process_name(std::process::id());
+        assert!(
+            name.as_deref().is_some_and(|n| !n.is_empty()),
+            "names-only refresh must still resolve a live process's name, got {name:?}"
+        );
     }
 
     #[test]

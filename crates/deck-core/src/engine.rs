@@ -147,8 +147,12 @@ struct Session {
     display_title: String,
     inferred: bool,
     branch: Option<String>,
-    /// A Quarterdeck ask is pending → force `attention` (R-2.4).
-    pending_ask: bool,
+    /// Number of Quarterdeck asks currently pending for this session → force
+    /// `attention` while > 0 (R-2.4). A count, not a bool: two agents can share
+    /// one session row (same cwd, or a basename-fallback match, `lib.rs`
+    /// `match_session`), so resolving/timing-out ONE ask must not clear the
+    /// override while another is still waiting on the human.
+    pending_asks: u32,
     /// `attention` originated from a Notification hook (eligible for R-2.2 recovery).
     attention_from_hook: bool,
     /// Receipt time of the Notification that put us in `attention` (R-2.2 anchor).
@@ -177,7 +181,7 @@ impl Session {
             display_title: naming::NO_TITLE.to_string(),
             inferred: false,
             branch: None,
-            pending_ask: false,
+            pending_asks: 0,
             attention_from_hook: false,
             last_notification_ms: None,
             dead_since_ms: None,
@@ -186,7 +190,7 @@ impl Session {
     }
 
     fn effective(&self) -> Status {
-        if self.pending_ask {
+        if self.pending_asks > 0 {
             Status::Attention
         } else {
             self.hook_status
@@ -211,10 +215,11 @@ impl Session {
         }
     }
 
-    /// Toggle the pending-ask override; returns `Some(new_effective)` on change.
-    fn set_pending(&mut self, pending: bool, ts_ms: u64) -> Option<Status> {
+    /// Re-derive the shown status after `pending_asks` or `hook_status` changed;
+    /// returns `Some(new_effective)` iff the shown status changed (so the caller
+    /// can re-stamp `entered_at`/`last_activity`, R-2.5).
+    fn resettle_effective(&mut self, ts_ms: u64) -> Option<Status> {
         let before = self.effective_status;
-        self.pending_ask = pending;
         let after = self.effective();
         if after != before {
             self.effective_status = after;
@@ -289,6 +294,16 @@ fn classify_notification(notification_type: Option<&str>) -> NotifClass {
 /// the Tauri shell and be driven from the watcher and timer tasks (T7).
 pub struct SessionStore {
     sessions: HashMap<String, Session>,
+    /// Tombstones for sessions that received `SessionEnd`, mapping id → the end
+    /// timestamp. Guards R-2.5 ("SessionEnd always wins immediately"): a
+    /// debounce-reordered or otherwise trailing event (Stop / Notification /
+    /// prompt) for an already-ended session must NOT resurrect the removed row
+    /// (which would revive a phantom red tray + a false "needs you" alert). A
+    /// genuinely-later `SessionStart` (a resume, or a reused id) — one whose
+    /// timestamp is strictly after the recorded end — clears the tombstone and
+    /// re-creates the row. Pruned to the spool freshness window so it stays
+    /// bounded (a stale event beyond it is discarded on replay anyway, R-3.5).
+    ended: HashMap<String, u64>,
     clock: Box<dyn Clock + Send + Sync>,
 }
 
@@ -306,6 +321,7 @@ impl SessionStore {
     pub fn new(clock: Box<dyn Clock + Send + Sync>) -> Self {
         SessionStore {
             sessions: HashMap::new(),
+            ended: HashMap::new(),
             clock,
         }
     }
@@ -372,13 +388,32 @@ impl SessionStore {
     /// Apply one parsed spool event, returning any toast decisions (R-9.1,
     /// R-9.2, R-2.3), each already burst-throttled (R-9.4).
     pub fn on_event(&mut self, ev: &SpoolEvent) -> Vec<Effect> {
-        // SessionEnd removes the row immediately, any reason (R-2.5, R-5.1).
+        let ts = ev.received_at_ms.unwrap_or_else(|| self.clock.now_ms());
+
+        // SessionEnd removes the row immediately, any reason (R-2.5, R-5.1), and
+        // tombstones the id so a reordered trailing event can't resurrect it.
         if let HookEvent::SessionEnd { .. } = ev.kind {
             self.sessions.remove(&ev.session_id);
+            self.record_ended(ev.session_id.clone(), ts);
             return Vec::new();
         }
 
-        let ts = ev.received_at_ms.unwrap_or_else(|| self.clock.now_ms());
+        // R-2.5 tombstone guard: ignore trailing/stale events for an ended
+        // session. A genuinely-later SessionStart (resume / reused id, strictly
+        // after the end) clears the tombstone and is allowed to re-create the row.
+        if let Some(&end_ts) = self.ended.get(&ev.session_id) {
+            let is_restart = matches!(ev.kind, HookEvent::SessionStart { .. }) && ts > end_ts;
+            if is_restart {
+                self.ended.remove(&ev.session_id);
+            } else {
+                tracing::debug!(
+                    session_id = %ev.session_id,
+                    event = ev.kind.name(),
+                    "ignoring event for ended session (R-2.5 tombstone)"
+                );
+                return Vec::new();
+            }
+        }
 
         let session = self
             .sessions
@@ -532,6 +567,16 @@ impl SessionStore {
     /// (no newer toast replaced it); removal is equivalent to restoring the
     /// previous stamp, because a stamp is only ever created ≥10 s after the one
     /// before it (`throttle_ok`), so the next toast would pass either way.
+    /// Record a `SessionEnd` tombstone, pruning entries older than the spool
+    /// freshness window so the map stays bounded (R-3.5: a stale event beyond
+    /// 24 h is discarded on replay anyway, so its tombstone is moot).
+    fn record_ended(&mut self, id: String, end_ts: u64) {
+        let now = self.clock.now_ms();
+        self.ended
+            .retain(|_, &mut end| now.saturating_sub(end) <= crate::events::MAX_EVENT_AGE_MS);
+        self.ended.insert(id, end_ts);
+    }
+
     pub fn refund_toast(&mut self, session_id: &str, kind: ToastKind, at_ms: u64) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if session.last_toast_ms.get(&kind) == Some(&at_ms) {
@@ -547,7 +592,8 @@ impl SessionStore {
     pub fn note_pending_ask(&mut self, session_id: &str) {
         let now = self.clock.now_ms();
         if let Some(s) = self.sessions.get_mut(session_id) {
-            if s.set_pending(true, now).is_some() {
+            s.pending_asks = s.pending_asks.saturating_add(1);
+            if s.resettle_effective(now).is_some() {
                 s.last_activity_ms = now;
             }
         }
@@ -558,7 +604,24 @@ impl SessionStore {
     pub fn note_ask_answered(&mut self, session_id: &str) {
         let now = self.clock.now_ms();
         if let Some(s) = self.sessions.get_mut(session_id) {
-            s.pending_ask = false;
+            s.pending_asks = s.pending_asks.saturating_sub(1);
+            // Two asks can be attributed to one session row (same cwd / basename
+            // fallback, `lib.rs` `match_session`). If another ask is still
+            // pending, the session remains blocked on a human (R-2.4) — do NOT
+            // resume it to working; only the LAST answer does (§2 "MCP ask
+            // answered → working"). The still-shown `attention` is left intact.
+            if s.pending_asks > 0 {
+                return;
+            }
+            // A liveness poll may have marked this session `dead` (its `claude`
+            // process is gone) while the ask was still answerable shell-side.
+            // Answering must NOT resurrect a dead process to `working` (a phantom
+            // green/yellow row + a wrong worst-of tray change, self-corrected only
+            // on the next tick). Leave it dead (the override is already cleared);
+            // a genuine new turn will re-create the row via SessionStart.
+            if s.hook_status == Status::Dead {
+                return;
+            }
             s.attention_from_hook = false;
             s.last_notification_ms = None;
             s.hook_status = Status::Working;
@@ -569,12 +632,14 @@ impl SessionStore {
         }
     }
 
-    /// The ask timed out or was dismissed → drop the override; status recomputes
-    /// from the last hook state (R-2.4).
+    /// The ask timed out or was dismissed → drop one pending ask; status
+    /// recomputes from the last hook state only once the LAST pending ask for the
+    /// session resolves (R-2.4).
     pub fn note_ask_cleared(&mut self, session_id: &str) {
         let now = self.clock.now_ms();
         if let Some(s) = self.sessions.get_mut(session_id) {
-            if s.set_pending(false, now).is_some() {
+            s.pending_asks = s.pending_asks.saturating_sub(1);
+            if s.resettle_effective(now).is_some() {
                 s.last_activity_ms = now;
             }
         }
@@ -594,7 +659,7 @@ impl SessionStore {
         for s in self.sessions.values_mut() {
             // A pending ask forces attention (R-2.4); transcript activity must
             // never clear it — only an explicit answer does.
-            if s.pending_ask {
+            if s.pending_asks > 0 {
                 continue;
             }
             match s.effective() {
@@ -655,7 +720,7 @@ impl SessionStore {
                 s.last_notification_ms = None;
                 s.hook_status = Status::Dead;
                 // Dead overrides even a pending ask: the process is gone.
-                s.pending_ask = false;
+                s.pending_asks = 0;
                 s.effective_status = Status::Dead;
                 s.entered_at_ms = now;
                 s.dead_since_ms = Some(now);
@@ -711,7 +776,10 @@ impl SessionStore {
         title: String,
         activity_ms: u64,
     ) {
-        if self.sessions.contains_key(&id) {
+        // Never resurrect a cleanly-ended session (R-2.5): if its SessionEnd was
+        // replayed this session, cold-start discovery must not re-infer a row
+        // from the still-present transcript file.
+        if self.sessions.contains_key(&id) || self.ended.contains_key(&id) {
             return;
         }
         let now = self.clock.now_ms();

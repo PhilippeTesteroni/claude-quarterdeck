@@ -50,6 +50,11 @@ export function footerText(counts: { attention: number; working: number; idle: n
 }
 
 export function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+  // Count by Unicode code points, not UTF-16 code units, so an astral character
+  // (emoji, e.g. in a Cyrillic/OneDrive path shown as "Unknown agent (<context>)",
+  // R-5.3/R-8.2) is never sliced through the middle into a lone surrogate that
+  // renders as a broken/tofu glyph. `Array.from` splits on code points.
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `${chars.slice(0, Math.max(0, max - 1)).join('').trimEnd()}…`;
 }

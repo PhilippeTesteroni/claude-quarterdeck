@@ -124,6 +124,61 @@ fn session_end_removes_row_any_reason() {
 }
 
 #[test]
+fn late_stop_after_session_end_does_not_resurrect_the_row() {
+    // R-2.5: SessionEnd always wins. A debounce-reordered trailing Stop must not
+    // revive a cleanly-ended session as an idle ghost.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 5));
+    s.on_event(&session_end("a", "logout", T0 + 10));
+    assert!(!s.contains("a"));
+    let fx = s.on_event(&stop("a", T0 + 20));
+    assert!(!s.contains("a"), "late Stop must not re-create the row");
+    assert!(fx.is_empty(), "and must fire no toast");
+}
+
+#[test]
+fn late_attention_notification_after_session_end_is_ignored() {
+    // The worst case in the finding: a late permission-prompt Notification
+    // resurrecting an ended session as ATTENTION *and* firing a false "needs
+    // you" alert. Both must be suppressed.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&session_end("a", "other", T0 + 10));
+    let fx = s.on_event(&notification(
+        "a",
+        "permission_prompt",
+        Some("Allow rm -rf?"),
+        T0 + 20,
+    ));
+    assert!(!s.contains("a"), "ended session must stay removed");
+    assert_eq!(s.status_of("a"), None);
+    assert!(
+        fx.is_empty(),
+        "no phantom attention toast for an ended session"
+    );
+}
+
+#[test]
+fn genuinely_later_session_start_resumes_an_ended_id() {
+    // A resume / id reuse strictly after the end busts the tombstone and
+    // re-creates the row (so the guard doesn't permanently blacklist an id).
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&session_end("a", "clear", T0 + 10));
+    assert!(!s.contains("a"));
+    s.on_event(&session_start("a", "/p", T0 + 1_000));
+    assert_eq!(
+        s.status_of("a"),
+        Some(Status::Idle),
+        "later SessionStart resumes the row"
+    );
+    // ...and subsequent events for the resumed session apply normally.
+    s.on_event(&prompt("a", "go again", T0 + 1_010));
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+}
+
+#[test]
 fn event_for_unknown_session_creates_the_row() {
     // Robustness: a Notification arriving before we saw SessionStart still tracks.
     let (mut s, _c) = store_at(T0);

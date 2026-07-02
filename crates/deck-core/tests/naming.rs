@@ -59,6 +59,37 @@ fn normalize_leaves_short_unicode_untouched() {
 }
 
 #[test]
+fn normalize_never_severs_a_zwj_emoji_sequence_at_the_cut() {
+    // R-5.3 Unicode safety: the 60-cluster cap must not slice a compound emoji
+    // (here the family ZWJ sequence 👨‍👩‍👧‍👦 = U+1F468 U+200D U+1F469 U+200D
+    // U+1F467 U+200D U+1F466, seven scalars rendered as ONE grapheme cluster).
+    // Engineer the title so a scalar-based cut would land INSIDE the sequence.
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+    let title = format!("{}{family} tail", "x".repeat(58));
+    let out = normalize_title(&title);
+
+    assert!(out.ends_with('…'), "truncated title ends with ellipsis");
+    // Grapheme truncation is always cluster-aligned, so the cut can never leave a
+    // dangling ZWJ joiner immediately before the ellipsis (a whole family emoji
+    // legitimately contains internal joiners, so we can't assert `!contains ZWJ`).
+    assert!(
+        !out.trim_end_matches('…').ends_with('\u{200D}'),
+        "no dangling ZWJ joiner left at the cut: {out:?}"
+    );
+    // The compound emoji must appear WHOLE or not at all — never a lone prefix
+    // (a bare 👨 with the rest of the sequence severed off).
+    let has_whole_family = out.contains(family);
+    let has_no_family_scalar = !out.contains('\u{1F468}')
+        && !out.contains('\u{1F469}')
+        && !out.contains('\u{1F467}')
+        && !out.contains('\u{1F466}');
+    assert!(
+        has_whole_family || has_no_family_scalar,
+        "family emoji kept whole or dropped whole, never severed: {out:?}"
+    );
+}
+
+#[test]
 fn project_basename_handles_both_separators_and_unicode() {
     assert_eq!(project_name(Some("/home/user/my-proj")), "my-proj");
     assert_eq!(

@@ -73,6 +73,38 @@ test.describe('ask window', () => {
     await expect(page.locator('#qd-ask-badge')).toBeHidden();
   });
 
+  // SPEC R-8: `push_state()` broadcasts to the ask window on ANY session's state
+  // change, not just this ask's. A partially-typed free-text answer (and focus)
+  // must survive such an unrelated re-render — it's the only interactive surface
+  // the ask channel provides, and silent loss is undiscoverable.
+  test('an unrelated state change preserves an in-progress free-text answer (R-8)', async ({ page }) => {
+    await gotoAsk(page, 'default');
+
+    // a1 is primary (options + free text); a2 is queued behind it ("1 more waiting").
+    const input = page.locator('.qd-ask-freeform input');
+    await input.click();
+    await input.fill('Segment proportionally by count');
+    await expect(input).toBeFocused();
+    await expect(page.locator('#qd-ask-badge')).toHaveText('1 more waiting');
+
+    // Drive a deck://state push from an UNRELATED ask (dismiss the queued a2
+    // headlessly) — the same global broadcast a sibling session's change causes.
+    // a1 stays primary, so its free-text field is rebuilt from scratch.
+    await page.evaluate(() =>
+      (window as unknown as { __qdMock: { answerAsk: (id: string, a: string, k: string) => void } }).__qdMock.answerAsk(
+        'a2',
+        '',
+        'dismissed',
+      ),
+    );
+
+    // The badge clears — proof the re-render actually ran.
+    await expect(page.locator('#qd-ask-badge')).toBeHidden();
+    // ...and the typed answer + focus survived it.
+    await expect(input).toHaveValue('Segment proportionally by count');
+    await expect(input).toBeFocused();
+  });
+
   // SPEC R-8.7: an ask recovered from disk after a restart can never be answered
   // (its MCP connection is gone). It renders as expired with only a Dismiss
   // action — "never answered into the void": no options, no free-text field,

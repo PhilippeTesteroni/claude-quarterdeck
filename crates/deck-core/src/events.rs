@@ -30,6 +30,12 @@ pub const MAX_EVENT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 /// Maximum number of spool files retained; oldest are deleted first (R-3.5).
 pub const MAX_SPOOL_FILES: usize = 5000;
 
+/// Maximum number of files retained in `spool-quarantine/`; oldest are deleted
+/// first. The spec caps the spool (R-3.5) and the logs (R-10.4); the quarantine
+/// dir that receives every malformed/hostile file gets the same disk-growth
+/// discipline so a buggy or adversarial hook can't grow it without bound.
+pub const MAX_QUARANTINE_FILES: usize = 1000;
+
 /// The five hook events we subscribe to (plus a tolerated catch-all), already
 /// projected down to the payload fields we rely on (R-4.5, `docs/hooks-facts.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +479,134 @@ pub fn drain_spool(
     Ok(outcome)
 }
 
+/// Enforce a "keep at most `max` files, oldest deleted first" cap on `dir`.
+/// Returns how many files were removed. A missing directory is a no-op.
+///
+/// When `only_json` is set, only `*.json` files count toward (and are removed
+/// by) the cap — used for the spool, whose live files are always `*.json`. The
+/// quarantine dir passes `false` because collision-renamed files there end in
+/// `.json.1`, `.json.2`, … and must still be counted/trimmed.
+///
+/// # Errors
+/// Propagates directory-read IO failures (other than "not found").
+fn cap_dir(dir: &Path, max: usize, only_json: bool) -> std::io::Result<usize> {
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if only_json && path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        files.push((path, mtime));
+    }
+    if files.len() <= max {
+        return Ok(0);
+    }
+    files.sort_by_key(|(_, mtime)| *mtime);
+    let overflow = files.len() - max;
+    let mut removed = 0;
+    for (path, _) in files.drain(0..overflow) {
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Enforce the R-3.5 5000-file spool cap on the *live* path (oldest deleted
+/// first). The startup replay path enforces the same cap inside [`drain_spool`];
+/// this is the running-app counterpart the engine calls on its periodic tick so
+/// the directory can't grow unbounded between restarts if the engine is ever
+/// outpaced by a flood of writes.
+///
+/// # Errors
+/// Propagates directory-read IO failures (other than "not found").
+pub fn enforce_spool_cap(spool_dir: &Path) -> std::io::Result<usize> {
+    cap_dir(spool_dir, MAX_SPOOL_FILES, true)
+}
+
+/// Enforce the [`MAX_QUARANTINE_FILES`] cap on `spool-quarantine/` (oldest
+/// deleted first), so a sustained flood of malformed/hostile spool files can't
+/// grow the quarantine dir without bound.
+///
+/// # Errors
+/// Propagates directory-read IO failures (other than "not found").
+pub fn enforce_quarantine_cap(quarantine_dir: &Path) -> std::io::Result<usize> {
+    cap_dir(quarantine_dir, MAX_QUARANTINE_FILES, false)
+}
+
+/// Grace period before a stray non-`.json` file in `spool/` is swept
+/// ([`sweep_stray_spool_files`]). Comfortably longer than an atomic tmp-write +
+/// rename (sub-millisecond in practice), so a file this old is definitely an
+/// abandoned leftover, never an in-flight write.
+pub const STRAY_FILE_MIN_AGE_MS: u64 = 60_000;
+
+/// Quarantine stray non-`.json` files left in `spool/` (R-3.5 disk hygiene).
+///
+/// The hook contract (R-4.3) writes each envelope atomically: `<id>.json.tmp`
+/// then rename to `<id>.json`. A hook process killed *between* those two steps
+/// leaves a `<id>.json.tmp` (or, defensively, any non-`.json` leftover) behind.
+/// Neither [`drain_spool`] nor [`ingest_file`] ever consumes such a file (both
+/// skip anything without a `.json` extension), and [`enforce_spool_cap`] counts
+/// only `.json` files — so without this it would accumulate on disk forever.
+///
+/// Only files older than `min_age_ms` are swept, so an in-flight atomic write
+/// (its `.tmp` exists for well under a millisecond) is never disturbed. Swept
+/// files go to `quarantine_dir`, which has its own [`MAX_QUARANTINE_FILES`] cap,
+/// keeping total growth bounded. Returns how many files were swept.
+///
+/// # Errors
+/// Propagates the directory-read IO failure (other than "not found").
+pub fn sweep_stray_spool_files(
+    spool_dir: &Path,
+    quarantine_dir: &Path,
+    now_ms: u64,
+    min_age_ms: u64,
+) -> std::io::Result<usize> {
+    let entries = match fs::read_dir(spool_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            continue;
+        }
+        let mtime_ms = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Too young to be sure it isn't an in-flight tmp-then-rename write.
+        if now_ms.saturating_sub(mtime_ms) < min_age_ms {
+            continue;
+        }
+        tracing::warn!(?path, "quarantining stray non-json spool file (R-3.5)");
+        if quarantine(&path, quarantine_dir).is_ok() {
+            swept += 1;
+        }
+    }
+    Ok(swept)
+}
+
 /// Live-path ingest of a single spool file discovered by the watcher.
 ///
 /// Returns `Ok(Some(event))` when the file parsed and is fresh (caller applies,
@@ -486,6 +620,12 @@ pub fn ingest_file(
     quarantine_dir: &Path,
     now_ms: u64,
 ) -> std::io::Result<Option<SpoolEvent>> {
+    // The watcher can report a path that a concurrent drain (e.g. the startup
+    // re-drain that closes the replay→watch gap) already consumed. A vanished
+    // file is a no-op, not a parse error to quarantine.
+    if !path.exists() {
+        return Ok(None);
+    }
     match classify_file(path, now_ms) {
         FileClass::Good(event) => Ok(Some(event)),
         FileClass::TooOld => {

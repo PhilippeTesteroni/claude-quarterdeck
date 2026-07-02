@@ -142,9 +142,21 @@ function askAgentLabel(ask: AskRow): string {
   return 'Unknown agent';
 }
 
+/** Ask ids already answered from a mirrored popup row, so a second answer for
+ * the SAME ask (double-click, or a click racing a leftover Enter) is dropped:
+ * both answer_ask writes target the same answers/<askId>.json, the second
+ * overwriting the first, and the debounced watcher delivers only the last —
+ * silently discarding the user's first answer. Single-flight prevents it. */
+const answeredAsks = new Set<string>();
+
 function renderAskMirrorRow(ask: AskRow): HTMLElement {
   const send = (answer: string, kind: AskAnswerKind): void => {
-    void invoke('answer_ask', { askId: ask.id, answer, kind });
+    if (answeredAsks.has(ask.id)) return;
+    answeredAsks.add(ask.id);
+    // Let the user retry only if the answer never reached the backend.
+    void invoke('answer_ask', { askId: ask.id, answer, kind }).catch(() => {
+      answeredAsks.delete(ask.id);
+    });
   };
 
   // R-8.7: an ask recovered after a restart can never be answered — show it as
@@ -171,6 +183,7 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
     className: 'qd-ask-row-input',
     type: 'text',
     placeholder: 'Type an answer…',
+    'data-ask-id': ask.id,
     onkeydown: (ev: Event) => {
       const kev = ev as KeyboardEvent;
       if (kev.key === 'Enter') {
@@ -325,15 +338,80 @@ function renderGearIssue(hooksInstalled: boolean): void {
   elGear.classList.toggle('has-issue', !hooksInstalled);
 }
 
+/** In-progress state of a mirrored ask-row free-text field, captured before a
+ * rebuild so a `deck://state` push from an unrelated session can't wipe it. */
+interface PreservedAskInput {
+  value: string;
+  focused: boolean;
+  selStart: number | null;
+  selEnd: number | null;
+}
+
+/** Snapshot every ask-row input's value + focus/selection, keyed by ask id, so
+ * they survive the full `elContent` rebuild (R-8: the mirrored ask input is an
+ * interactive surface; an unrelated session's state change must not clear it). */
+function captureAskInputs(): Map<string, PreservedAskInput> {
+  const active = document.activeElement;
+  const preserved = new Map<string, PreservedAskInput>();
+  for (const el of elContent.querySelectorAll<HTMLInputElement>('.qd-ask-row-input')) {
+    const id = el.getAttribute('data-ask-id');
+    if (!id) continue;
+    preserved.set(id, {
+      value: el.value,
+      focused: el === active,
+      selStart: el.selectionStart,
+      selEnd: el.selectionEnd,
+    });
+  }
+  return preserved;
+}
+
+/** Restore captured ask-row input state onto the freshly-rebuilt inputs. */
+function restoreAskInputs(preserved: Map<string, PreservedAskInput>): void {
+  if (preserved.size === 0) return;
+  for (const el of elContent.querySelectorAll<HTMLInputElement>('.qd-ask-row-input')) {
+    const id = el.getAttribute('data-ask-id');
+    const prior = id ? preserved.get(id) : undefined;
+    if (!prior) continue;
+    el.value = prior.value;
+    if (prior.focused) {
+      el.focus();
+      try {
+        el.setSelectionRange(prior.selStart ?? prior.value.length, prior.selEnd ?? prior.value.length);
+      } catch {
+        /* setSelectionRange throws on some input types; value is already restored. */
+      }
+    }
+  }
+}
+
 function renderContent(snap: StateSnapshot): void {
+  const preservedAsks = captureAskInputs();
   clear(elContent);
   timeTicks = [];
   const settings = snap.settings;
   const onboardingActive = settings ? settings.onboardingDone === false : false;
+  const hasRows = snap.sessions.length > 0 || snap.asks.length > 0;
 
-  if (onboardingActive) {
+  // R-10.2: the one-time first-run onboarding card must NOT coexist with a
+  // populated session list. Hooks install into the shared, machine-wide
+  // `~/.claude/settings.json` while `onboardingDone` is per-data-dir, so a
+  // reinstall / new data dir can leave onboarding incomplete while sessions
+  // already flow. Stacking "Install hooks so sessions show up here" above a
+  // live, scrolling list both contradicts itself and fights the list for space.
+  // When sessions exist, hooks are obviously working: show the list (the gear
+  // issue-dot + hooks banner still guide any remaining setup); reserve the card
+  // for a genuine empty first run.
+  if (onboardingActive && !hasRows) {
     elContent.append(renderOnboarding(settings as SettingsState, snap.hooksInstalled));
-  } else if (!snap.hooksInstalled) {
+    if (installError) {
+      elContent.append(h('div', { className: 'qd-banner-error' }, [installError]));
+    }
+    elFooter.style.display = 'none';
+    return;
+  }
+
+  if (!snap.hooksInstalled) {
     elContent.append(renderHooksBanner());
   }
 
@@ -341,15 +419,13 @@ function renderContent(snap: StateSnapshot): void {
     elContent.append(h('div', { className: 'qd-banner-error' }, [installError]));
   }
 
-  const hasRows = snap.sessions.length > 0 || snap.asks.length > 0;
-
-  if (!hasRows && !onboardingActive) {
+  if (!hasRows) {
     elContent.append(renderEmptyState(snap.hooksInstalled));
     elFooter.style.display = 'none';
     return;
   }
 
-  elFooter.style.display = hasRows ? '' : 'none';
+  elFooter.style.display = '';
 
   const rows = h('div', { className: 'qd-rows' }, []);
   for (const ask of snap.asks) {
@@ -361,6 +437,7 @@ function renderContent(snap: StateSnapshot): void {
     rows.append(renderSessionRow(row));
   }
   elContent.append(rows);
+  restoreAskInputs(preservedAsks);
 }
 
 function renderFooter(counts: StateSnapshot['counts']): void {
@@ -368,17 +445,50 @@ function renderFooter(counts: StateSnapshot['counts']): void {
   elFooter.textContent = text.length > 0 ? text : ' ';
 }
 
-function toggleControl(label: string, checked: boolean, onToggle: (next: boolean) => void): HTMLElement {
-  return h('div', { className: 'qd-toggle-row' }, [
-    h('span', { className: 'qd-toggle-label' }, [label]),
-    h('button', {
-      className: 'qd-toggle',
-      type: 'button',
-      role: 'switch',
-      'aria-checked': String(checked),
-      onclick: () => onToggle(!checked),
-    }),
-  ]);
+/** Keys of the boolean settings driven by a `toggleControl`. */
+type ToggleKey = 'notifyIdle' | 'notifyAttention' | 'notifyReminder' | 'launchAtLogin';
+
+/** Optimistic per-toggle state while the user's clicks are outrunning the
+ * backend. `value` is the latest value the user's clicks asked for; `inFlight`
+ * counts `set_setting` calls not yet resolved. While `inFlight > 0` this value
+ * is authoritative for the control (over the server snapshot); once every one of
+ * our own writes has resolved the backend provably reflects our last write, so
+ * the entry is dropped and the server snapshot takes over again. This keeps N
+ * rapid clicks == N flips even when the round-trip can't keep up — worst on
+ * "Launch at login", whose real OS autostart I/O makes `set_setting` slow, so a
+ * value captured at render time goes stale and repeated clicks would otherwise
+ * compute the same next value and diverge from the click count. */
+const pendingToggles = new Map<ToggleKey, { value: boolean; inFlight: number }>();
+
+function toggleShownValue(key: ToggleKey, serverValue: boolean): boolean {
+  const pending = pendingToggles.get(key);
+  return pending ? pending.value : serverValue;
+}
+
+function toggleControl(key: ToggleKey, label: string, serverValue: boolean): HTMLElement {
+  const btn = h('button', {
+    className: 'qd-toggle',
+    type: 'button',
+    role: 'switch',
+    'aria-checked': String(toggleShownValue(key, serverValue)),
+    onclick: () => {
+      const next = !toggleShownValue(key, serverValue);
+      const pending = pendingToggles.get(key) ?? { value: next, inFlight: 0 };
+      pending.value = next;
+      pending.inFlight += 1;
+      pendingToggles.set(key, pending);
+      btn.setAttribute('aria-checked', String(next));
+      // Hold the optimistic value authoritative until THIS write resolves; only
+      // when no writes remain in flight do we let the server snapshot take over
+      // (it then reflects our last write). `set_setting` resolves after the
+      // backend has persisted + pushed, so this never hands back to a stale value.
+      void invoke('set_setting', { key, value: next }).finally(() => {
+        pending.inFlight -= 1;
+        if (pending.inFlight <= 0) pendingToggles.delete(key);
+      });
+    },
+  }) as HTMLButtonElement;
+  return h('div', { className: 'qd-toggle-row' }, [h('span', { className: 'qd-toggle-label' }, [label]), btn]);
 }
 
 /** R-8.6: when the `claude` CLI isn't on PATH, show the exact `claude mcp add …`
@@ -444,13 +554,13 @@ function renderSettings(snap: StateSnapshot): void {
     h('div', { className: 'qd-settings-body' }, [
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['Notifications']),
-        toggleControl('Notify when a session finishes', settings.notifyIdle, (v) => set('notifyIdle', v)),
-        toggleControl('Notify when a session needs you', settings.notifyAttention, (v) => set('notifyAttention', v)),
-        toggleControl('Remind me if a session is still waiting', settings.notifyReminder, (v) => set('notifyReminder', v)),
+        toggleControl('notifyIdle', 'Notify when a session finishes', settings.notifyIdle),
+        toggleControl('notifyAttention', 'Notify when a session needs you', settings.notifyAttention),
+        toggleControl('notifyReminder', 'Remind me if a session is still waiting', settings.notifyReminder),
       ]),
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['General']),
-        toggleControl('Launch Quarterdeck at login', settings.launchAtLogin, (v) => set('launchAtLogin', v)),
+        toggleControl('launchAtLogin', 'Launch Quarterdeck at login', settings.launchAtLogin),
       ]),
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['Hooks']),

@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::ipc::SettingValue;
 
@@ -215,10 +216,23 @@ pub fn save(dir: &Path, settings: &Settings) -> io::Result<()> {
     atomic_write(&settings_path(dir), &json)
 }
 
+/// Serializes the whole read-modify-write in [`set_setting`]. `load`/`save` are a
+/// plain read-then-overwrite of the whole file with no per-key merge, so two
+/// concurrent `set_setting` calls for *different* keys whose `[load..save]`
+/// windows overlap would otherwise race: the call that saves last writes back its
+/// own stale copy of the other key, silently discarding that update (and the JS
+/// `invoke('set_setting', …)` promise still resolves, so the UI never learns the
+/// toggle it "saved" didn't persist). A process-global lock is sufficient because
+/// every settings write goes through this one function.
+static SET_SETTING_LOCK: Mutex<()> = Mutex::new(());
+
 /// Loads, applies one `set_setting` intent, and atomically saves. Returns the
 /// resulting settings so callers (e.g. T7's autostart wiring) can react to
-/// the change immediately.
+/// the change immediately. The read-modify-write is serialized (see
+/// [`SET_SETTING_LOCK`]) so concurrent updates to different keys can't clobber
+/// each other.
 pub fn set_setting(dir: &Path, key: &str, value: SettingValue) -> io::Result<Settings> {
+    let _guard = SET_SETTING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut settings = load(dir);
     settings.apply(key, value);
     save(dir, &settings)?;

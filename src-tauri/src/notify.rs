@@ -151,16 +151,14 @@ pub fn compose(req: &ToastRequest) -> (String, String) {
     }
 }
 
-/// Truncates `s` to at most `max_chars` characters (char-boundary safe,
-/// Unicode-aware for R-5.3-style non-ASCII text), appending `…` when it was
-/// actually shortened, matching the `"<question…>"` shape from R-8.4.
+/// Truncates `s` to at most `max_chars` grapheme clusters, appending `…` when it
+/// was actually shortened, matching the `"<question…>"` shape from R-8.4. Reuses
+/// [`deck_core::naming::truncate_graphemes`] so the ask-toast title is truncated
+/// grapheme-cluster-safe (Unicode-aware for R-5.3-style text): a ZWJ emoji
+/// sequence or flag straddling the boundary is dropped whole, never severed
+/// mid-cluster.
 fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
-    let s = s.trim();
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{}…", truncated.trim_end())
+    deck_core::naming::truncate_graphemes(s.trim(), max_chars)
 }
 
 fn sound_for(kind: ToastKind) -> &'static str {
@@ -341,16 +339,24 @@ fn data_dir() -> PathBuf {
     platform_data_dir()
 }
 
+// NOTE: these mirror `settings::platform_data_dir` exactly — including the
+// `temp_dir()` fallback when the platform var is unset. Reached from the alert
+// toast hot path (`alert_icon_path`) whenever `QUARTERDECK_DATA_DIR` is unset, so
+// a stripped environment (a service/SYSTEM context, a sanitized launch) with no
+// `%APPDATA%`/`$HOME` must degrade, not panic the firing thread (R-3.5 "never
+// crash on the unexpected"), which an `.expect()` here would do.
 #[cfg(target_os = "windows")]
 fn platform_data_dir() -> PathBuf {
-    let appdata = std::env::var("APPDATA").expect("%APPDATA% must be set on Windows");
-    PathBuf::from(appdata).join("quarterdeck")
+    std::env::var("APPDATA")
+        .map(|appdata| PathBuf::from(appdata).join("quarterdeck"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("quarterdeck"))
 }
 
 #[cfg(target_os = "macos")]
 fn platform_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("$HOME must be set on macOS");
-    PathBuf::from(home).join("Library/Application Support/quarterdeck")
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support/quarterdeck"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("quarterdeck"))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -738,6 +744,40 @@ mod tests {
         assert!(title.ends_with('…'));
         assert!(title.chars().count() < long_question.chars().count());
         assert_eq!(body, long_question);
+    }
+
+    #[test]
+    fn ask_toast_truncation_never_severs_a_zwj_emoji_sequence() {
+        // R-5.3 Unicode safety on the toast hot path: a ZWJ family emoji
+        // (👨‍👩‍👧‍👦, seven scalars = one grapheme cluster) straddling the 60-char
+        // ask-title cap must be dropped whole, never severed into a lone prefix
+        // or a dangling ZWJ. Build a question whose cut would land inside it.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let detail = format!("{}{family} tail", "a".repeat(58));
+        let req = ToastRequest {
+            kind: ToastKind::Ask,
+            session_id: "s1".into(),
+            project: "quarterdeck".into(),
+            detail,
+        };
+        let (title, _) = compose(&req);
+        assert!(title.ends_with('…'));
+        // Cluster-aligned truncation can never leave a trailing ZWJ before the
+        // ellipsis (a whole family emoji has internal joiners, so we can't assert
+        // `!contains ZWJ`).
+        assert!(
+            !title.trim_end_matches('…').ends_with('\u{200D}'),
+            "no dangling ZWJ joiner in the toast title: {title:?}"
+        );
+        let whole = title.contains(family);
+        let none = !title.contains('\u{1F468}')
+            && !title.contains('\u{1F469}')
+            && !title.contains('\u{1F467}')
+            && !title.contains('\u{1F466}');
+        assert!(
+            whole || none,
+            "family emoji whole or dropped, never split: {title:?}"
+        );
     }
 
     #[test]

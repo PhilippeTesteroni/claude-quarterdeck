@@ -430,7 +430,13 @@ button {
 .qd-row-project {
   font-weight: 600;
   color: var(--text);
-  flex: 0 1 auto;
+  /* R-7.2: the project name stays legible; only the title ellipsizes. Do NOT
+     let this item flex-shrink (`0 0 auto`): a flex item with non-visible
+     overflow gets an automatic min-width of 0, so with `flex-shrink: 1` a wide
+     title's negative-space redistribution would crush even a 3-char project to
+     one glyph + ellipsis. Keeping shrink at 0 pins it to its natural width
+     (capped at 42%); the title, which has `min-width: 0`, absorbs all shrink. */
+  flex: 0 0 auto;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
