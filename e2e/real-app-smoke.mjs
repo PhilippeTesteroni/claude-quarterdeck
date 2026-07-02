@@ -148,6 +148,88 @@ function killTree(pid) {
 }
 
 /**
+ * The Tauri-forced WebView2 user-data folder for this app lives under
+ * `%LOCALAPPDATA%\pro.philippgross.quarterdeck` and is SHARED by every run of
+ * quarterdeck.exe on this machine. WebView2 runs ONE browser process per
+ * user-data folder, and `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` (our
+ * `--remote-debugging-port`) is only applied when that browser process is
+ * *created* — a new app instance that finds an existing/still-exiting browser
+ * process for the same folder joins it and the debug-port argument is
+ * silently dropped, so the CDP endpoint never opens no matter how long we
+ * poll. That was the ~1-in-3 smoke flake: `taskkill /T /F` returns before the
+ * msedgewebview2 process tree has fully exited, so a back-to-back run raced
+ * the previous run's dying browser process.
+ */
+const WEBVIEW_UDF_MARKER = 'pro.philippgross.quarterdeck';
+
+/**
+ * Lists quarterdeck-related processes that could steal/deny the WebView2
+ * debug port: any `quarterdeck.exe`, and any `msedgewebview2.exe` whose
+ * command line references the quarterdeck WebView2 user-data folder
+ * (browser/gpu/renderer/utility processes all carry `--user-data-dir=...`).
+ * Windows-only; returns [] elsewhere (the smoke targets the Windows exe).
+ */
+function listQuarterdeckProcesses() {
+  if (process.platform !== 'win32') return [];
+  const script =
+    `$ErrorActionPreference='SilentlyContinue';` +
+    `Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe' OR Name='quarterdeck.exe'" | ` +
+    `ForEach-Object { if ($_.Name -eq 'quarterdeck.exe' -or ($_.CommandLine -like '*${WEBVIEW_UDF_MARKER}*')) { "$($_.Name)|$($_.ProcessId)" } }`;
+  const out = execFileSync('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
+  ], { encoding: 'utf8' });
+  return out
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      const [name, pid] = l.split('|');
+      return { name, pid: Number(pid) };
+    })
+    .filter((p) => Number.isInteger(p.pid) && p.pid > 0 && p.pid !== process.pid);
+}
+
+/**
+ * Kills every stray quarterdeck.exe / quarterdeck-owned msedgewebview2.exe and
+ * WAITS until they are actually gone. Called (a) before launch, so our fresh
+ * app instance is guaranteed to create a brand-new WebView2 browser process
+ * that honours `--remote-debugging-port`, and (b) after killing our own child,
+ * so this script never leaves a lingering browser process behind to flake the
+ * next run. Throws after `timeoutMs` — pre-launch that is a real environment
+ * problem worth failing loudly on, not a race to paper over.
+ */
+async function ensureNoQuarterdeckProcesses(phase, timeoutMs = 15_000) {
+  if (process.platform !== 'win32') return;
+  const start = Date.now();
+  let firstPass = true;
+  for (;;) {
+    const procs = listQuarterdeckProcesses();
+    if (procs.length === 0) {
+      if (!firstPass) log(`${phase}: quarterdeck webview processes fully exited`);
+      return;
+    }
+    if (firstPass) {
+      log(`${phase}: found ${procs.length} leftover process(es): ${procs.map((p) => `${p.name}(${p.pid})`).join(', ')} — killing and waiting for exit`);
+      firstPass = false;
+    }
+    // quarterdeck.exe first (with /T so its own webview children go too),
+    // then any orphaned msedgewebview2 stragglers directly.
+    for (const p of procs.filter((x) => x.name.toLowerCase() === 'quarterdeck.exe')) killTree(p.pid);
+    for (const p of procs.filter((x) => x.name.toLowerCase() !== 'quarterdeck.exe')) {
+      try {
+        execFileSync('taskkill', ['/PID', String(p.pid), '/F'], { stdio: 'ignore' });
+      } catch {
+        // Already gone — fine.
+      }
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`${phase}: quarterdeck webview processes still alive after ${timeoutMs} ms: ${listQuarterdeckProcesses().map((p) => `${p.name}(${p.pid})`).join(', ')}`);
+    }
+    await sleep(500);
+  }
+}
+
+/**
  * One MCP JSON-RPC call against the running app's streamable-HTTP server.
  * Returns the `result` object (throws on RPC error / non-200). Notifications
  * (method `notifications/*`) resolve to `null` after asserting a 202.
@@ -190,8 +272,15 @@ async function main() {
     return;
   }
 
-  // Pre-flight: resolve a CDP debug port that is actually free, so a stray
-  // instance can't steal the connection and turn the DOM/screenshot gate into a
+  // Pre-flight 1: make sure NO quarterdeck WebView2 browser process exists.
+  // The user-data folder is shared machine-wide, so a leftover (or still
+  // exiting) browser process from a previous run/launch would make the fresh
+  // app instance JOIN it — silently dropping our --remote-debugging-port and
+  // guaranteeing a CDP-endpoint timeout (see WEBVIEW_UDF_MARKER doc comment).
+  await ensureNoQuarterdeckProcesses('pre-launch');
+
+  // Pre-flight 2: resolve a CDP debug port that is actually free, so a stray
+  // listener can't steal the connection and turn the DOM/screenshot gate into a
   // silent no-op (SPEC §11 requires all three assertions to run).
   const cdpPort = await pickFreeCdpPort(Number(flags['cdp-port'] ?? 9333));
   log(`using CDP debug port ${cdpPort}`);
@@ -283,11 +372,15 @@ async function main() {
     const { chromium } = await import('@playwright/test');
     // WebView2 opens its `--remote-debugging-port` CDP endpoint only after the
     // browser process behind the (hidden) popup webview has finished spinning
-    // up, which on a cold/first-run machine can lag the mcp.json startup signal
-    // by well over 10 s. The old 10 s ceiling turned that timing lag into a
-    // flaky hard FAIL on the SPEC §11 gate; poll (every 300 ms) up to 60 s so a
-    // slow-but-healthy handshake still connects. `isPortInUse` first, so we only
-    // attempt the (noisier) CDP connect once the port is actually listening.
+    // up, which on a cold/first-run machine (AV scan, WebView2 bootstrap) can
+    // lag the mcp.json startup signal by well over 10 s — poll (every 300 ms)
+    // up to 60 s so a slow-but-healthy handshake still connects. Note the
+    // endpoint appearing AT ALL is guaranteed by the pre-launch
+    // `ensureNoQuarterdeckProcesses` sweep: with no pre-existing browser
+    // process for the shared user-data folder, this run's app must create a
+    // fresh one, which is the only case where WebView2 applies our debug-port
+    // argument. `isPortInUse` first, so we only attempt the (noisier) CDP
+    // connect once the port is actually listening.
     const browser = await waitFor('WebView2 CDP endpoint', 60_000, async () => {
       if (!(await isPortInUse(cdpPort))) return null;
       try {
@@ -441,7 +534,17 @@ async function main() {
   if (!childExited) {
     log(`stopping app (pid ${child.pid})`);
     killTree(child.pid);
-    await sleep(500);
+  }
+  // Wait until the WebView2 browser process tree has actually exited —
+  // `taskkill /T /F` returns before the msedgewebview2 children are gone, and
+  // a lingering browser process makes the NEXT run's webview join it and drop
+  // its --remote-debugging-port (the old ~1-in-3 flake). Non-fatal here: the
+  // assertions above already decided pass/fail, and the next run's pre-launch
+  // sweep is the hard gate.
+  try {
+    await ensureNoQuarterdeckProcesses('post-run');
+  } catch (err) {
+    log(`WARN: ${err.message}`);
   }
   if (!keep) {
     rmSync(runDir, { recursive: true, force: true });

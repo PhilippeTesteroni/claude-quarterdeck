@@ -116,12 +116,28 @@ its `--remote-debugging-port` CDP endpoint behind the hidden popup webview. On a
 cold machine or immediately after a fresh `cargo build --release` (AV scanning
 the new binary, WebView2 first-run bootstrap), either can lag by tens of
 seconds. The script now waits up to 60 s for each (polling every 300 ms) so a
-slow-but-healthy startup connects instead of tripping a timing-only FAIL. If you
-still see `timed out waiting for: WebView2 CDP endpoint` after that, confirm the
-CDP port actually comes up (`Test-NetConnection 127.0.0.1 -Port <cdp-port>`
-while the app runs, default 9333) before treating it as an app regression —
-some locked-down/headless sessions never open the WebView2 debug port at all,
-which is an environment limitation, not a Quarterdeck bug.
+slow-but-healthy startup connects instead of tripping a timing-only FAIL.
+
+The historical ~1-in-3 `timed out waiting for: WebView2 CDP endpoint` flake had
+a different root cause than slowness, and no timeout fixes it: Tauri forces one
+WebView2 user-data folder for the app
+(`%LOCALAPPDATA%\pro.philippgross.quarterdeck`), WebView2 runs ONE browser
+process per user-data folder, and `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` only
+applies when that browser process is *created*. If a previous run's
+`msedgewebview2.exe` tree is still exiting (taskkill returns before it is gone)
+— or any other quarterdeck instance is running — the new app instance joins the
+existing browser process and the `--remote-debugging-port` argument is silently
+dropped, so the endpoint never opens. The smoke script now eliminates this
+deterministically: before launch (and again after killing its own app) it kills
+any stray `quarterdeck.exe` plus any `msedgewebview2.exe` whose command line
+references the quarterdeck user-data folder, and *waits until they have
+actually exited* before proceeding. Corollary: don't keep a real Quarterdeck
+instance running while the smoke runs — the script will kill it. If you still
+see the CDP timeout after all that, confirm the port actually comes up
+(`Test-NetConnection 127.0.0.1 -Port <cdp-port>` while the app runs, default
+9333) before treating it as an app regression — some locked-down/headless
+sessions never open the WebView2 debug port at all, which is an environment
+limitation, not a Quarterdeck bug.
 
 ### `scripts/inject-events.mjs` on its own
 
