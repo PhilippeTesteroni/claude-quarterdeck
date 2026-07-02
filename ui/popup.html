@@ -9,12 +9,30 @@
   <body>
     <main id="app">
       <header class="qd-header">
-        <span class="qd-wordmark">QUARTERDECK</span>
-        <div class="qd-watchline" aria-hidden="true"></div>
+        <div class="qd-header-row">
+          <span class="qd-wordmark">QUARTERDECK</span>
+          <button id="qd-gear" class="qd-gear" type="button" aria-label="Settings" title="Settings">
+            <span class="qd-gear-dot" aria-hidden="true"></span>
+            <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <path
+                d="M8 10.25a2.25 2.25 0 1 0 0-4.5 2.25 2.25 0 0 0 0 4.5Z"
+                stroke="currentColor"
+                stroke-width="1.2"
+              />
+              <path
+                d="M13.2 8.75c.03-.25.05-.5.05-.75s-.02-.5-.05-.75l1.4-1.1a.55.55 0 0 0 .13-.7l-1.33-2.3a.55.55 0 0 0-.67-.24l-1.65.66a5.6 5.6 0 0 0-1.3-.75L9.5 1.2a.55.55 0 0 0-.54-.45H7.04a.55.55 0 0 0-.54.45l-.24 1.76a5.6 5.6 0 0 0-1.3.75l-1.65-.66a.55.55 0 0 0-.67.24L1.31 5.6a.55.55 0 0 0 .13.7l1.4 1.1c-.03.25-.05.5-.05.75s.02.5.05.75l-1.4 1.1a.55.55 0 0 0-.13.7l1.33 2.3c.14.24.43.34.67.24l1.65-.66c.4.31.83.56 1.3.75l.24 1.76c.04.27.28.45.54.45h1.92c.26 0 .5-.18.54-.45l.24-1.76c.47-.19.9-.44 1.3-.75l1.65.66c.24.1.53 0 .67-.24l1.33-2.3a.55.55 0 0 0-.13-.7l-1.4-1.1Z"
+                stroke="currentColor"
+                stroke-width="1.1"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
+        <div id="qd-watchline" class="qd-watchline" aria-hidden="true"></div>
       </header>
-      <section id="content" class="qd-content">
-        <p class="qd-placeholder">Quarterdeck</p>
-      </section>
+      <section id="qd-content" class="qd-content"></section>
+      <footer id="qd-footer" class="qd-footer"></footer>
+      <div id="qd-settings" class="qd-settings" role="region" aria-label="Settings"></div>
     </main>
     <script type="module" src="/src/popup.ts"></script>
   </body>
