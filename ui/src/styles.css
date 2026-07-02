@@ -1,0 +1,77 @@
+/* Quarterdeck design tokens (SPEC §7). Full design system lands in T4. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --surface: #f6f8fa;
+  --border: #d0d7de;
+  --text: #1f2328;
+  --muted: #656d76;
+  --accent: #d97757;
+  --status-green: #1a7f37;
+  --status-yellow: #9a6700;
+  --status-red: #cf222e;
+  --status-gray: #8c959f;
+  font-family: -apple-system, "Segoe UI Variable", "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --status-green: #3fb950;
+    --status-yellow: #d29922;
+    --status-red: #f85149;
+    --status-gray: #6e7681;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+.qd-header {
+  padding: 12px 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.qd-wordmark {
+  font-family: "Cascadia Code", "SF Mono", ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--accent);
+}
+
+/* Signature watch line (SPEC §7) — placeholder segment, styled fully in T4. */
+.qd-watchline {
+  height: 2px;
+  margin-top: 10px;
+  background: var(--status-gray);
+  border-radius: 2px;
+}
+
+.qd-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100% - 48px);
+}
+
+.qd-placeholder {
+  color: var(--muted);
+  font-size: 14px;
+}

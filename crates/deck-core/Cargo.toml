@@ -1,0 +1,16 @@
+[package]
+name = "deck-core"
+description = "Pure-Rust engine behind Quarterdeck (no Tauri/GUI dependencies)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

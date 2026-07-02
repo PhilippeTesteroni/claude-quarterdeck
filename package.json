@@ -1,0 +1,26 @@
+{
+  "name": "quarterdeck",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Quarterdeck: command deck for your Claude Code fleet.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "ui:dev": "vite",
+    "ui:build": "vite build",
+    "ui:test": "echo \"ui:test placeholder (Playwright suite lands in T4/T8)\"",
+    "gen-icons": "node scripts/gen-icons.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "eslint": "^9",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8",
+    "vite": "^6"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  }
+}
