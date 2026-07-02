@@ -1,0 +1,8 @@
+# Playwright / npm artifacts for this isolated e2e project (kept out of the
+# shared root .gitignore, which is T0-owned — see this task's report).
+node_modules/
+test-results/
+report/
+playwright-report/
+blob-report/
+.cache/

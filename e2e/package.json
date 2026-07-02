@@ -1,0 +1,14 @@
+{
+  "name": "quarterdeck-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "T8: Playwright UI suite (mocked IPC) + real-app smoke driver. Deliberately a SEPARATE npm project (own node_modules) so the T8 task never has to touch the shared root package.json/package-lock.json (owned by T0/T7) just to add a devDependency.",
+  "scripts": {
+    "test": "playwright test",
+    "smoke": "node real-app-smoke.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0"
+  }
+}
