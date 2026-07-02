@@ -98,8 +98,9 @@ pub fn discover_sessions(
             let Some(mtime) = mtime_ms(&fpath) else {
                 continue;
             };
-            // R-5.4: only transcripts touched within the last 6 h.
-            if now_ms.saturating_sub(mtime) > DISCOVERY_MAX_AGE_MS {
+            // R-5.4: only transcripts touched within the last 6 h (strict
+            // `<6 h`: a transcript exactly at the boundary is excluded).
+            if now_ms.saturating_sub(mtime) >= DISCOVERY_MAX_AGE_MS {
                 continue;
             }
             let status = if now_ms.saturating_sub(mtime) < DISCOVERY_WORKING_WINDOW_MS {

@@ -26,16 +26,31 @@
 //! T3 is being built in parallel; T7 should make one call the other (or
 //! extract a tiny shared helper) once both exist.
 //!
-//! Toast click routing (R-9.6, "opens the popup / ask window") is **not**
-//! implemented here: `tauri-plugin-notification`'s desktop `show()` (as
-//! vendored, non-`windows7-compat`) fires the toast on a spawned task and
-//! discards the underlying `notify-rust` `NotificationHandle` that carries
-//! activation/click events, so there is currently no click callback surface
-//! exposed through the plugin's public API. Wiring R-9.6 for real would mean
-//! depending on `notify-rust` directly (not currently a declared dependency
-//! of `src-tauri`) to keep the handle and turn its activation event into a
-//! `deck://toast-clicked` Tauri event for `windows.rs`/`main.rs` to consume.
-//! Flagged in `missingDeps`/`notesForIntegrator` for T7.
+//! Toast click routing (R-9.6, "opens the popup / ask window"): implemented on
+//! both desktop platforms by firing real toasts through the OS-native backend
+//! with a click callback that emits [`TOAST_CLICKED_EVENT`]
+//! (`deck://toast-clicked`) carrying the toast's [`ToastKind`] + session id;
+//! `lib.rs` listens for it and opens the popup (or the ask window for `Ask`
+//! toasts). On Windows this is `tauri-winrt-notification` (the same WinRT
+//! backend `tauri-plugin-notification` uses under the hood) with an
+//! `.on_activated` handler. On macOS it is `mac-notification-sys` with
+//! `wait_for_click`, run on a detached thread (the click wait blocks until the
+//! user interacts with or dismisses the toast). Either path falls back to the
+//! plugin if the native send fails, so the toast still shows
+//! (R-9.1/9.2/9.3 never regress). On Windows, click delivery to our own
+//! `on_activated` requires the toast to carry the app's registered
+//! AppUserModelID (packaged builds); unregistered dev builds fall back to the
+//! pre-registered PowerShell AUMID so toasts appear at all, but their
+//! activation is owned by that AUMID, so click routing is a packaged-build
+//! feature there. Linux (a §13 non-goal) keeps the plugin path, which exposes
+//! no click callback.
+//!
+//! Alert icon (R-9.2, "red-badged icon variant where the platform allows"): the
+//! alert toast class (`Attention`/`Ask`) carries the red status icon so it is
+//! visually distinct from the quiet `Idle`/`Reminder` toasts. The OS toast APIs
+//! reference an icon by file path/URI (not embedded bytes), so the bundled red
+//! tray PNG is materialized once to a stable path under the data dir and reused
+//! (see [`alert_icon_path`]).
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -46,9 +61,24 @@ use std::time::{Duration, Instant};
 
 use deck_core::traits::Notifier;
 pub use deck_core::traits::ToastKind;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+#[cfg_attr(not(windows), allow(unused_imports))]
+use tauri::Emitter;
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::NotificationExt;
+
+/// Tauri event emitted when a native toast is clicked/activated (R-9.6). Payload
+/// is [`ToastClickPayload`]; `lib.rs` routes it to the popup or ask window.
+pub const TOAST_CLICKED_EVENT: &str = "deck://toast-clicked";
+
+/// Payload of [`TOAST_CLICKED_EVENT`]: which toast was clicked, so the shell can
+/// open the ask window for `Ask` toasts and the popup for everything else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToastClickPayload {
+    pub kind: ToastKind,
+    pub session_id: String,
+}
 
 /// Stable Windows AppUserModelID (R-9.3), matching `identifier` in
 /// `tauri.conf.json`. `tauri-plugin-notification` reads
@@ -140,6 +170,37 @@ fn sound_for(kind: ToastKind) -> &'static str {
         ToastKind::Idle | ToastKind::Reminder => idle_sound(),
         ToastKind::Attention | ToastKind::Ask => attention_sound(),
     }
+}
+
+/// Whether a toast kind is in the alert class (R-9.2): `Attention` (permission /
+/// elicitation) and `Ask`. These get the distinct alert sound and the
+/// red-badged icon; `Idle`/`Reminder` do not.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn is_alert(kind: ToastKind) -> bool {
+    matches!(kind, ToastKind::Attention | ToastKind::Ask)
+}
+
+/// Red status icon bytes (R-9.2 "red-badged icon variant"), embedded from the
+/// same tray asset the attention tray icon uses. Path is relative to this
+/// source file (`src-tauri/src/`), so `../../assets` reaches the repo-root
+/// `assets/`.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+const ALERT_ICON_PNG: &[u8] = include_bytes!("../../assets/tray/red-32.png");
+
+/// Materializes the embedded red alert icon to a stable on-disk path under the
+/// data dir and returns it (R-9.2). The OS toast APIs want a file path/URI, not
+/// embedded bytes, so this writes the PNG once and reuses it thereafter.
+/// Returns `None` (icon simply omitted) if the file can't be written.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn alert_icon_path() -> Option<PathBuf> {
+    let dir = data_dir().join("toast-icons");
+    let path = dir.join("alert-32.png");
+    if path.exists() {
+        return Some(path);
+    }
+    fs::create_dir_all(&dir).ok()?;
+    fs::write(&path, ALERT_ICON_PNG).ok()?;
+    Some(path)
 }
 
 // --- Windows sounds (R-9.1/R-9.2) ---------------------------------------
@@ -431,17 +492,189 @@ impl<R: Runtime> DesktopNotifier<R> {
             return;
         }
 
-        let result = self
+        #[cfg(windows)]
+        self.fire_windows(req, &title, &body, sound);
+        #[cfg(target_os = "macos")]
+        self.fire_macos(req, &title, &body, sound);
+        #[cfg(not(any(windows, target_os = "macos")))]
+        self.fire_via_plugin(req.kind, &title, &body, sound);
+    }
+
+    /// The proven `tauri-plugin-notification` path: always shows a toast, but
+    /// exposes no click callback. Used on Linux (§13 non-goal) and as the
+    /// Windows/macOS fallback when the native click-routing path can't fire
+    /// (R-9.1/9.2/9.3). Attaches the red alert icon for alert kinds (R-9.2).
+    fn fire_via_plugin(&self, kind: ToastKind, title: &str, body: &str, sound: &str) {
+        let mut builder = self
             .app
             .notification()
             .builder()
-            .title(title)
-            .body(body)
-            .sound(sound)
-            .show();
-        if let Err(err) = result {
+            .title(title.to_string())
+            .body(body.to_string())
+            .sound(sound);
+        if is_alert(kind) {
+            if let Some(icon) = alert_icon_path() {
+                builder = builder.icon(icon.to_string_lossy().into_owned());
+            }
+        }
+        if let Err(err) = builder.show() {
             tracing::warn!(?err, "failed to show toast");
         }
+    }
+
+    /// Windows path (R-9.6): fire via `tauri-winrt-notification` with an
+    /// `on_activated` handler emitting [`TOAST_CLICKED_EVENT`]; fall back to the
+    /// plugin if WinRT can't show it, so the toast is never lost.
+    #[cfg(windows)]
+    fn fire_windows(&self, req: &ToastRequest, title: &str, body: &str, sound: &str) {
+        if self.fire_windows_winrt(req, title, body, sound).is_err() {
+            self.fire_via_plugin(req.kind, title, body, sound);
+        }
+    }
+
+    #[cfg(windows)]
+    fn fire_windows_winrt(
+        &self,
+        req: &ToastRequest,
+        title: &str,
+        body: &str,
+        sound: &str,
+    ) -> tauri_winrt_notification::Result<()> {
+        use tauri_winrt_notification::{IconCrop, Sound, Toast};
+
+        // Match the plugin's AppUserModelID behavior (R-9.3): a packaged/installed
+        // build uses its own identifier so click activation reaches us; an
+        // unregistered dev build falls back to the pre-registered PowerShell
+        // AUMID so the toast shows at all (click routing then belongs to that
+        // AUMID — a packaged-build feature).
+        let app_id = if is_dev_exe() {
+            Toast::POWERSHELL_APP_ID.to_string()
+        } else {
+            self.app.config().identifier.clone()
+        };
+
+        let payload = ToastClickPayload {
+            kind: req.kind,
+            session_id: req.session_id.clone(),
+        };
+        let app = self.app.clone();
+
+        let mut toast = Toast::new(&app_id).title(title).text1(body);
+        // R-9.2: red-badged icon for the alert (Attention/Ask) toast class.
+        let alert_icon = if is_alert(req.kind) {
+            alert_icon_path()
+        } else {
+            None
+        };
+        if let Some(icon) = &alert_icon {
+            toast = toast.icon(icon, IconCrop::Square, "Quarterdeck alert");
+        }
+        if let Ok(s) = Sound::try_from(sound) {
+            toast = toast.sound(Some(s));
+        }
+        toast
+            .on_activated(move |_action| {
+                // R-9.6: click opens the popup (or ask window for ask toasts).
+                let _ = app.emit(TOAST_CLICKED_EVENT, payload.clone());
+                Ok(())
+            })
+            .show()?;
+        Ok(())
+    }
+
+    /// macOS path (R-9.6): fire via `mac-notification-sys` with `wait_for_click`
+    /// so a click routes to [`TOAST_CLICKED_EVENT`] (opening the popup, or the
+    /// ask window for `Ask` toasts) — the platform analog of the Windows
+    /// `.on_activated` handler. `send()` blocks until the user clicks or
+    /// dismisses the toast, so it runs on a detached thread. If the native send
+    /// fails (e.g. an unregistered bundle id in a dev build), it falls back to
+    /// the plugin so the toast is never lost (R-9.1/9.2/9.3). The red alert icon
+    /// (R-9.2) is attached for alert kinds.
+    #[cfg(target_os = "macos")]
+    fn fire_macos(&self, req: &ToastRequest, title: &str, body: &str, sound: &str) {
+        use mac_notification_sys::{set_application, Notification, NotificationResponse};
+
+        let app = self.app.clone();
+        let payload = ToastClickPayload {
+            kind: req.kind,
+            session_id: req.session_id.clone(),
+        };
+        let bundle_id = self.app.config().identifier.clone();
+        let title = title.to_string();
+        let body = body.to_string();
+        let sound = sound.to_string();
+        let icon = if is_alert(req.kind) {
+            alert_icon_path().map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        std::thread::spawn(move || {
+            // Best-effort: attribute the toast to Quarterdeck's bundle id (ignore
+            // errors — a non-bundled dev binary may not be registered, in which
+            // case `send()` below fails and we fall back to the plugin).
+            let _ = set_application(&bundle_id);
+
+            let response = {
+                let mut notification = Notification::new();
+                notification
+                    .title(&title)
+                    .message(&body)
+                    .wait_for_click(true);
+                if !sound.is_empty() {
+                    notification.sound(sound.as_str());
+                }
+                if let Some(ref icon_path) = icon {
+                    notification.app_icon(icon_path);
+                }
+                notification.send()
+            };
+
+            match response {
+                Ok(NotificationResponse::Click) | Ok(NotificationResponse::ActionButton(_)) => {
+                    // R-9.6: click opens the popup (or ask window for ask toasts).
+                    let _ = app.emit(TOAST_CLICKED_EVENT, payload);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "mac-notification-sys send failed; falling back to plugin"
+                    );
+                    let mut builder = app
+                        .notification()
+                        .builder()
+                        .title(title)
+                        .body(body)
+                        .sound(sound);
+                    if let Some(icon_path) = icon {
+                        builder = builder.icon(icon_path);
+                    }
+                    if let Err(err) = builder.show() {
+                        tracing::warn!(?err, "plugin fallback toast also failed");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// True when the running executable is an un-installed dev build
+/// (`target/debug` or `target/release`), mirroring the plugin's own check so
+/// the AppUserModelID decision matches (R-9.3).
+#[cfg(windows)]
+fn is_dev_exe() -> bool {
+    use std::path::MAIN_SEPARATOR as SEP;
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let dir = exe
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            dir.ends_with(&format!("{SEP}target{SEP}debug"))
+                || dir.ends_with(&format!("{SEP}target{SEP}release"))
+        }
+        Err(_) => false,
     }
 }
 

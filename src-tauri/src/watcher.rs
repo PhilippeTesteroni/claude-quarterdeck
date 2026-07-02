@@ -63,12 +63,18 @@ impl SpoolWatcher {
     }
 }
 
-/// Access events are noisy and never indicate new/changed spool data; every
-/// other kind (create, modify, remove, or a platform's generic "any") is
-/// worth waking the engine up for — spool consumption (parse → apply →
-/// delete, SPEC R-3.5) is idempotent against a stray extra wakeup.
+/// Only file arrivals/changes carry new spool (or answer) data to ingest.
+///
+/// `Access` events are pure noise. `Remove` events are excluded specifically to
+/// avoid a self-echo loop (SPEC R-3.5): the engine *deletes* every spool file it
+/// consumes and *moves* every malformed file to quarantine, and those deletions
+/// are themselves reported on the watched directory. Forwarding them re-queues a
+/// now-nonexistent path, whose `NotFound` read turns into a bogus "malformed
+/// spool file" quarantine+log — indistinguishable from a real malformed hook
+/// payload, defeating the diagnostic value of that log. A removed file can never
+/// be ingested, so dropping `Remove` loses nothing.
 fn is_relevant(kind: &EventKind) -> bool {
-    !matches!(kind, EventKind::Access(_))
+    !matches!(kind, EventKind::Access(_) | EventKind::Remove(_))
 }
 
 fn debounce_loop(raw_rx: Receiver<PathBuf>, out_tx: Sender<PathBuf>, debounce: Duration) {
@@ -209,15 +215,20 @@ mod tests {
     }
 
     #[test]
-    fn is_relevant_ignores_access_events() {
+    fn is_relevant_ignores_access_and_remove_events() {
         assert!(!is_relevant(&EventKind::Access(
             notify::event::AccessKind::Any
+        )));
+        // Remove is dropped so the engine's own consume/quarantine deletions
+        // don't self-echo as bogus "malformed" events (SPEC R-3.5).
+        assert!(!is_relevant(&EventKind::Remove(
+            notify::event::RemoveKind::Any
         )));
         assert!(is_relevant(&EventKind::Create(
             notify::event::CreateKind::Any
         )));
-        assert!(is_relevant(&EventKind::Remove(
-            notify::event::RemoveKind::Any
+        assert!(is_relevant(&EventKind::Modify(
+            notify::event::ModifyKind::Any
         )));
         assert!(is_relevant(&EventKind::Any));
     }

@@ -29,3 +29,15 @@ sysinfo = "0.39.5"
 axum = "0.8.9"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Windows toast click routing (R-9.6): the same WinRT backend
+# tauri-plugin-notification uses under the hood, but exposing `on_activated`.
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
+
+# macOS toast click routing (R-9.6): mac-notification-sys exposes `wait_for_click`
+# (returns which part of the toast the user clicked) — the plugin's desktop path
+# has no click callback. Same backend `notify-rust` already uses under the hood,
+# so it's already in the lockfile as a transitive dep.
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys = "0.6"

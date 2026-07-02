@@ -45,6 +45,8 @@ interface InternalAsk {
   options?: string[];
   timeoutAt?: number;
   createdAt: number;
+  /** R-8.7: recovered-after-restart ask — renders as expired, Dismiss-only. */
+  orphaned?: boolean;
 }
 
 const params = new URLSearchParams(location.search);
@@ -66,6 +68,9 @@ function defaultSettings(): SettingsState {
     launchAtLogin: false,
     onboardingDone: true,
     mcpEnabled: true,
+    mcpCliAvailable: true,
+    mcpCommand:
+      'claude mcp add --transport http --scope user quarterdeck http://127.0.0.1:53017/mcp --header "Authorization: Bearer mock-token"',
     dataDir: 'C:/Users/phily/AppData/Roaming/quarterdeck',
     version: '0.1.0',
   };
@@ -255,6 +260,36 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
       },
     ],
   }),
+  'ask-orphaned': () => ({
+    // R-8.7: an ask recovered from disk after a restart. Its MCP connection is
+    // gone, so it can never be answered — it renders as expired with only a
+    // Dismiss action (no options, no free-text field, no live countdown).
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(40),
+      }),
+    ],
+    asks: [
+      {
+        id: 'a1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        question: 'Migrate the settings schema now, or defer to the next release?',
+        options: ['Migrate now', 'Defer'],
+        // No timeoutAt: the recovered ask is already expired, not counting down.
+        createdAt: Date.now() - 120_000,
+        orphaned: true,
+      },
+    ],
+  }),
   error: () => ({
     hooksInstalled: false,
     settings: defaultSettings(),
@@ -276,9 +311,29 @@ function loadScenario(name: string): void {
 
 loadScenario(params.get('scenario') ?? 'default');
 
+// R-7.3 status priority; mirrors the Rust engine so the mock — standing in for
+// the backend — emits snapshots already in the engine's canonical order. The
+// dumb frontend (R-3.4) renders this order verbatim and never re-sorts.
+const STATUS_PRIORITY: Record<SessionStatus, number> = {
+  attention: 0,
+  working: 1,
+  idle: 2,
+  dead: 3,
+};
+
 function snapshot(): StateSnapshot {
   const now = Date.now();
-  const rows: SessionRow[] = sessions.map((s) => ({
+  // Sort exactly as `SessionStore::view` does: by status priority, then
+  // most-recently-active first (the mock has only `statusChangedAt`, its analog
+  // of the engine's `last_activity_ms`), then a stable id tiebreak.
+  const ordered = [...sessions].sort((a, b) => {
+    const byStatus = STATUS_PRIORITY[a.status] - STATUS_PRIORITY[b.status];
+    if (byStatus !== 0) return byStatus;
+    const byActivity = b.statusChangedAt - a.statusChangedAt;
+    if (byActivity !== 0) return byActivity;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  const rows: SessionRow[] = ordered.map((s) => ({
     id: s.id,
     project: s.project,
     title: s.title,
@@ -296,6 +351,7 @@ function snapshot(): StateSnapshot {
     options: a.options,
     timeoutAt: a.timeoutAt,
     context: a.context,
+    orphaned: a.orphaned,
   }));
   const counts = {
     attention: sessions.filter((s) => s.status === 'attention').length,
@@ -379,6 +435,10 @@ export async function invoke<K extends keyof Commands>(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
     }
+    case 'resize_popup':
+      // No window to size in mock/browser mode — accept and ignore.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
     default:
       throw new Error(`quarterdeck mock: unknown command ${String(cmd)}`);
   }

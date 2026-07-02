@@ -26,15 +26,21 @@
  * Electron and Tauri apps. `Page.captureScreenshot` renders straight from
  * the compositor, independent of OS-level window visibility.
  *
- * There is no dedicated Rust-side "tray test hook" in this codebase (grepped
- * for one; none of T3/T7's modules expose the aggregate tray status via a
- * file, command, or debug event) — see the notesForIntegrator in this task's
- * report. This script substitutes for it by reading the popup DOM over the
- * same CDP connection: `StateSnapshot` (and therefore the tray's
- * `TrayStatus::worst_of`, which is a pure function of the identical
- * `Counts`) is derived from the same in-memory `Shell` the popup renders, so
- * asserting the popup's rendered row/dot statuses is an equivalent,
- * evidence-based check on the aggregate state the tray icon would show.
+ * Tray test hook (SPEC §11 "assert tray icon changes (via test hook)"): in the
+ * fake-notifier mode this run uses, `tray::update` appends the status it just
+ * passed to `TrayIcon::set_icon` to `<data>/tray-state.jsonl` (see
+ * `src-tauri/src/tray.rs`). This script asserts that file's last entry matches
+ * the worst-of status of the injected fleet — a direct check on the real icon
+ * swap, not just the popup DOM. The popup DOM read below is kept as a
+ * complementary, per-row check.
+ *
+ * MCP round-trip (SPEC §11 "MCP: scripted Node client calls ask_user, test
+ * answers via answer_ask command, asserts returned value"): this script also
+ * drives the real MCP HTTP server the running exe serves — it calls `ask_user`
+ * (blocking), answers it through the real `answer_ask` Tauri command (invoked
+ * over the popup's CDP page), and asserts the value the blocked call returns.
+ * That exercises the whole §3.1 ask channel against the built app: MCP ->
+ * gateway -> ask -> answer_ask -> answers/ -> disk-watch -> MCP unblock.
  *
  * Usage:
  *   node e2e/real-app-smoke.mjs [--exe <path-to-quarterdeck.exe>] [--keep]
@@ -48,6 +54,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
 import process from 'node:process';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -89,6 +96,41 @@ async function waitFor(label, timeoutMs, checkFn) {
   throw new Error(`timed out waiting for: ${label}${lastErr ? ` (last error: ${lastErr.message})` : ''}`);
 }
 
+/**
+ * Resolves whether *something* is already listening on 127.0.0.1:<port>. Used to
+ * pre-flight the WebView2 CDP debug port: a stray quarterdeck.exe (or anything
+ * else) bound to the same port would otherwise silently steal our CDP connection,
+ * so the DOM/screenshot assertions would run against the wrong process — or, if
+ * they were non-fatal, be skipped entirely while the script still printed PASS.
+ */
+function isPortInUse(port) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = (inUse) => {
+      socket.destroy();
+      resolve(inUse);
+    };
+    socket.once('connect', () => done(true));
+    socket.once('error', () => resolve(false));
+    socket.setTimeout(700, () => done(false));
+  });
+}
+
+/**
+ * Picks a CDP debug port that is provably free right now, starting from
+ * `preferred` and probing upward. Avoids the hardcoded-port collision the old
+ * script had: with a stray instance already on 9333, connecting there found no
+ * popup.html target, which used to be swallowed as a warning (a false PASS).
+ */
+async function pickFreeCdpPort(preferred) {
+  for (let port = preferred; port < preferred + 50; port += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    if (!(await isPortInUse(port))) return port;
+    log(`CDP port ${port} is already in use (a stray quarterdeck.exe?) — trying ${port + 1}`);
+  }
+  throw new Error(`no free CDP port found in ${preferred}..${preferred + 49}`);
+}
+
 function killTree(pid) {
   if (process.platform === 'win32') {
     try {
@@ -105,17 +147,54 @@ function killTree(pid) {
   }
 }
 
+/**
+ * One MCP JSON-RPC call against the running app's streamable-HTTP server.
+ * Returns the `result` object (throws on RPC error / non-200). Notifications
+ * (method `notifications/*`) resolve to `null` after asserting a 202.
+ */
+async function mcpRpc(endpoint, token, method, params, idRef) {
+  const isNotification = method.startsWith('notifications/');
+  const message = { jsonrpc: '2.0', method, params };
+  if (!isNotification) {
+    idRef.id += 1;
+    message.id = idRef.id;
+  }
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(message),
+  });
+  if (isNotification) {
+    if (res.status !== 202) throw new Error(`${method}: expected 202, got ${res.status}`);
+    return null;
+  }
+  const text = await res.text();
+  if (res.status !== 200) throw new Error(`${method}: HTTP ${res.status}: ${text}`);
+  const json = JSON.parse(text);
+  if (json.error) throw new Error(`${method}: RPC error ${json.error.code}: ${json.error.message}`);
+  return json.result;
+}
+
 async function main() {
   const flags = parseArgs(process.argv.slice(2));
   const exe = flags.exe ?? join(repoRoot, 'target', 'release', 'quarterdeck.exe');
   const keep = flags.keep === 'true';
-  const cdpPort = Number(flags['cdp-port'] ?? 9333);
 
   if (!existsSync(exe)) {
-    log(`FAIL: built exe not found at ${exe} (run 'cargo build --release' first, or pass --exe)`);
+    log(`FAIL: built exe not found at ${exe} (run 'npm run tauri build' first — a bare 'cargo build --release' binary loads the dev URL and fails the UI assertions; or pass --exe)`);
     process.exitCode = 1;
     return;
   }
+
+  // Pre-flight: resolve a CDP debug port that is actually free, so a stray
+  // instance can't steal the connection and turn the DOM/screenshot gate into a
+  // silent no-op (SPEC §11 requires all three assertions to run).
+  const cdpPort = await pickFreeCdpPort(Number(flags['cdp-port'] ?? 9333));
+  log(`using CDP debug port ${cdpPort}`);
 
   const runDir = mkdtempSync(join(tmpdir(), 'quarterdeck-smoke-'));
   const dataDir = join(runDir, 'data');
@@ -139,14 +218,19 @@ async function main() {
   let childExited = false;
   child.on('exit', () => { childExited = true; });
 
-  const hardFailures = []; // flip the exit code
-  const warnings = []; // reported, but a documented/worked-around issue
+  const hardFailures = []; // any entry flips the exit code to 1
 
   try {
     // --- 1. wait for startup (mcp.json is only written once the MCP server
     //    has bound, i.e. well past spool replay + cold-start discovery) ----
     const mcpJsonPath = join(dataDir, 'mcp.json');
-    await waitFor('app startup (<data>/mcp.json written)', 20_000, () => {
+    // Generous startup budget: a freshly built exe on a cold machine (AV scan of
+    // the new binary, WebView2 first-run bootstrap, spool replay + cold-start
+    // discovery) can take well past 20 s to reach `setup()` and bind the MCP
+    // server. `waitFor` polls every 300 ms, so a fast start still returns fast;
+    // the ceiling only bounds a genuine hang, so keep it high to avoid a
+    // timing-only FAIL (SPEC §11 hard gate must not be flaky).
+    await waitFor('app startup (<data>/mcp.json written)', 60_000, () => {
       if (childExited) throw new Error('app process exited before starting up');
       return existsSync(mcpJsonPath);
     });
@@ -173,16 +257,39 @@ async function main() {
     });
     log(`notifier-calls.jsonl OK — ${calls.length} call(s) recorded:`);
     for (const c of calls) log(`  ${c.kind} [${c.sessionId}] "${c.title}" / "${c.body}"`);
+
+    // --- 3b. assert the tray icon actually changed (SPEC §11 test hook) -----
+    // The fleet has an `attention` session, so the worst-of tray status (R-2.6)
+    // must be `attention`. `tray::update` records each real `set_icon` swap to
+    // <data>/tray-state.jsonl in fake-notifier mode.
+    const trayStatePath = join(dataDir, 'tray-state.jsonl');
+    const trayStatus = await waitFor('tray-state.jsonl showing attention (worst-of)', 15_000, () => {
+      if (!existsSync(trayStatePath)) return null;
+      const lines = readFileSync(trayStatePath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      if (lines.length === 0) return null;
+      const last = lines[lines.length - 1];
+      return last.status === 'attention' ? last : null;
+    });
+    log(`tray-state.jsonl OK — tray icon swapped to "${trayStatus.status}" (counts ${JSON.stringify(trayStatus.counts)})`);
   } catch (err) {
-    hardFailures.push(`notifier assertion: ${err.message}`);
+    hardFailures.push(`notifier/tray assertion: ${err.message}`);
     log(`FAIL: ${err.message}`);
   }
 
-  // --- 4. best-effort: CDP screenshot + DOM read of the popup (see header
-  //    comment — substitutes for the nonexistent tray test hook) ----------
+  // --- 4. required: CDP screenshot + DOM read of the popup (SPEC §11; see
+  //    header comment — substitutes for the nonexistent tray test hook). Any
+  //    failure below is a hard failure (see the catch), not a warning. -------
   try {
     const { chromium } = await import('@playwright/test');
-    const browser = await waitFor('WebView2 CDP endpoint', 10_000, async () => {
+    // WebView2 opens its `--remote-debugging-port` CDP endpoint only after the
+    // browser process behind the (hidden) popup webview has finished spinning
+    // up, which on a cold/first-run machine can lag the mcp.json startup signal
+    // by well over 10 s. The old 10 s ceiling turned that timing lag into a
+    // flaky hard FAIL on the SPEC §11 gate; poll (every 300 ms) up to 60 s so a
+    // slow-but-healthy handshake still connects. `isPortInUse` first, so we only
+    // attempt the (noisier) CDP connect once the port is actually listening.
+    const browser = await waitFor('WebView2 CDP endpoint', 60_000, async () => {
+      if (!(await isPortInUse(cdpPort))) return null;
       try {
         return await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
       } catch {
@@ -190,49 +297,47 @@ async function main() {
       }
     });
     try {
-      const contexts = browser.contexts();
-      let popupPage;
-      for (const ctx of contexts) {
-        for (const p of ctx.pages()) {
-          if (p.url().includes('popup.html')) popupPage = p;
+      // WebView2 registers the hidden popup window's CDP page target a beat
+      // after the debug endpoint starts answering, so poll (re-listing
+      // contexts/pages) rather than enumerating once — checking a single time
+      // races the target registration and makes the assertion silently not run.
+      const popupPage = await waitFor('popup.html CDP target', 20_000, () => {
+        for (const ctx of browser.contexts()) {
+          for (const p of ctx.pages()) {
+            if (p.url().includes('popup.html')) return p;
+          }
         }
-      }
-      if (!popupPage) throw new Error('no popup.html target found over CDP (windows may not have painted yet)');
+        return null;
+      });
 
-      // KNOWN ISSUE (discovered by this script, not fixed here — outside
-      // T8's owned paths): this repo ships with no `src-tauri/capabilities/`
-      // file at all, so Tauri v2's default-deny ACL blocks every
-      // plugin-namespaced JS->Rust call, INCLUDING `event.listen`. That
-      // means the frontend's live `deck://state` push (R-3.4) never
-      // arrives — the popup only ever reflects whatever `get_state()`
-      // returned at initial page load, and then goes stale forever. Custom
-      // `#[tauri::command]`s (get_state, remove_row, answer_ask, ...) are
-      // NOT gated the same way and work fine, which is why a fresh
-      // `page.reload()` (re-running the initial `get_state()` priming
-      // call) is a faithful, if unfortunate, way to observe current
-      // backend state here. See this task's report for the full repro and
-      // the suggested fix (add a capabilities file granting `core:default`
-      // to the popup/ask windows).
+      // R-3.4 live push gate: `event.listen('deck://state')` MUST be permitted
+      // by Tauri's ACL, otherwise the frontend never live-updates and the popup
+      // is permanently stale (onboarding never renders, rows never change). This
+      // requires a `src-tauri/capabilities/*.json` granting `core:event` to the
+      // popup/ask windows. A blocked listen is a HARD failure here (R-11.1: a
+      // green smoke must mean the core architecture actually works), not a
+      // silently-tolerated warning.
       const listenResult = await popupPage.evaluate(async () => {
         try {
-          await window.__TAURI__.event.listen('deck://state', () => {});
+          const unlisten = await window.__TAURI__.event.listen('deck://state', () => {});
+          unlisten();
           return { ok: true };
         } catch (err) {
           return { ok: false, error: String(err) };
         }
       });
       if (!listenResult.ok) {
-        log(`WARN: event.listen is blocked by Tauri ACL (${listenResult.error}) — no capabilities file exists in src-tauri/. ` +
-          'The popup will never live-update; reloading to read a fresh get_state() snapshot instead.');
-        warnings.push(
+        log(`FAIL: event.listen is blocked by Tauri ACL (${listenResult.error}) — the live deck://state push (R-3.4) never reaches any window.`);
+        hardFailures.push(
           `event.listen blocked by ACL ("${listenResult.error}") — R-3.4 live push (deck://state) does not reach ` +
-          'any window; worked around here via page.reload() (get_state() itself is unaffected). Needs a ' +
-          'src-tauri/capabilities file (outside T8-owned paths) — see notesForIntegrator.',
+          'any window; the popup can never live-update. Needs a src-tauri/capabilities file granting core:event.',
         );
+        // Still reload to read a get_state() snapshot so the DOM checks below can
+        // run and surface any additional issues, but the run has already failed.
         await popupPage.reload({ waitUntil: 'load' });
         await popupPage.waitForSelector('#qd-content', { state: 'attached' });
       } else {
-        log('event.listen succeeded (deck://state push works) — no reload needed.');
+        log('event.listen succeeded (deck://state live push works) — R-3.4 verified.');
       }
 
       const rowStatuses = await popupPage.evaluate(() =>
@@ -260,17 +365,76 @@ async function main() {
       const screenshotPath = join(screenshotDir, 'popup-live-smoke.png');
       await popupPage.screenshot({ path: screenshotPath });
       log(`screenshot saved: ${screenshotPath}`);
+
+      // --- MCP ask_user round-trip answered via the real answer_ask command --
+      // (SPEC §11): scripted client -> ask_user (blocks) -> answer through the
+      // real Tauri `answer_ask` command (invoked over CDP, writing to
+      // <data>/answers/) -> the disk-watch unblocks the MCP call -> assert the
+      // returned {answer, kind}. This exercises the full §3.1 ask channel on the
+      // real built exe, which nothing else in the repo covers end-to-end.
+      try {
+        const mcp = JSON.parse(readFileSync(join(dataDir, 'mcp.json'), 'utf8'));
+        const endpoint = `http://127.0.0.1:${mcp.port}/mcp`;
+        const idRef = { id: 0 };
+        await mcpRpc(endpoint, mcp.token, 'initialize', {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'quarterdeck-real-app-smoke', version: '1.0.0' },
+        }, idRef);
+        await mcpRpc(endpoint, mcp.token, 'notifications/initialized', {}, idRef);
+
+        const question = 'Real-app smoke: proceed with the deploy?';
+        const options = ['Yes', 'No'];
+        // Fire the blocking ask_user; do NOT await yet — it stays open until we
+        // answer it via answer_ask below.
+        const askPromise = mcpRpc(endpoint, mcp.token, 'tools/call', {
+          name: 'ask_user',
+          arguments: { question, options, context: join(runDir, 'projects'), timeout_seconds: 60 },
+        }, idRef);
+
+        // Wait for the ask to surface in the real Shell state, then read its id
+        // from a real get_state snapshot over the popup's Tauri bridge.
+        const askId = await waitFor('ask_user question in app state', 20_000, async () => {
+          const snap = await popupPage.evaluate(() => window.__TAURI__.core.invoke('get_state'));
+          const ask = (snap.asks || []).find((a) => a.question === question);
+          return ask ? ask.id : null;
+        });
+        log(`ask_user surfaced as ask "${askId}"`);
+
+        // Answer it through the REAL answer_ask command (not a mock).
+        await popupPage.evaluate(
+          ({ id }) => window.__TAURI__.core.invoke('answer_ask', { askId: id, answer: 'Yes', kind: 'option' }),
+          { id: askId },
+        );
+
+        // The blocked MCP call must now return the answer we submitted.
+        const call = await askPromise;
+        const structured = call.structuredContent || JSON.parse(call.content[0].text);
+        if (structured.answer !== 'Yes' || structured.kind !== 'option') {
+          hardFailures.push(
+            `MCP ask_user round-trip: expected {answer:"Yes", kind:"option"}, got ${JSON.stringify(structured)}`,
+          );
+          log(`FAIL: MCP ask_user returned ${JSON.stringify(structured)}`);
+        } else {
+          log(`MCP ask_user round-trip OK -> {answer:"${structured.answer}", kind:"${structured.kind}"} (via real answer_ask)`);
+        }
+      } catch (err) {
+        hardFailures.push(`MCP ask_user round-trip did not complete: ${err.message}`);
+        log(`FAIL: MCP ask_user round-trip: ${err.message}`);
+      }
     } finally {
       await browser.close().catch(() => {});
     }
   } catch (err) {
-    // The CDP connection itself (WebView2 debug port never responding, no
-    // popup.html target found at all) is a harness/environment problem
-    // distinct from an actual state-content mismatch — reported, but kept
-    // out of hardFailures so a machine without loopback CDP access still
-    // gets a clean signal from the (already-passed) notifier assertion.
-    log(`WARN: screenshot/DOM check did not complete: ${err.message}`);
-    warnings.push(`screenshot/DOM check did not complete: ${err.message}`);
+    // SPEC §11 requires the E2E smoke to assert the tray-equivalent per-row
+    // statuses AND capture the popup screenshot — not just the notifier trail.
+    // A failure to connect over CDP, find the popup target, or write the
+    // screenshot means those two assertions never ran, so it is a HARD failure
+    // (R-11.1: a green smoke must mean all three checks actually passed), not a
+    // silently-tolerated warning. The port is pre-flighted free above, so this
+    // is a real regression signal, not a routine port collision.
+    log(`FAIL: screenshot/DOM check did not complete: ${err.message}`);
+    hardFailures.push(`screenshot/DOM check did not complete: ${err.message}`);
   }
 
   // --- cleanup --------------------------------------------------------------
@@ -285,10 +449,6 @@ async function main() {
     log(`--keep set: leaving ${runDir} in place`);
   }
 
-  if (warnings.length > 0) {
-    log(`${warnings.length} warning(s) (did not fail the run):`);
-    for (const w of warnings) log(`  - ${w}`);
-  }
   if (hardFailures.length === 0) {
     log('PASS');
   } else {

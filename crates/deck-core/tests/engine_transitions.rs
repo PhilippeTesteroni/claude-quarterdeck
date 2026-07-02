@@ -55,13 +55,27 @@ fn elicitation_dialog_enters_attention() {
 }
 
 #[test]
-fn idle_prompt_does_not_change_status_and_emits_no_toast() {
-    // R-2.3
+fn idle_prompt_does_not_change_status_but_emits_reminder_toast() {
+    // R-2.3 / R-9.5: `idle_prompt` leaves the status idle, but the engine emits a
+    // Reminder toast decision (the shell gates it on the default-off
+    // `notifyReminder` toggle).
     let (mut s, _c) = store_at(T0);
     s.on_event(&session_start("a", "/p", T0));
     s.on_event(&stop("a", T0 + 10)); // now idle
     let fx = s.on_event(&notification("a", "idle_prompt", None, T0 + 20));
     assert_eq!(s.status_of("a"), Some(Status::Idle));
+    assert_eq!(toast_kinds(&fx), [ToastKind::Reminder]);
+}
+
+#[test]
+fn idle_prompt_while_working_emits_nothing() {
+    // A stray idle_prompt that arrives while the session is working (not idle)
+    // is inert — no status change, no reminder.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 10)); // working
+    let fx = s.on_event(&notification("a", "idle_prompt", None, T0 + 20));
+    assert_eq!(s.status_of("a"), Some(Status::Working));
     assert!(fx.is_empty());
 }
 
@@ -210,6 +224,197 @@ fn throttle_is_per_session() {
     let b = s.on_event(&stop("b", T0 + 100));
     assert_eq!(a.len(), 1);
     assert_eq!(b.len(), 1);
+}
+
+#[test]
+fn throttle_is_per_status_kind_not_global() {
+    // R-9.4: the throttle is per (session, kind). A prior idle toast must NOT
+    // swallow a genuinely-different, more-urgent attention toast within 10 s.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 1));
+    let idle_fx = s.on_event(&stop("a", T0 + 100)); // idle toast
+    assert_eq!(toast_kinds(&idle_fx), [ToastKind::Idle]);
+    // Within the same 10 s window, a real attention transition still fires.
+    let att_fx = s.on_event(&notification("a", "permission_prompt", Some("q"), T0 + 200));
+    assert_eq!(
+        toast_kinds(&att_fx),
+        [ToastKind::Attention],
+        "a different kind is not throttled by the prior idle toast"
+    );
+}
+
+#[test]
+fn suppressed_toast_refund_releases_the_throttle_slot() {
+    // R-9.4 + R-9.5: a toast the shell suppresses (its per-type toggle is off)
+    // must NOT consume the throttle window. The engine stamps on emit; the shell
+    // calls `refund_toast` on suppression, so the next same-kind toast still
+    // fires once the toggle is re-enabled — even within the 10 s window.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 1));
+    s.on_event(&stop("a", T0 + 100)); // idle toast (kind Idle)
+
+    // First idle_prompt → reminder toast emitted (engine stamps the slot).
+    let first = s.on_event(&notification("a", "idle_prompt", None, T0 + 200));
+    assert_eq!(toast_kinds(&first), [ToastKind::Reminder]);
+    let Effect::Toast(decision) = &first[0];
+    assert_eq!(decision.at_ms, T0 + 200);
+
+    // Shell found notifyReminder OFF → no toast shown → refund the slot.
+    s.refund_toast("a", ToastKind::Reminder, decision.at_ms);
+
+    // A second idle_prompt ~1 s later (well within 10 s) still fires, because
+    // the suppressed one never really spent the window.
+    let second = s.on_event(&notification("a", "idle_prompt", None, T0 + 1_200));
+    assert_eq!(
+        toast_kinds(&second),
+        [ToastKind::Reminder],
+        "a refunded (never-shown) toast must not throttle the next same-kind toast"
+    );
+}
+
+#[test]
+fn popup_suppressed_toast_refund_releases_the_throttle_slot() {
+    // R-9.4: a toast the notifier suppresses because the popup is visible AND
+    // focused shares the exact same refund path as the R-9.5 toggle-off case —
+    // no toast actually shows, so the shell calls `refund_toast` and the slot is
+    // released. Guards the composition the shell relies on (fire_effects): a
+    // popup-suppressed same-kind toast must not silently spend the 10 s window
+    // and drop the next legitimate one after the popup loses focus/closes.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 1));
+
+    // First turn finishes → Idle toast emitted (engine stamps Idle @ T0+100).
+    let first = s.on_event(&stop("a", T0 + 100));
+    assert_eq!(toast_kinds(&first), [ToastKind::Idle]);
+    let Effect::Toast(decision) = &first[0];
+    assert_eq!(decision.kind, ToastKind::Idle);
+    assert_eq!(decision.at_ms, T0 + 100);
+
+    // The popup was visible AND focused, so the notifier suppressed the toast
+    // (returned false) → the shell refunds the slot (R-9.4).
+    s.refund_toast("a", ToastKind::Idle, decision.at_ms);
+
+    // A new turn ending ~2.9 s later (well within 10 s) still fires its Idle
+    // toast, because the suppressed one never really spent the window.
+    s.on_event(&prompt("a", "again", T0 + 2_000));
+    let second = s.on_event(&stop("a", T0 + 3_000));
+    assert_eq!(
+        toast_kinds(&second),
+        [ToastKind::Idle],
+        "a popup-suppressed (never-shown) toast must not throttle the next same-kind toast"
+    );
+}
+
+#[test]
+fn a_shown_toast_is_not_refunded_and_still_throttles_the_burst() {
+    // The converse guard: when the shell does NOT refund (toast shown), the
+    // R-9.4 throttle still collapses a same-kind burst within 10 s.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 1));
+    s.on_event(&stop("a", T0 + 100));
+
+    let first = s.on_event(&notification("a", "idle_prompt", None, T0 + 200));
+    assert_eq!(toast_kinds(&first), [ToastKind::Reminder]);
+    // No refund: the toast was shown.
+    let second = s.on_event(&notification("a", "idle_prompt", None, T0 + 1_200));
+    assert!(second.is_empty(), "a shown toast still throttles the burst");
+}
+
+#[test]
+fn refund_only_clears_a_matching_stamp() {
+    // `refund_toast` must be a no-op when the stamp was replaced by a newer
+    // toast (defensive: it only releases the slot it was told about).
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 1));
+    s.on_event(&stop("a", T0 + 100)); // stamps Idle @ T0+100
+
+    // A stale/wrong at_ms must not release the current Idle slot.
+    s.refund_toast("a", ToastKind::Idle, T0 + 999);
+    s.on_event(&prompt("a", "again", T0 + 200));
+    let within = s.on_event(&stop("a", T0 + 5_000));
+    assert!(
+        within.is_empty(),
+        "a non-matching refund must not release the throttle slot"
+    );
+}
+
+#[test]
+fn worst_status_ranks_idle_above_dead() {
+    // R-2.6: worst-of ordering red > yellow > green > gray, i.e. idle outranks
+    // dead in the tray aggregate.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start_full(
+        "gone",
+        "/p",
+        Some("/t/gone.jsonl"),
+        Some(4321),
+        None,
+        T0,
+    ));
+    let procs = FakeProcessTable::new(); // pid 4321 absent → dead
+    s.poll_liveness(&procs, |_p| None);
+    assert_eq!(s.status_of("gone"), Some(Status::Dead));
+    // A lone dead session → worst is gray/dead.
+    assert_eq!(s.worst_status(), Some(Status::Dead));
+    // Add an idle session: idle must now win the worst-of.
+    s.on_event(&session_start("live", "/p", T0));
+    assert_eq!(
+        s.worst_status(),
+        Some(Status::Idle),
+        "idle (green) outranks dead (gray)"
+    );
+}
+
+#[test]
+fn view_sorts_dead_last_below_idle() {
+    // R-7.3 / R-2.6: dead rows sort to the very bottom, below idle. The three
+    // live rows carry pids so the liveness poll that kills `gone` leaves them be.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start_full("idle", "/p", None, Some(1), None, T0));
+    s.on_event(&session_start_full(
+        "work",
+        "/p",
+        None,
+        Some(2),
+        None,
+        T0 + 1,
+    ));
+    s.on_event(&prompt("work", "x", T0 + 1));
+    s.on_event(&session_start_full(
+        "att",
+        "/p",
+        None,
+        Some(3),
+        None,
+        T0 + 2,
+    ));
+    s.on_event(&notification("att", "permission_prompt", None, T0 + 2));
+    s.on_event(&session_start_full(
+        "gone",
+        "/p",
+        None,
+        Some(999),
+        None,
+        T0 + 3,
+    ));
+
+    // Table keeps 1/2/3 alive; 999 is absent → dead.
+    let procs = FakeProcessTable::new()
+        .with(1, "node.exe")
+        .with(2, "node.exe")
+        .with(3, "node.exe");
+    s.poll_liveness(&procs, |_p| None);
+    assert_eq!(s.status_of("gone"), Some(Status::Dead));
+    assert_eq!(s.status_of("att"), Some(Status::Attention));
+
+    let view = s.view();
+    let order: Vec<&str> = view.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(order, ["att", "work", "idle", "gone"]);
 }
 
 #[test]

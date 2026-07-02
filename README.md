@@ -13,7 +13,7 @@ Run several agents in parallel terminals and you already know the problem:
 there's no answer to "who needs me right now?" without alt-tabbing through
 every window. Quarterdeck puts that answer in your tray.
 
-![Quarterdeck popup — three sessions and two pending asks, dark theme](docs/screenshots/popup-dark.png)
+![Quarterdeck popup — five sessions and two pending asks, dark theme](docs/screenshots/popup-dark.png)
 
 ## Why Quarterdeck (the ask-channel differentiator)
 

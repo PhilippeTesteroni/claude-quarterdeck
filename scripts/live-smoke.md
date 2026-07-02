@@ -12,10 +12,12 @@ Three layers, cheapest/most automated first:
   before any public release, and after any change to `hooks/**`,
   `mcp_server.rs`, `notify.rs`, or the hook-installer path in `lib.rs`.
 
-Read the **Known issues** section at the end before you run Part C — there
-is one currently-open bug (no Tauri capabilities file → the popup never
-live-updates) that will make the popup *look* broken during manual testing
-even though the underlying engine/toast/MCP pipeline is fine.
+The popup live-updates correctly: `src-tauri/capabilities/default.json` grants
+the `core:event` ACL that lets `event.listen('deck://state')` deliver the live
+push (R-3.4), and `e2e/real-app-smoke.mjs` asserts it as a hard gate. See the
+**Resolved** section at the end for the history. If the popup ever *does* look
+frozen during Part C, treat that as a regression and check that capabilities
+file first.
 
 ---
 
@@ -48,10 +50,23 @@ onboarding, Cyrillic/CJK rendering, and dark/light/reduced-motion.
 ## Part B — E2E smoke (real built app, synthetic events)
 
 ```powershell
-cargo build --release   # (or a full `npm run tauri build`)
+npm run tauri build     # NOT a bare `cargo build --release` — see note below
 cd e2e
 node real-app-smoke.mjs
 ```
+
+> **Build with `npm run tauri build`, not a bare `cargo build --release`.**
+> A plain `cargo build --release` does not enable Tauri's `custom-protocol`
+> feature, so the resulting `quarterdeck.exe` still loads the **dev URL**
+> (`http://localhost:1420`, `src-tauri/tauri.conf.json` → `build.devUrl`)
+> instead of the bundled `ui/dist`. Launched standalone (no Vite dev server on
+> 1420) its webviews fail to load — the popup shows `chrome-error://…`, so the
+> CDP DOM read, screenshot, `event.listen` ACL check, and MCP round-trip all
+> fail even though the notifier/tray pipeline passes. `npm run tauri build`
+> produces a self-contained binary that serves `ui/dist` over the app protocol,
+> which is what the UI-side assertions require. (If you must smoke a bare
+> `cargo build --release` binary, run `npm run ui:dev` in a second terminal
+> first so the dev URL resolves.)
 
 What it does (see the header comment in `e2e/real-app-smoke.mjs` for the
 full detail):
@@ -77,15 +92,36 @@ full detail):
    `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<n>` for
    this), reads the rendered rows, and saves a screenshot to
    `docs/screenshots/popup-live-smoke.png`. This substitutes for the "tray
-   test hook" SPEC §11 mentions — no such hook exists in the codebase (see
-   Known issues), so the popup's rendered `.qd-row` statuses (driven by the
-   same `Shell`/`StateSnapshot` the tray icon reads) stand in for it.
+   test hook" SPEC §11 mentions — no such hook exists in the codebase, so the
+   popup's rendered `.qd-row` statuses (driven by the same `Shell`/
+   `StateSnapshot` the tray icon reads) stand in for it. The CDP connect, the
+   DOM read, and the screenshot are all **hard** assertions now — if any of
+   them can't complete, the run fails (it does not fall back to a warning).
 6. Kills the app and deletes the temp dir (pass `--keep` to skip cleanup for
    post-mortem debugging, `--exe <path>` to point at a different binary,
-   `--cdp-port <n>` if 9333 is taken).
+   `--cdp-port <n>` to change the starting CDP debug port — the script probes
+   upward from there for a free one, so a stray instance on the default 9333
+   no longer collides).
 
-Exit code 0 on pass. As of this writing: **PASS**, with one warning (the ACL
-issue below, worked around automatically inside the script).
+Exit code 0 on pass, 1 on any assertion failure; there are no soft warnings —
+every check (notifier trail, tray hook, CDP screenshot/DOM read, the
+`event.listen('deck://state')` ACL check, MCP `ask_user` round-trip) is a hard
+gate. The ACL check in particular is a hard gate (a blocked listen fails the
+run), not a worked-around warning — see the **Resolved** section below.
+
+One timing caveat worth knowing before you read a red run as a code regression:
+steps 2 and 5 both depend on things the app brings up asynchronously — the MCP
+server binding (`mcp.json`) and, for the screenshot/DOM block, WebView2 opening
+its `--remote-debugging-port` CDP endpoint behind the hidden popup webview. On a
+cold machine or immediately after a fresh `cargo build --release` (AV scanning
+the new binary, WebView2 first-run bootstrap), either can lag by tens of
+seconds. The script now waits up to 60 s for each (polling every 300 ms) so a
+slow-but-healthy startup connects instead of tripping a timing-only FAIL. If you
+still see `timed out waiting for: WebView2 CDP endpoint` after that, confirm the
+CDP port actually comes up (`Test-NetConnection 127.0.0.1 -Port <cdp-port>`
+while the app runs, default 9333) before treating it as an app regression —
+some locked-down/headless sessions never open the WebView2 debug port at all,
+which is an environment limitation, not a Quarterdeck bug.
 
 ### `scripts/inject-events.mjs` on its own
 
@@ -156,8 +192,9 @@ $env:QUARTERDECK_CLAUDE_DIR = $smokeClaudeDir
    questions** — confirm it copies `skills/quarterdeck/SKILL.md` to
    `$smokeClaudeDir\skills\quarterdeck\SKILL.md` (R-8.6); if the `claude`
    CLI is on PATH it also runs `claude mcp add` for you (check with
-   `claude mcp list --scope user` under the same `CLAUDE_CONFIG_DIR`, see
-   step 4). Click **Yes**/**No** on "Launch at login?", then **Continue**.
+   `claude mcp list` under the same `CLAUDE_CONFIG_DIR`, see step 4 — note
+   `mcp list` takes no `--scope` option, unlike `mcp add`/`mcp remove`).
+   Click **Yes**/**No** on "Launch at login?", then **Continue**.
 
 4. In a **second** terminal, point the real `claude` CLI at the same
    isolated config dir and start a session in some scratch project:
@@ -204,54 +241,18 @@ $env:QUARTERDECK_CLAUDE_DIR = $smokeClaudeDir
 
 ---
 
-## Known issues found while building this procedure
+## Resolved: live `deck://state` push (was: no capabilities file)
 
-**No Tauri v2 capabilities file exists (`src-tauri/capabilities/` is
-entirely absent) → the frontend's `deck://state` live push never arrives in
-any window.** Confirmed by `e2e/real-app-smoke.mjs` against the real built
-app:
+Earlier builds shipped with no Tauri v2 capabilities file, so the default-deny
+ACL blocked `event.listen('deck://state')` and the frontend never live-updated
+(the popup froze on its first `get_state()` snapshot). This is now **fixed**:
+`src-tauri/capabilities/default.json` grants `core:event` (+ `core:window:hide`
+for Esc-to-hide) to the `popup` and `ask` windows, so the live push arrives and
+the popup/ask window update on every state change.
 
-```
-window.__TAURI__.event.listen('deck://state', () => {})
-  → rejects: "Command plugin:event|listen not allowed by ACL"
-window.__TAURI__.core.invoke('get_state')
-  → resolves fine (custom app commands aren't gated the same way)
-```
-
-Practical effect: **the popup only ever shows whatever `get_state()`
-returned the moment its webview first loaded** (once, at app startup,
-before any session exists) **and then never updates again for the rest of
-the app's lifetime** — not on new sessions, not on status changes, not on
-new asks. Re-clicking the tray icon just re-shows the same stale, frozen
-window (R-3.6 keeps it alive rather than destroying/recreating it, which
-normally would have masked this by re-priming on every open). Toasts still
-fire correctly (`notify.rs` calls the plugin from Rust, which isn't subject
-to the JS-side ACL), and the MCP `ask_user`/`notify_user` round trip is
-unaffected server-side — but the ask window and popup will not visibly
-reflect either without a full app restart.
-
-During Part C, if the popup looks frozen after step 4's first row should
-have appeared, that is this bug, not a regression you introduced — restart
-Quarterdeck to re-observe current state, or (if you have the CDP debug flag
-set per Part B) `page.reload()` the webview.
-
-**Suggested fix** (outside T8's owned paths — `e2e/**`,
-`scripts/inject-events.mjs`, this file — so not applied here): add a
-`src-tauri/capabilities/default.json` granting at least `core:default`
-(bundles `core:event:default`, `core:window:default`, etc.) to the `popup`
-and `ask` windows, e.g.:
-
-```json
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "windows": ["popup", "ask"],
-  "permissions": ["core:default"]
-}
-```
-
-then re-verify `event.listen` resolves and Esc-to-hide
-(`windows.rs::setup_popup_behavior`'s injected
-`window.__TAURI__.window.getCurrentWindow().hide()`, which very likely has
-the same ACL problem — same root cause, not separately re-verified here)
-works from a real keypress.
+`e2e/real-app-smoke.mjs` now asserts this as a **hard** gate:
+`event.listen('deck://state', …)` must resolve; if it were ever blocked again
+the smoke run fails (rather than warning). During Part C the popup should show
+new rows/status changes live without a restart; if it doesn't, check that the
+capabilities file is present and that `cargo build` regenerated
+`src-tauri/gen/schemas/capabilities.json`.

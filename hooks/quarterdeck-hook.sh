@@ -20,9 +20,13 @@ set +e
 
 # Validate JSON with whatever parser is available. A parser is only trusted if
 # it round-trips a trivial document first, so a broken interpreter stub (e.g. a
-# Windows Store python3 alias) cannot make us drop valid events. When no working
-# parser is present we fail open: the caller's `{ ... }` brace guard already ran,
-# and the deck quarantines any malformed spool file it later reads (R-3.5).
+# Windows Store python3 alias) cannot make us drop valid events. Order:
+# python3, jq, then perl+JSON::PP (a core module since Perl 5.14, so this covers
+# a stock macOS — a spec target — where python3 is a gated stub and jq is
+# absent). If NONE is a working parser we fail CLOSED (return non-zero -> write
+# nothing) rather than spool brace-wrapped garbage: R-4.3's per-script contract
+# is "garbage stdin -> write nothing", which the cheap `{ ... }` brace guard
+# alone cannot guarantee.
 json_is_valid() {
     if command -v python3 >/dev/null 2>&1 &&
         printf '{}' | python3 -c 'import sys,json; json.load(sys.stdin)' >/dev/null 2>&1; then
@@ -34,7 +38,12 @@ json_is_valid() {
         printf '%s' "$1" | jq -e . >/dev/null 2>&1
         return $?
     fi
-    return 0
+    if command -v perl >/dev/null 2>&1 &&
+        printf '{}' | perl -MJSON::PP -e 'decode_json(do { local $/; <STDIN> })' >/dev/null 2>&1; then
+        printf '%s' "$1" | perl -MJSON::PP -e 'decode_json(do { local $/; <STDIN> })' >/dev/null 2>&1
+        return $?
+    fi
+    return 1
 }
 
 # UTC ISO-8601; millisecond precision on GNU date, second precision on BSD/macOS.
@@ -60,7 +69,7 @@ claude_ancestor_pid() {
         comm="$(ps -o comm= -p "$ppid" 2>/dev/null)"
         base="${comm##*/}"
         case "$base" in
-            claude | claude-* | node | node-* | bun | bun-*)
+            claude | node | bun)
                 printf '%s' "$ppid"
                 return 0
                 ;;

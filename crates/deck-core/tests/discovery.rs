@@ -68,6 +68,23 @@ fn skips_transcripts_older_than_6h() {
 }
 
 #[test]
+fn skips_a_transcript_exactly_at_the_6h_boundary() {
+    // R-5.4 says "mtime <6 h" (strict): a transcript exactly at the boundary is
+    // excluded, not kept.
+    let (dir, mtime) = make_transcript("slug", "sess-boundary", USER_LINE);
+    let now = mtime + DISCOVERY_MAX_AGE_MS; // age == exactly 6 h
+    let found = discover_sessions(dir.path(), &HashSet::new(), now);
+    assert!(
+        found.is_empty(),
+        "an exactly-6h-old transcript must be excluded by the strict <6h cutoff"
+    );
+
+    // One millisecond fresher than the boundary is still discovered.
+    let found_fresh = discover_sessions(dir.path(), &HashSet::new(), now - 1);
+    assert_eq!(found_fresh.len(), 1);
+}
+
+#[test]
 fn skips_already_known_sessions() {
     let (dir, mtime) = make_transcript("slug", "known", USER_LINE);
     let now = mtime + 1000;

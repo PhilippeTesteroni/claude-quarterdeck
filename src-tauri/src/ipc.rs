@@ -61,6 +61,11 @@ pub struct AskRow {
     /// `AskRow.context` in `ui/src/ipc-contract.ts`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub context: Option<String>,
+    /// R-8.7: true when this ask was recovered from disk after a restart — it can
+    /// never be answered (its MCP connection is gone), so the UI shows it as
+    /// expired with only a Dismiss action.
+    #[serde(default)]
+    pub orphaned: bool,
 }
 
 /// Per-status session counts shown in the footer.
@@ -86,6 +91,14 @@ pub struct SettingsState {
     pub onboarding_done: bool,
     /// Agent-questions (MCP) enabled, R-8.6.
     pub mcp_enabled: bool,
+    /// R-8.6: whether the `claude` CLI is on PATH. When false, the settings pane
+    /// shows `mcp_command` for the user to run manually ("else shows the exact
+    /// command to copy").
+    pub mcp_cli_available: bool,
+    /// R-8.6: the exact `claude mcp add …` command (with the real port + token)
+    /// to register the MCP server by hand. `None` until the server is up.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mcp_command: Option<String>,
     pub data_dir: String,
     pub version: String,
 }
@@ -306,6 +319,14 @@ pub fn uninstall_hooks(state: tauri::State<AppState>, app: tauri::AppHandle) -> 
     set_hooks_installed(&state, &app, false)
 }
 
+/// Resizes the popup to fit its content within the 460..=560 band (SPEC R-7.1
+/// grow-then-scroll). The frontend measures its own content height and calls
+/// this; all clamping/anchoring lives in Rust (R-3.4).
+#[tauri::command]
+pub fn resize_popup(app: tauri::AppHandle, content_height: f64) -> Result<(), String> {
+    crate::windows::resize_popup_to_content(&app, content_height)
+}
+
 fn set_hooks_installed(
     state: &tauri::State<AppState>,
     app: &tauri::AppHandle,
@@ -401,6 +422,7 @@ mod tests {
                     options: None,
                     timeout_at: None,
                     context: None,
+                    orphaned: false,
                 },
                 AskRow {
                     id: "ask-2".to_string(),
@@ -410,6 +432,7 @@ mod tests {
                     options: None,
                     timeout_at: None,
                     context: None,
+                    orphaned: false,
                 },
             ],
             ..Default::default()

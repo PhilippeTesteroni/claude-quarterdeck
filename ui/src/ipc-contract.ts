@@ -37,6 +37,12 @@ export interface AskRow {
    * T3/T7: mirror on the Rust `AskRow` in `src-tauri/src/ipc.rs`.
    */
   context?: string;
+  /**
+   * R-8.7: true when this ask was recovered from disk after a restart — it can
+   * never be answered (its MCP connection is gone), so it renders as expired
+   * with only a Dismiss action.
+   */
+  orphaned?: boolean;
 }
 
 export interface Counts {
@@ -65,6 +71,17 @@ export interface SettingsState {
   onboardingDone: boolean;
   /** Agent-questions (MCP) enabled, R-8.6. */
   mcpEnabled: boolean;
+  /**
+   * R-8.6: whether the `claude` CLI is on PATH. When false, the settings pane
+   * shows `mcpCommand` for the user to run by hand ("else shows the exact
+   * command to copy").
+   */
+  mcpCliAvailable: boolean;
+  /**
+   * R-8.6: the exact `claude mcp add …` command (with the real port + token).
+   * Undefined until the MCP server is up.
+   */
+  mcpCommand?: string;
   dataDir: string;
   version: string;
 }
@@ -103,6 +120,12 @@ export interface Commands {
   install_hooks: () => Promise<void>;
   uninstall_hooks: () => Promise<void>;
   get_state: () => Promise<StateSnapshot>;
+  /**
+   * Popup content self-measurement for the grow-then-scroll window (R-7.1). The
+   * frontend reports its content height; the shell clamps it to 460..=560 and
+   * resizes/re-anchors the window (all sizing logic stays in Rust, R-3.4).
+   */
+  resize_popup: (args: { contentHeight: number }) => Promise<void>;
 }
 
 export type CommandName = keyof Commands;

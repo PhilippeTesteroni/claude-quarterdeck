@@ -2851,6 +2851,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "deck-core",
+ "mac-notification-sys",
  "notify",
  "serde",
  "serde_json",
@@ -2859,6 +2860,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-notification",
+ "tauri-winrt-notification",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

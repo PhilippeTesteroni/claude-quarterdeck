@@ -4,7 +4,9 @@
 //!
 //! Filled in by T3.
 
-use tauri::{AppHandle, Manager, PhysicalPosition, Rect, WebviewWindow, WindowEvent};
+use std::sync::Mutex;
+
+use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Rect, WebviewWindow, WindowEvent};
 
 /// Label of the popup window declared in `tauri.conf.json`.
 pub const POPUP_LABEL: &str = "popup";
@@ -14,6 +16,36 @@ pub const ASK_LABEL: &str = "ask";
 /// Gap, in physical pixels, kept between the tray icon and the anchored
 /// popup (SPEC R-7.1 "anchored to tray icon").
 const ANCHOR_GAP_PX: i32 = 6;
+
+/// Popup logical width and the base/cap heights (SPEC R-7.1: "360×460
+/// (max-height 560 then scroll)"): it grows with content from 460 up to a
+/// 560 cap, beyond which the content area scrolls.
+const POPUP_W: f64 = 360.0;
+const POPUP_MIN_H: f64 = 460.0;
+const POPUP_MAX_H: f64 = 560.0;
+
+/// The tray-icon rect the popup was last anchored to. Kept so a content-driven
+/// [`resize_popup_to_content`] can re-anchor the (possibly visible) popup
+/// without waiting for a fresh tray click — otherwise growing the window would
+/// extend it over the taskbar/tray instead of away from it.
+static LAST_TRAY_RECT: Mutex<Option<Rect>> = Mutex::new(None);
+
+fn remember_tray_rect(rect: Rect) {
+    if let Ok(mut guard) = LAST_TRAY_RECT.lock() {
+        *guard = Some(rect);
+    }
+}
+
+fn last_tray_rect() -> Option<Rect> {
+    LAST_TRAY_RECT.lock().ok().and_then(|guard| *guard)
+}
+
+/// Pure clamp for the popup's grow-then-scroll band (SPEC R-7.1): content
+/// shorter than 460 keeps the base height; taller content grows up to 560,
+/// beyond which the window stays at 560 and the content area scrolls.
+fn popup_target_height(content_px: f64) -> f64 {
+    content_px.clamp(POPUP_MIN_H, POPUP_MAX_H)
+}
 
 fn popup_window(app: &AppHandle) -> Result<WebviewWindow, String> {
     app.get_webview_window(POPUP_LABEL)
@@ -32,11 +64,22 @@ fn ask_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 pub fn setup_popup_behavior(app: &AppHandle) -> Result<(), String> {
     let popup = popup_window(app)?;
 
-    let on_blur = popup.clone();
-    popup.on_window_event(move |event| {
-        if let WindowEvent::Focused(false) = event {
-            let _ = on_blur.hide();
+    let on_event = popup.clone();
+    popup.on_window_event(move |event| match event {
+        WindowEvent::Focused(false) => {
+            let _ = on_event.hide();
         }
+        // R-3.6: the popup is created once and only hidden/shown — never
+        // destroyed. A native close (the OS window `closable: false` flag is
+        // best-effort and does not cover every accelerator, e.g. Alt+F4) would
+        // otherwise destroy the webview and permanently break the tray, since
+        // `popup_window()` would return `None` on every subsequent click.
+        // Prevent the destroy and hide instead.
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = on_event.hide();
+        }
+        _ => {}
     });
 
     // Esc-to-hide: injected via the global Tauri JS API
@@ -58,6 +101,7 @@ pub fn setup_popup_behavior(app: &AppHandle) -> Result<(), String> {
 /// Positions the popup near the tray icon and shows/focuses it, or hides it
 /// if it's already visible (SPEC R-7.1: click toggles).
 pub fn toggle_popup(app: &AppHandle, tray_rect: Rect) -> Result<(), String> {
+    remember_tray_rect(tray_rect);
     let popup = popup_window(app)?;
     let visible = popup.is_visible().map_err(|err| err.to_string())?;
     if visible {
@@ -66,6 +110,44 @@ pub fn toggle_popup(app: &AppHandle, tray_rect: Rect) -> Result<(), String> {
     anchor_near_tray(&popup, tray_rect)?;
     popup.show().map_err(|err| err.to_string())?;
     popup.set_focus().map_err(|err| err.to_string())
+}
+
+/// Shows and focuses the popup near the tray icon (used by toast-click routing,
+/// SPEC R-9.6). Unlike [`toggle_popup`] it never hides an already-open popup —
+/// a toast click should always bring the deck forward.
+pub fn open_popup(app: &AppHandle) -> Result<(), String> {
+    let popup = popup_window(app)?;
+    if let Some(rect) = last_tray_rect() {
+        let _ = anchor_near_tray(&popup, rect);
+    }
+    popup.show().map_err(|err| err.to_string())?;
+    popup.set_focus().map_err(|err| err.to_string())
+}
+
+/// Resizes the popup to fit `content_px` logical pixels of content, clamped to
+/// the 460..=560 band (SPEC R-7.1 grow-then-scroll). A visible popup is
+/// re-anchored so it grows away from the tray edge rather than over it. The
+/// frontend measures its own content height and drives this via the
+/// `resize_popup` command (R-3.4: logic stays in Rust, the view just reports a
+/// number).
+pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), String> {
+    let popup = popup_window(app)?;
+    let target_h = popup_target_height(content_px);
+    let scale = popup.scale_factor().map_err(|err| err.to_string())?;
+    let current_h = popup.inner_size().map_err(|err| err.to_string())?.height as f64 / scale;
+    // Avoid churn: only resize when the height meaningfully changes.
+    if (current_h - target_h).abs() < 1.0 {
+        return Ok(());
+    }
+    popup
+        .set_size(LogicalSize::new(POPUP_W, target_h))
+        .map_err(|err| err.to_string())?;
+    if popup.is_visible().unwrap_or(false) {
+        if let Some(rect) = last_tray_rect() {
+            let _ = anchor_near_tray(&popup, rect);
+        }
+    }
+    Ok(())
 }
 
 /// Pure geometry for [`anchor_near_tray`]: given the tray icon's rect, the
@@ -245,5 +327,21 @@ mod tests {
         let (x, y) = compute_center_position((420, 260), WORK_AREA);
         assert_eq!(x, (1920 - 420) / 2);
         assert_eq!(y, (1040 - 260) / 2);
+    }
+
+    #[test]
+    fn popup_height_grows_then_caps_at_560() {
+        // SPEC R-7.1 "360×460 (max-height 560 then scroll)".
+        assert_eq!(
+            popup_target_height(120.0),
+            POPUP_MIN_H,
+            "short content → base 460"
+        );
+        assert_eq!(popup_target_height(500.0), 500.0, "grows with content");
+        assert_eq!(
+            popup_target_height(900.0),
+            POPUP_MAX_H,
+            "capped at 560, then scrolls"
+        );
     }
 }

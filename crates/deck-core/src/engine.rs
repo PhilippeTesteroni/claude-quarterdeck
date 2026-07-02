@@ -89,6 +89,11 @@ pub struct ToastDecision {
     pub kind: ToastKind,
     pub project: String,
     pub detail: String,
+    /// Event timestamp this decision was throttled against (R-9.4). The shell
+    /// passes it back to [`SessionStore::refund_toast`] when it suppresses the
+    /// toast for a reason the engine can't see (R-9.5 toggle off), so a
+    /// never-shown toast doesn't consume the throttle window.
+    pub at_ms: u64,
 }
 
 /// Output events the reducer emits for the shell to act on. State itself is read
@@ -149,7 +154,10 @@ struct Session {
     /// Receipt time of the Notification that put us in `attention` (R-2.2 anchor).
     last_notification_ms: Option<u64>,
     dead_since_ms: Option<u64>,
-    last_toast_ms: Option<u64>,
+    /// Last emission time per toast kind (R-9.4: the throttle is per
+    /// `(session, status-change kind)`, so an idle toast never swallows a
+    /// genuinely-different attention/reminder alert within the same window).
+    last_toast_ms: HashMap<ToastKind, u64>,
 }
 
 impl Session {
@@ -173,7 +181,7 @@ impl Session {
             attention_from_hook: false,
             last_notification_ms: None,
             dead_since_ms: None,
-            last_toast_ms: None,
+            last_toast_ms: HashMap::new(),
         }
     }
 
@@ -245,9 +253,9 @@ impl Session {
         );
     }
 
-    fn throttle_ok(&self, ts_ms: u64) -> bool {
-        match self.last_toast_ms {
-            Some(prev) => ts_ms.saturating_sub(prev) >= TOAST_THROTTLE_MS,
+    fn throttle_ok(&self, kind: ToastKind, ts_ms: u64) -> bool {
+        match self.last_toast_ms.get(&kind) {
+            Some(&prev) => ts_ms.saturating_sub(prev) >= TOAST_THROTTLE_MS,
             None => true,
         }
     }
@@ -433,6 +441,7 @@ impl SessionStore {
                                     kind: ToastKind::Attention,
                                     project: session.project(),
                                     detail,
+                                    at_ms: ts,
                                 },
                                 ts,
                             ));
@@ -440,11 +449,24 @@ impl SessionStore {
                     }
                     NotifClass::IdlePrompt => {
                         // R-2.3: `idle_prompt` does NOT change status (the session
-                        // is already `idle` via Stop). The optional "still
-                        // waiting" reminder toast (default OFF) is left to the
-                        // shell timer — the shared `ToastKind` has no reminder
-                        // variant, and emitting a status toast here would be wrong.
+                        // is already `idle` via Stop). It does, however, drive the
+                        // optional "still waiting" reminder toast (R-9.5, default
+                        // OFF): the engine emits the decision, the shell gates it
+                        // on `notifyReminder`. Only meaningful while actually idle.
                         tracing::debug!(session_id = %session.id, "idle_prompt: no status change (R-2.3)");
+                        if session.effective() == Status::Idle {
+                            effect = Some((
+                                ToastDecision {
+                                    session_id: session.id.clone(),
+                                    kind: ToastKind::Reminder,
+                                    project: session.project(),
+                                    // Reminder copy is fixed (R-2.3); detail unused.
+                                    detail: String::new(),
+                                    at_ms: ts,
+                                },
+                                ts,
+                            ));
+                        }
                     }
                     NotifClass::Ignored => {
                         tracing::debug!(
@@ -473,6 +495,7 @@ impl SessionStore {
                             kind: ToastKind::Idle,
                             project: session.project(),
                             detail,
+                            at_ms: ts,
                         },
                         ts,
                     ));
@@ -485,14 +508,36 @@ impl SessionStore {
             }
         }
 
-        // Apply the R-9.4 burst throttle at the point of emission.
+        // Apply the R-9.4 burst throttle at the point of emission, keyed per
+        // toast kind so different status changes don't collapse into each other.
+        // The stamp records an *emitted* decision; if the shell then suppresses
+        // it for a reason only the shell can see (R-9.5 toggle off), it calls
+        // `refund_toast` to release the slot so the throttle keeps bounding
+        // *actually-shown* toasts (R-9.4).
         if let Some((toast, at)) = effect {
-            if session.throttle_ok(at) {
-                session.last_toast_ms = Some(at);
+            if session.throttle_ok(toast.kind, at) {
+                session.last_toast_ms.insert(toast.kind, at);
                 return vec![Effect::Toast(toast)];
             }
         }
         Vec::new()
+    }
+
+    /// Release the R-9.4 throttle slot for a toast the shell decided NOT to show
+    /// (e.g. the R-9.5 per-type toggle for its kind is off). `on_event` stamps
+    /// the throttle when it *emits* a decision, but the throttle bounds
+    /// *actually-shown* toasts — a suppressed toast must not consume the window,
+    /// else the next same-kind toast is wrongly dropped for up to 10 s after the
+    /// toggle is re-enabled. Only clears the stamp when it still matches `at_ms`
+    /// (no newer toast replaced it); removal is equivalent to restoring the
+    /// previous stamp, because a stamp is only ever created ≥10 s after the one
+    /// before it (`throttle_ok`), so the next toast would pass either way.
+    pub fn refund_toast(&mut self, session_id: &str, kind: ToastKind, at_ms: u64) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if session.last_toast_ms.get(&kind) == Some(&at_ms) {
+                session.last_toast_ms.remove(&kind);
+            }
+        }
     }
 
     // --- Ask override (R-2.4) ---------------------------------------------
@@ -537,26 +582,52 @@ impl SessionStore {
 
     // --- Timers (Rust-side, R-3.6) ----------------------------------------
 
-    /// `attention → working` recovery (R-2.2): for each hook-driven `attention`
-    /// session, if its transcript advanced to ≥2 s past the Notification
-    /// timestamp, recover to `working`. `mtime_of` returns the transcript's
-    /// current mtime (epoch ms) — the engine never reads transcripts itself.
+    /// Transcript-driven `→ working` recovery (§2 status table, R-2.2): for a
+    /// hook-driven `attention` session, recover to `working` once the transcript
+    /// advances ≥2 s past the Notification timestamp; likewise an `idle` session
+    /// whose transcript advances ≥2 s past the moment it went idle (a turn
+    /// resumed without a `UserPromptSubmit` hook, e.g. resume/compact) is
+    /// promoted to `working`. `mtime_of` returns the transcript's current mtime
+    /// (epoch ms) — the engine never reads transcripts itself.
     pub fn poll_recovery(&mut self, mut mtime_of: impl FnMut(&str) -> Option<u64>) -> Vec<Effect> {
         let now = self.clock.now_ms();
         for s in self.sessions.values_mut() {
-            if s.pending_ask || !s.attention_from_hook || s.effective() != Status::Attention {
+            // A pending ask forces attention (R-2.4); transcript activity must
+            // never clear it — only an explicit answer does.
+            if s.pending_ask {
                 continue;
             }
-            let (Some(tp), Some(notif)) = (s.transcript_path.as_deref(), s.last_notification_ms)
-            else {
-                continue;
-            };
-            if let Some(mtime) = mtime_of(tp) {
-                if mtime >= notif + RECOVERY_MIN_ADVANCE_MS {
-                    s.attention_from_hook = false;
-                    s.last_notification_ms = None;
-                    s.set_hook_status(Status::Working, now);
+            match s.effective() {
+                // R-2.2: hook-driven attention → working on transcript advance.
+                Status::Attention if s.attention_from_hook => {
+                    let (Some(tp), Some(notif)) =
+                        (s.transcript_path.as_deref(), s.last_notification_ms)
+                    else {
+                        continue;
+                    };
+                    if let Some(mtime) = mtime_of(tp) {
+                        if mtime >= notif + RECOVERY_MIN_ADVANCE_MS {
+                            s.attention_from_hook = false;
+                            s.last_notification_ms = None;
+                            s.set_hook_status(Status::Working, now);
+                        }
+                    }
                 }
+                // §2 table "transcript activity while idle → working": anchored on
+                // the instant the session entered `idle` so the write that
+                // produced the preceding `Stop` cannot immediately re-promote it.
+                Status::Idle => {
+                    let Some(tp) = s.transcript_path.as_deref() else {
+                        continue;
+                    };
+                    let anchor = s.entered_at_ms;
+                    if let Some(mtime) = mtime_of(tp) {
+                        if mtime >= anchor + RECOVERY_MIN_ADVANCE_MS {
+                            s.set_hook_status(Status::Working, now);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Vec::new()

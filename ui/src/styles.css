@@ -540,6 +540,47 @@ button {
   color: var(--text);
 }
 
+/* Orphaned (expired) ask rows (R-8.7) — muted, no answer inputs. */
+.qd-ask-row-expired {
+  border-left-color: var(--muted);
+  background: color-mix(in srgb, var(--muted) 8%, transparent);
+}
+
+.qd-ask-row-expired .qd-ask-row-question {
+  color: var(--muted);
+}
+
+.qd-ask-row-expired-note {
+  flex: 1 1 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* MCP manual-setup command (R-8.6, shown when the claude CLI isn't on PATH). */
+.qd-mcp-command {
+  margin-top: 6px;
+}
+
+.qd-mcp-command-box {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.qd-mcp-command-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 6px 8px;
+  font-size: 10.5px;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: nowrap;
+  user-select: all;
+}
+
 /* Footer --------------------------------------------------------------------- */
 .qd-footer {
   flex: 0 0 auto;

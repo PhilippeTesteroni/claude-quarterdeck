@@ -6,7 +6,7 @@
 
 import { invoke, onState, usingMock } from './ipc-client';
 import type { AskAnswerKind, AskRow, SessionRow, SessionStatus, SettingsState, StateSnapshot } from './ipc-contract';
-import { footerText, formatDuration, sortSessions, truncate } from './format';
+import { footerText, formatDuration, truncate } from './format';
 import { clear, h } from './dom';
 import { installMockScenarioSwitcher } from './mock-switcher';
 
@@ -146,6 +146,26 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
   const send = (answer: string, kind: AskAnswerKind): void => {
     void invoke('answer_ask', { askId: ask.id, answer, kind });
   };
+
+  // R-8.7: an ask recovered after a restart can never be answered — show it as
+  // expired with only a Dismiss action, "never answered into the void".
+  if (ask.orphaned) {
+    return h('div', { className: 'qd-ask-row qd-ask-row-expired' }, [
+      h('div', { className: 'qd-ask-row-head' }, [
+        h('span', { className: 'qd-ask-row-agent' }, [askAgentLabel(ask)]),
+        h('span', { style: 'color:var(--muted)' }, ['· expired']),
+      ]),
+      h('div', { className: 'qd-ask-row-question' }, [ask.question]),
+      h('div', { className: 'qd-ask-row-actions' }, [
+        h('span', { className: 'qd-ask-row-expired-note' }, ['Expired while Quarterdeck was closed.']),
+        h(
+          'button',
+          { className: 'qd-ask-row-dismiss', type: 'button', title: 'Dismiss', onclick: () => send('', 'dismissed') },
+          ['Dismiss'],
+        ),
+      ]),
+    ]);
+  }
 
   const input = h('input', {
     className: 'qd-ask-row-input',
@@ -335,7 +355,9 @@ function renderContent(snap: StateSnapshot): void {
   for (const ask of snap.asks) {
     rows.append(renderAskMirrorRow(ask));
   }
-  for (const row of sortSessions(snap.sessions)) {
+  // R-3.4/R-7.3: `snap.sessions` already arrives in the engine's canonical
+  // R-7.3 order (`SessionStore::view`); render it as-is, never re-sort here.
+  for (const row of snap.sessions) {
     rows.append(renderSessionRow(row));
   }
   elContent.append(rows);
@@ -359,6 +381,30 @@ function toggleControl(label: string, checked: boolean, onToggle: (next: boolean
   ]);
 }
 
+/** R-8.6: when the `claude` CLI isn't on PATH, show the exact `claude mcp add …`
+ * command (with the real port + token) for the user to run by hand. */
+function renderMcpCommandFallback(settings: SettingsState): HTMLElement | null {
+  if (!settings.mcpEnabled || settings.mcpCliAvailable || !settings.mcpCommand) return null;
+  const command = settings.mcpCommand;
+  return h('div', { className: 'qd-mcp-command' }, [
+    h('p', { className: 'qd-empty-health', style: 'color:var(--muted);margin:8px 0 6px' }, [
+      'The claude CLI wasn’t found on your PATH. Run this command to finish setup:',
+    ]),
+    h('div', { className: 'qd-mcp-command-box' }, [
+      h('code', { className: 'mono qd-mcp-command-text' }, [command]),
+      h(
+        'button',
+        {
+          className: 'qd-btn',
+          type: 'button',
+          onclick: () => void navigator.clipboard?.writeText(command).catch(() => undefined),
+        },
+        ['Copy'],
+      ),
+    ]),
+  ]);
+}
+
 function renderSettings(snap: StateSnapshot): void {
   clear(elSettings);
   const settings: SettingsState =
@@ -369,6 +415,7 @@ function renderSettings(snap: StateSnapshot): void {
       launchAtLogin: false,
       onboardingDone: true,
       mcpEnabled: false,
+      mcpCliAvailable: true,
       dataDir: '',
       version: '',
     };
@@ -445,6 +492,7 @@ function renderSettings(snap: StateSnapshot): void {
             [settings.mcpEnabled ? 'Disable agent questions' : 'Enable agent questions'],
           ),
         ]),
+        renderMcpCommandFallback(settings),
       ]),
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['About']),
@@ -462,6 +510,22 @@ function renderAll(): void {
   renderFooter(latest.counts);
   renderGearIssue(latest.hooksInstalled);
   if (settingsOpen) renderSettings(latest);
+  syncPopupHeight();
+}
+
+/** R-7.1 grow-then-scroll: report the intrinsic content height so the shell can
+ * size the window (clamped to 460..=560 in Rust). `.qd-content` scrolls
+ * internally, so its `scrollHeight` is the full natural content height even
+ * while the window constrains it. No-op in mock/browser mode and while the
+ * settings overlay is open (it has its own scroll). */
+function syncPopupHeight(): void {
+  if (usingMock || settingsOpen) return;
+  const header = document.querySelector('.qd-header') as HTMLElement | null;
+  const headerH = header?.offsetHeight ?? 0;
+  const contentH = elContent.scrollHeight;
+  const footerH = elFooter.style.display === 'none' ? 0 : elFooter.offsetHeight;
+  const total = headerH + contentH + footerH;
+  void invoke('resize_popup', { contentHeight: total }).catch(() => undefined);
 }
 
 elGear.addEventListener('click', () => {

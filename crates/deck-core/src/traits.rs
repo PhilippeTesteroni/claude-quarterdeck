@@ -10,7 +10,7 @@
 /// alongside the trait rather than in `src-tauri`. `Serialize` is derived so
 /// `src-tauri/src/notify.rs` can record it verbatim in the
 /// `QUARTERDECK_FAKE_NOTIFIER=1` jsonl trail (R-3.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToastKind {
     /// R-9.1 — `Stop`: title `"<project> finished"`, system default sound.

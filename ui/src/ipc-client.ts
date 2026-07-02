@@ -34,15 +34,28 @@ export function onState(cb: (snapshot: StateSnapshot) => void): () => void {
   }
   let unlisten: (() => void) | undefined;
   let cancelled = false;
-  tauriListen<StateSnapshot>(STATE_EVENT, (event) => cb(event.payload)).then((u) => {
-    if (cancelled) {
-      u();
-    } else {
+  const prime = (): void => {
+    void tauriInvoke<StateSnapshot>('get_state').then(cb).catch(() => undefined);
+  };
+  tauriListen<StateSnapshot>(STATE_EVENT, (event) => cb(event.payload))
+    .then((u) => {
+      if (cancelled) {
+        u();
+        return;
+      }
       unlisten = u;
-    }
-  });
-  // Prime the view immediately rather than waiting for the next push.
-  void tauriInvoke<StateSnapshot>('get_state').then(cb).catch(() => undefined);
+      // Re-prime once the subscription is actually attached, to close the
+      // startup race where the engine's first `deck://state` push (fired from a
+      // background thread after spool replay + discovery) could land before the
+      // listener exists — otherwise the popup would keep the empty default
+      // snapshot and never show the onboarding card (R-10.2 / R-3.4).
+      prime();
+    })
+    // A rejected `listen` (e.g. an ACL misconfiguration) must not become an
+    // unhandled rejection; the primed `get_state` still renders a snapshot.
+    .catch(() => undefined);
+  // Prime immediately too, so the view isn't blank while `listen` registers.
+  prime();
   return () => {
     cancelled = true;
     unlisten?.();

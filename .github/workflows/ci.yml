@@ -15,6 +15,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # SPEC §11 "Hook script tests (real machine)": lint the .sh with shellcheck
+  # (preinstalled on ubuntu runners). The piped-stdin fixture assertions run as
+  # Rust integration tests (src-tauri/tests/hook_scripts.rs) in the matrix below.
+  shellcheck:
+    name: shellcheck (hooks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: shellcheck hooks/quarterdeck-hook.sh
+        run: shellcheck hooks/quarterdeck-hook.sh
+
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -53,10 +65,10 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Cargo test (deck-core + src-tauri, no GUI needed)
+      - name: Cargo test (deck-core + src-tauri incl. hook-script tests)
         run: cargo test --workspace
 
-      - name: UI tests
+      - name: UI tests (Playwright suite, mocked IPC)
         run: npm run ui:test
 
       - name: Build UI assets

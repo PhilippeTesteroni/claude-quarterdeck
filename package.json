@@ -10,7 +10,7 @@
     "build": "tauri build",
     "ui:dev": "vite",
     "ui:build": "vite build",
-    "ui:test": "echo \"ui:test placeholder (Playwright suite lands in T4/T8)\"",
+    "ui:test": "npm --prefix e2e install && npm --prefix e2e exec -- playwright install chromium && npm --prefix e2e test",
     "gen-icons": "node scripts/gen-icons.mjs"
   },
   "devDependencies": {

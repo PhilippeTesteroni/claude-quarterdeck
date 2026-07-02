@@ -359,8 +359,13 @@ fn build_router(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 
 /// GET on the MCP endpoint would open a server→client SSE stream. Quarterdeck
-/// never initiates messages, so we decline it (spec-permitted 405).
-async fn handle_get() -> Response {
+/// never initiates messages, so we decline it. Per R-8.1 ("requests without the
+/// token → 401") the bearer check runs first, so an unauthenticated GET gets a
+/// 401 before the 405; an authenticated GET gets the spec-permitted 405.
+async fn handle_get(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, state.token.as_str()) {
+        return unauthorized();
+    }
     (StatusCode::METHOD_NOT_ALLOWED, "SSE stream not supported").into_response()
 }
 

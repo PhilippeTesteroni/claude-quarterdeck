@@ -3,7 +3,7 @@
  * Pure functions, no DOM — kept separate so they're trivial to unit-test later.
  */
 
-import type { SessionRow, SessionStatus } from './ipc-contract';
+import type { SessionStatus } from './ipc-contract';
 
 /** mm 'm' ss 's' with zero-padded seconds; hours fold in above 60 minutes. */
 export function formatDuration(ms: number): string {
@@ -25,22 +25,13 @@ export function formatCountdown(ms: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-/** R-7.3 sort: attention -> working -> idle -> dead; within group, latest activity first. */
-const STATUS_RANK: Record<SessionStatus, number> = {
-  attention: 0,
-  working: 1,
-  idle: 2,
-  dead: 3,
-};
-
-export function sortSessions(rows: SessionRow[]): SessionRow[] {
-  return [...rows].sort((a, b) => {
-    const rankDiff = STATUS_RANK[a.status] - STATUS_RANK[b.status];
-    if (rankDiff !== 0) return rankDiff;
-    // Latest activity first == least time spent in the current status.
-    return a.sinceMs - b.sinceMs;
-  });
-}
+// R-7.3 session ordering (attention -> working -> idle -> dead; within a group,
+// most-recently-active first) is computed ONCE, canonically, by the Rust engine
+// (`SessionStore::view`) and delivered pre-sorted in every `StateSnapshot`. The
+// frontend is dumb (R-3.4): it renders `snapshot.sessions` in the given order and
+// never re-sorts. (An earlier client-side sort tie-broke on `sinceMs` — the R-7.2
+// time-in-status field — which is a different quantity from the engine's
+// `last_activity_ms` tie-break, so it diverged from the canonical order.)
 
 const FOOTER_LABELS: Record<SessionStatus, string> = {
   attention: 'needs you',

@@ -80,15 +80,51 @@ fn recovery_only_applies_to_hook_driven_attention_not_ask() {
 }
 
 #[test]
-fn stop_clears_recovery_bookkeeping() {
-    // After a Stop the session is idle; a stale transcript advance must not
-    // resurrect a recovery.
+fn stop_clears_attention_bookkeeping_then_idle_recovery_takes_over() {
+    // After a Stop the session is idle (attention_from_hook cleared). A later
+    // transcript advance ≥2 s past the idle-entry promotes it to working via the
+    // §2 "transcript activity while idle → working" rule — NOT a resurrected
+    // attention recovery (the notification anchor is gone).
     let notif = T0;
     let (mut s, c) = attention_session("/t/a.jsonl", notif);
     s.on_event(&stop("a", notif + 500)); // back to idle, clears attention_from_hook
     assert_eq!(s.status_of("a"), Some(Status::Idle));
     c.set(notif + 10_000);
-    s.poll_recovery(|_p| Some(notif + 9_000));
+    s.poll_recovery(|_p| Some(notif + 9_000)); // > idle-entry(notif+500)+2s
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+}
+
+#[test]
+fn idle_recovers_to_working_when_transcript_advances_2s_after_going_idle() {
+    // §2 status table: "transcript activity while idle → working" (a resumed
+    // turn writing to the transcript without a UserPromptSubmit hook).
+    let notif = T0;
+    let (mut s, c) = attention_session("/t/a.jsonl", notif);
+    s.on_event(&stop("a", notif + 500)); // idle at notif+500
+    c.set(notif + 10_000);
+    s.poll_recovery(|_p| Some(notif + 3_000)); // 2.5s past idle-entry → promote
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+}
+
+#[test]
+fn idle_stays_idle_when_transcript_not_advanced_past_entry() {
+    let notif = T0;
+    let (mut s, c) = attention_session("/t/a.jsonl", notif);
+    s.on_event(&stop("a", notif + 5_000)); // idle at notif+5000
+    c.set(notif + 10_000);
+    // Only 1s past idle-entry → still idle.
+    s.poll_recovery(|_p| Some(notif + 6_000));
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+}
+
+#[test]
+fn idle_without_transcript_never_promotes() {
+    let (mut s, c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0)); // idle, no transcript path
+    s.on_event(&prompt("a", "go", T0 + 1));
+    s.on_event(&stop("a", T0 + 2)); // idle again
+    c.set(T0 + 100_000);
+    s.poll_recovery(|_p| Some(T0 + 100_000));
     assert_eq!(s.status_of("a"), Some(Status::Idle));
 }
 

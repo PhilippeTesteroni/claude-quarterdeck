@@ -37,7 +37,7 @@ function renderIdentity(ask: AskRow, sessions: SessionRow[]): HTMLElement {
     h('span', { className: 'qd-ask-identity-project' }, [label]),
   ]);
 
-  if (ask.timeoutAt !== undefined) {
+  if (ask.timeoutAt !== undefined && !ask.orphaned) {
     const cd = h('span', { className: 'qd-ask-countdown mono' }, ['']);
     row.append(cd);
     countdownEl = cd;
@@ -46,6 +46,9 @@ function renderIdentity(ask: AskRow, sessions: SessionRow[]): HTMLElement {
   } else {
     countdownEl = null;
     countdownTarget = null;
+    if (ask.orphaned) {
+      row.append(h('span', { className: 'qd-ask-countdown mono' }, ['expired']));
+    }
   }
 
   return row;
@@ -109,6 +112,26 @@ function renderFreeform(ask: AskRow): HTMLElement {
 
 function renderAsk(ask: AskRow, sessions: SessionRow[]): void {
   clear(elContent);
+  // R-8.7: an ask recovered after a restart can never be answered — show it as
+  // expired with only a Dismiss action ("never answered into the void").
+  if (ask.orphaned) {
+    freeTextInput = null;
+    elContent.append(
+      renderIdentity(ask, sessions),
+      h('div', { className: 'qd-ask-question' }, [ask.question]),
+      h('p', { className: 'qd-ask-empty', style: 'padding:4px 0;text-align:left' }, [
+        'This question expired while Quarterdeck was closed. It can no longer be answered.',
+      ]),
+      h('div', { className: 'qd-ask-actions' }, [
+        h(
+          'button',
+          { className: 'qd-btn qd-btn-primary', type: 'button', onclick: () => send(ask, '', 'dismissed') },
+          ['Dismiss'],
+        ),
+      ]),
+    );
+    return;
+  }
   elContent.append(
     renderIdentity(ask, sessions),
     h('div', { className: 'qd-ask-question' }, [ask.question]),

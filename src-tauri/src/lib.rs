@@ -33,10 +33,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, Wry};
+use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tokio::sync::oneshot;
 
+use deck_core::ask::{AskStore, PendingAsk};
 use deck_core::engine::{Effect, SessionStore, SessionView, Status as EngineStatus};
 use deck_core::traits::{Notifier, ProcessTable, ToastKind};
 use deck_core::{discovery, events, hooks_config};
@@ -303,6 +304,21 @@ fn paths_eq(a: &str, b: &str) -> bool {
     }
 }
 
+/// Whether a `claude` executable is resolvable on `PATH` (R-8.6): drives whether
+/// the settings pane shows the manual `claude mcp add …` command to copy. A cheap
+/// PATH scan (no subprocess) so it's fine to compute on every snapshot.
+fn claude_cli_on_path() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let candidates: &[&str] = if cfg!(windows) {
+        &["claude.exe", "claude.cmd", "claude.bat", "claude"]
+    } else {
+        &["claude"]
+    };
+    std::env::split_paths(&paths).any(|dir| candidates.iter().any(|name| dir.join(name).is_file()))
+}
+
 /// The user-level Claude settings file we install hooks into (`~/.claude/settings.json`),
 /// with the `QUARTERDECK_CLAUDE_DIR` override so tests target an isolated copy (R-4.1).
 fn claude_settings_path() -> PathBuf {
@@ -337,34 +353,49 @@ fn map_row(view: &SessionView) -> SessionRow {
 // Pending asks (§8) tracked shell-side.
 // ---------------------------------------------------------------------------
 
-struct PendingAsk {
-    id: String,
-    session_id: Option<String>,
-    project: Option<String>,
-    question: String,
-    options: Option<Vec<String>>,
-    context: Option<String>,
-    timeout_at_ms: u64,
-    responder: Option<oneshot::Sender<AskAnswer>>,
+/// Shell-side pending ask: the portable [`deck_core::ask::PendingAsk`] carrying
+/// the shell's `oneshot` responder that unblocks the blocked MCP `ask_user` call.
+/// The queue/timeout/orphan logic lives in `deck-core` ([`AskStore`]); the shell
+/// only owns the responder and the file I/O.
+type ShellAsk = PendingAsk<oneshot::Sender<AskAnswer>>;
+
+fn ask_to_row(ask: &ShellAsk) -> AskRow {
+    AskRow {
+        id: ask.id.clone(),
+        session_id: ask.session_id.clone(),
+        project: ask.project.clone(),
+        question: ask.question.clone(),
+        options: ask.options.clone(),
+        timeout_at: Some(ask.timeout_at_ms),
+        // R-8.2: only unmatched asks surface the raw context ("Unknown agent (<context>)").
+        context: if ask.session_id.is_none() {
+            ask.context.clone()
+        } else {
+            None
+        },
+        // R-8.7: an ask recovered from disk at startup is shown as expired.
+        orphaned: ask.orphaned,
+    }
 }
 
-impl PendingAsk {
-    fn to_row(&self) -> AskRow {
-        AskRow {
-            id: self.id.clone(),
-            session_id: self.session_id.clone(),
-            project: self.project.clone(),
-            question: self.question.clone(),
-            options: self.options.clone(),
-            timeout_at: Some(self.timeout_at_ms),
-            // R-8.2: only unmatched asks surface the raw context ("Unknown agent (<context>)").
-            context: if self.session_id.is_none() {
-                self.context.clone()
-            } else {
-                None
-            },
-        }
-    }
+/// On-disk shape of a persisted ask file (`<data>/asks/<id>.json`, written by
+/// [`Shell::write_ask_file`]) — read back only when recovering orphaned asks
+/// after a restart (R-8.7).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AskFileRecord {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    options: Option<Vec<String>>,
+    #[serde(default)]
+    context: Option<String>,
 }
 
 /// The on-disk answer written by the `answer_ask` command (mirror of
@@ -384,7 +415,7 @@ struct AnswerFile {
 struct Shell {
     app: AppHandle<Wry>,
     store: Mutex<SessionStore>,
-    asks: Mutex<Vec<PendingAsk>>,
+    asks: Mutex<AskStore<oneshot::Sender<AskAnswer>>>,
     notifier: DesktopNotifier<Wry>,
     tray: tauri::tray::TrayIcon<Wry>,
     data_dir: PathBuf,
@@ -414,7 +445,7 @@ impl Shell {
             .lock()
             .expect("asks poisoned")
             .iter()
-            .map(PendingAsk::to_row)
+            .map(ask_to_row)
             .collect();
 
         let settings = settings::load(&self.data_dir);
@@ -423,6 +454,17 @@ impl Shell {
             .get("mcpEnabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        // R-8.6: the exact `claude mcp add …` command with the real port + token,
+        // surfaced so the user can run it when the `claude` CLI isn't on PATH.
+        let mcp_command = mcp_server::load_config().map(|cfg| {
+            format!(
+                "claude mcp add --transport http --scope user quarterdeck \
+                 http://127.0.0.1:{}{} --header \"Authorization: Bearer {}\"",
+                cfg.port,
+                mcp_server::MCP_PATH,
+                cfg.token
+            )
+        });
         let settings_state = SettingsState {
             notify_idle: settings.notify_idle,
             notify_attention: settings.notify_attention,
@@ -430,6 +472,8 @@ impl Shell {
             launch_at_login: settings.launch_at_login,
             onboarding_done: settings.onboarding_done,
             mcp_enabled,
+            mcp_cli_available: claude_cli_on_path(),
+            mcp_command,
             data_dir: self.data_dir.display().to_string(),
             version: self.version.clone(),
         };
@@ -490,16 +534,33 @@ impl Shell {
                 ToastKind::Reminder => settings.notify_reminder,
                 ToastKind::Ask => true,
             };
-            if !enabled {
-                continue;
+            // A toast actually shows only if its R-9.5 toggle is on AND the
+            // notifier didn't suppress it (R-9.4 popup-visible-and-focused
+            // suppression, applied inside `notify`, which returns whether a
+            // toast fired). Short-circuit so `notify` is not called when the
+            // toggle is off.
+            let shown = enabled
+                && self.notifier.notify(
+                    decision.kind,
+                    &decision.session_id,
+                    &decision.project,
+                    &decision.detail,
+                    popup,
+                );
+            if !shown {
+                // R-9.4/R-9.5: the engine already stamped this (session, kind)
+                // throttle slot when it emitted the decision, but no toast
+                // actually showed — either the R-9.5 per-type toggle is off, or
+                // the notifier suppressed it because the popup is visible AND
+                // focused (R-9.4). Release the slot so a later same-kind toast
+                // isn't dropped for up to 10 s (once the toggle is re-enabled or
+                // the popup loses focus/closes).
+                self.store.lock().expect("store poisoned").refund_toast(
+                    &decision.session_id,
+                    decision.kind,
+                    decision.at_ms,
+                );
             }
-            self.notifier.notify(
-                decision.kind,
-                &decision.session_id,
-                &decision.project,
-                &decision.detail,
-                popup,
-            );
         }
     }
 
@@ -528,7 +589,7 @@ impl Shell {
         settings::asks_dir().join(format!("{id}.json"))
     }
 
-    fn write_ask_file(&self, ask: &PendingAsk, timeout_seconds: u64) {
+    fn write_ask_file(&self, ask: &ShellAsk, timeout_seconds: u64) {
         let record = serde_json::json!({
             "id": ask.id,
             "sessionId": ask.session_id,
@@ -564,7 +625,7 @@ impl Shell {
                 .note_pending_ask(sid);
         }
 
-        let ask = PendingAsk {
+        let ask = ShellAsk {
             id: ask_id.clone(),
             session_id: session_id.clone(),
             project: project.clone(),
@@ -572,6 +633,7 @@ impl Shell {
             options: req.options.clone(),
             context: req.context.clone(),
             timeout_at_ms,
+            orphaned: false,
             responder: Some(tx),
         };
         self.write_ask_file(&ask, req.timeout_seconds);
@@ -603,6 +665,14 @@ impl Shell {
     }
 
     fn notify_user(&self, req: NotifyRequest) {
+        // R-9.5: the MCP `notify_user` toast uses the alert (Attention) channel,
+        // so it honors the `notifyAttention` toggle just like hook-driven
+        // attention toasts (`fire_effects`). Unlike `ask_user` (R-8.4 "Ask toasts
+        // never suppressed"), no spec text exempts `notify_user` from the toggle.
+        if !settings::load(&self.data_dir).notify_attention {
+            tracing::debug!("notify_user suppressed: notifyAttention is off (R-9.5)");
+            return;
+        }
         let (session_id, project) = self.match_session(req.context.as_deref());
         let project = project
             .or_else(|| req.context.as_deref().map(basename))
@@ -617,29 +687,44 @@ impl Shell {
         );
     }
 
-    /// R-8.7: at startup, clear any ask files left by a previous process — their
-    /// MCP connections are gone, so they can never be answered.
+    /// R-8.7: at startup, recover any ask files left by a previous process. Their
+    /// MCP connections died with that process, so they can never be answered — but
+    /// rather than vanishing silently, they are loaded back as `orphaned` rows
+    /// (no responder, exempt from the timeout sweep) so the UI shows them as
+    /// **expired** until the user dismisses them, "never answered into the void".
     fn orphan_stale_asks(&self) {
-        let dir = settings::asks_dir();
-        let mut cleared = 0usize;
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json")
-                    && std::fs::remove_file(&path).is_ok()
-                {
-                    cleared += 1;
-                }
-            }
+        let records = recover_ask_files(&settings::asks_dir(), &settings::spool_quarantine_dir());
+        let recovered = records.len();
+        for rec in records {
+            let ask = ShellAsk {
+                id: rec.id,
+                session_id: rec.session_id,
+                project: rec.project,
+                question: rec.question,
+                options: rec.options,
+                context: rec.context,
+                timeout_at_ms: 0,
+                orphaned: true,
+                responder: None,
+            };
+            self.asks.lock().expect("asks poisoned").push(ask);
         }
-        if cleared > 0 {
-            tracing::warn!(cleared, "orphaned stale asks from a previous run (R-8.7)");
+        if recovered > 0 {
+            tracing::warn!(
+                recovered,
+                "recovered orphaned asks from a previous run, shown as expired (R-8.7)"
+            );
+            self.push_state();
+            run_on_main(&self.app, |app| {
+                if let Err(err) = windows::show_ask_window(app) {
+                    tracing::warn!(error = %err, "failed to show ask window for orphaned asks");
+                }
+            });
         }
     }
 
-    fn take_ask(&self, id: &str) -> Option<PendingAsk> {
-        let mut asks = self.asks.lock().expect("asks poisoned");
-        asks.iter().position(|a| a.id == id).map(|i| asks.remove(i))
+    fn take_ask(&self, id: &str) -> Option<ShellAsk> {
+        self.asks.lock().expect("asks poisoned").take(id)
     }
 
     fn asks_empty(&self) -> bool {
@@ -656,9 +741,14 @@ impl Shell {
             return;
         };
         let Ok(text) = std::fs::read_to_string(path) else {
+            // R-3.5 "(also applies to asks/answers)": quarantine + log, never crash.
+            tracing::warn!(?path, "quarantining unreadable answer file (R-3.5)");
+            quarantine_bad_file(path);
             return;
         };
         let Ok(parsed) = serde_json::from_str::<AnswerFile>(&text) else {
+            tracing::warn!(?path, "quarantining malformed answer file (R-3.5)");
+            quarantine_bad_file(path);
             return;
         };
 
@@ -696,21 +786,9 @@ impl Shell {
 
     /// Drop asks whose timeout has elapsed (the MCP call already returned
     /// `timeout` via its own timer); recompute the session status (R-2.4).
+    /// Orphaned (shown-as-expired) asks are exempt (handled in [`AskStore`]).
     fn sweep_expired_asks(&self) {
-        let now = now_ms();
-        let expired: Vec<PendingAsk> = {
-            let mut asks = self.asks.lock().expect("asks poisoned");
-            let mut out = Vec::new();
-            let mut i = 0;
-            while i < asks.len() {
-                if now >= asks[i].timeout_at_ms {
-                    out.push(asks.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            out
-        };
+        let expired = self.asks.lock().expect("asks poisoned").sweep_expired();
         if expired.is_empty() {
             return;
         }
@@ -729,6 +807,76 @@ impl Shell {
                 let _ = windows::hide_ask_window(app);
             });
         }
+    }
+}
+
+/// Scan `asks_dir` for pending ask files left behind by a previous process
+/// (R-8.7). Valid files are consumed (removed) and returned as records so the
+/// caller can surface them as orphaned/expired asks; malformed or unreadable
+/// files are quarantined into `quarantine_dir` + logged, never silently deleted
+/// (R-3.5 "also applies to asks/answers"). Pure disk I/O with explicit
+/// directories, so it is unit-testable without a `Shell`/`AppHandle`.
+fn recover_ask_files(asks_dir: &Path, quarantine_dir: &Path) -> Vec<AskFileRecord> {
+    let Ok(entries) = std::fs::read_dir(asks_dir) else {
+        return Vec::new();
+    };
+    let mut recovered = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            tracing::warn!(?path, "quarantining unreadable ask file (R-3.5)");
+            quarantine_bad_file_to(&path, quarantine_dir);
+            continue;
+        };
+        let parsed = serde_json::from_str::<AskFileRecord>(&text)
+            .ok()
+            .filter(|rec| !rec.id.is_empty());
+        let Some(rec) = parsed else {
+            tracing::warn!(?path, "quarantining malformed ask file (R-3.5)");
+            quarantine_bad_file_to(&path, quarantine_dir);
+            continue;
+        };
+        // Valid file: the pending call died with the previous process and can
+        // never be fulfilled again — consume it and hand the record back.
+        let _ = std::fs::remove_file(&path);
+        recovered.push(rec);
+    }
+    recovered
+}
+
+/// Move a malformed/unreadable file into `<data>/spool-quarantine/` (R-3.5 "also
+/// applies to asks/answers"), disambiguating name collisions, and never leaving
+/// it in place to be reprocessed forever. Best-effort: if the move fails the file
+/// is at least removed so it can't loop.
+fn quarantine_bad_file(path: &Path) {
+    quarantine_bad_file_to(path, &settings::spool_quarantine_dir());
+}
+
+/// [`quarantine_bad_file`] with an explicit destination dir, so the recovery
+/// scanners and tests don't have to route through the env-derived data root.
+fn quarantine_bad_file_to(path: &Path, dir: &Path) {
+    if std::fs::create_dir_all(dir).is_err() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed.json".to_string());
+    let mut dest = dir.join(&name);
+    let mut n = 1u32;
+    while dest.exists() {
+        dest = dir.join(format!("{name}.{n}"));
+        n += 1;
+    }
+    if std::fs::rename(path, &dest).is_err() {
+        // Cross-device or racing rename: best-effort copy, then remove either way
+        // so the bad file can never be reprocessed in a loop.
+        let _ = std::fs::copy(path, &dest);
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1039,8 +1187,10 @@ fn copy_skill(app: &AppHandle<Wry>) {
 }
 
 /// R-8.6: register/unregister the MCP server with the Claude CLI and copy the
-/// bundled skill. Best-effort — the `claude` CLI may not be on PATH; if not, the
-/// UI still shows the copy-paste command elsewhere.
+/// bundled skill. When the `claude` CLI isn't on PATH (or the add fails), the
+/// settings pane surfaces the exact `claude mcp add …` command to run manually
+/// (the snapshot's `mcpCommand` + `mcpCliAvailable`, rendered by the UI).
+/// Idempotent; "Disable" reverses BOTH the registration and the skill copy.
 fn setup_agent_questions(app: &AppHandle<Wry>, enable: bool) {
     if enable {
         if let Some(cfg) = mcp_server::load_config() {
@@ -1064,7 +1214,7 @@ fn setup_agent_questions(app: &AppHandle<Wry>, enable: bool) {
                 Ok(out) if out.status.success() => tracing::info!("registered MCP with claude CLI"),
                 Ok(_) | Err(_) => {
                     tracing::warn!(
-                        "`claude mcp add` unavailable; user must run it manually (R-8.6)"
+                        "`claude mcp add` unavailable; the settings pane shows the command to run manually (R-8.6)"
                     )
                 }
             }
@@ -1074,6 +1224,22 @@ fn setup_agent_questions(app: &AppHandle<Wry>, enable: bool) {
         let _ = std::process::Command::new("claude")
             .args(["mcp", "remove", "--scope", "user", "quarterdeck"])
             .output();
+        // R-8.6 "Disable reverses both": also remove the copied skill.
+        remove_skill();
+    }
+}
+
+/// Delete the bundled skill copied by [`copy_skill`] (R-8.6 "Disable reverses
+/// both"). No-op when it was never installed.
+fn remove_skill() {
+    let Some(claude) = discovery::claude_dir_from_env() else {
+        return;
+    };
+    let dst = claude.join("skills").join("quarterdeck");
+    if dst.exists() {
+        if let Err(err) = std::fs::remove_dir_all(&dst) {
+            tracing::warn!(error = %err, "failed to remove bundled skill on disable");
+        }
     }
 }
 
@@ -1153,9 +1319,16 @@ pub fn run() {
             ipc::set_setting,
             ipc::install_hooks,
             ipc::uninstall_hooks,
+            ipc::resize_popup,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+
+            // macOS: keep Quarterdeck out of the Dock and the Cmd+Tab app
+            // switcher (R-7.1 "absent from taskbar/Dock/alt-tab"). `skipTaskbar`
+            // alone doesn't remove the Dock icon — the activation policy does.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Tray + windows (R-2.6, R-7.1, R-8.3).
             let tray = tray::build(&handle)?;
@@ -1167,13 +1340,38 @@ pub fn run() {
             let shell = Arc::new(Shell {
                 app: handle.clone(),
                 store: Mutex::new(SessionStore::with_system_clock()),
-                asks: Mutex::new(Vec::new()),
+                asks: Mutex::new(AskStore::with_system_clock()),
                 notifier: DesktopNotifier::new(handle.clone()),
                 tray,
                 data_dir: data_dir.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             });
             app.manage(shell.clone());
+
+            // R-9.6: a clicked toast opens the popup (or the ask window for ask
+            // toasts). The click source is wired in `notify.rs` (Windows WinRT
+            // `on_activated`); this handler does the routing for every platform.
+            {
+                let click_handle = handle.clone();
+                handle.listen(notify::TOAST_CLICKED_EVENT, move |event| {
+                    let is_ask = serde_json::from_str::<notify::ToastClickPayload>(event.payload())
+                        .map(|p| {
+                            tracing::debug!(kind = ?p.kind, session_id = %p.session_id, "toast clicked (R-9.6)");
+                            p.kind == ToastKind::Ask
+                        })
+                        .unwrap_or(false);
+                    run_on_main(&click_handle, move |app| {
+                        let result = if is_ask {
+                            windows::show_ask_window(app)
+                        } else {
+                            windows::open_popup(app)
+                        };
+                        if let Err(err) = result {
+                            tracing::warn!(error = %err, "failed to open window from toast click");
+                        }
+                    });
+                });
+            }
 
             // Reflect the persisted autostart preference (no change without prior
             // consent: the default is off, so nothing is enabled here). R-10.2/10.3.
@@ -1312,5 +1510,70 @@ mod tests {
         let parsed: AnswerFile = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.answer, "Yes");
         assert_eq!(parsed.kind, AskAnswerKind::Option);
+    }
+
+    #[test]
+    fn recover_ask_files_recovers_valid_and_quarantines_malformed() {
+        // R-8.7 + R-3.5 "(also applies to asks/answers)": at startup, a valid
+        // ask file is consumed and returned (to be shown as orphaned/expired),
+        // while a malformed/unreadable/empty-id one is moved to spool-quarantine
+        // and logged — never silently deleted.
+        let tmp = unique_tmp("recover-asks");
+        let asks_dir = tmp.join("asks");
+        let quarantine_dir = tmp.join("spool-quarantine");
+        std::fs::create_dir_all(&asks_dir).unwrap();
+
+        let good = asks_dir.join("ask-good.json");
+        std::fs::write(
+            &good,
+            br#"{"id":"ask-good","question":"Tabs or spaces?","project":"quarterdeck"}"#,
+        )
+        .unwrap();
+        let malformed = asks_dir.join("ask-bad.json");
+        std::fs::write(&malformed, b"{ this is not json").unwrap();
+        let empty_id = asks_dir.join("ask-empty.json");
+        std::fs::write(&empty_id, br#"{"id":"","question":"x"}"#).unwrap();
+        // A non-json sibling must be ignored entirely (neither recovered nor
+        // quarantined).
+        std::fs::write(asks_dir.join("notes.txt"), b"ignore me").unwrap();
+
+        let recovered = recover_ask_files(&asks_dir, &quarantine_dir);
+
+        // Exactly the one valid file comes back, with its fields intact.
+        assert_eq!(recovered.len(), 1, "only the valid ask file is recovered");
+        assert_eq!(recovered[0].id, "ask-good");
+        assert_eq!(recovered[0].question, "Tabs or spaces?");
+
+        // Valid file consumed; both bad files moved out of asks/ (not deleted).
+        assert!(!good.exists(), "recovered file is consumed");
+        assert!(!malformed.exists(), "malformed file left asks/");
+        assert!(!empty_id.exists(), "empty-id file left asks/");
+
+        // ...and landed in spool-quarantine (R-3.5), not the void.
+        let quarantined: Vec<_> = std::fs::read_dir(&quarantine_dir)
+            .expect("quarantine dir created")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            quarantined.iter().any(|n| n.starts_with("ask-bad.json")),
+            "malformed file quarantined, got {quarantined:?}"
+        );
+        assert!(
+            quarantined.iter().any(|n| n.starts_with("ask-empty.json")),
+            "empty-id file quarantined, got {quarantined:?}"
+        );
+
+        // The non-json file was ignored: still in asks/, never quarantined.
+        assert!(asks_dir.join("notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn recover_ask_files_on_missing_dir_is_empty() {
+        let tmp = unique_tmp("recover-missing");
+        let recovered = recover_ask_files(&tmp.join("asks"), &tmp.join("spool-quarantine"));
+        assert!(recovered.is_empty());
     }
 }

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { gotoAsk } from '../helpers/popup';
+import { gotoAsk, gotoPopup } from '../helpers/popup';
 
 // SPEC R-8.3: the dedicated always-on-top ask window — FIFO queue, option
 // buttons (keyboard 1-9), free text, dismiss, countdown, "N more waiting"
@@ -71,5 +71,45 @@ test.describe('ask window', () => {
     await gotoAsk(page, 'empty');
     await expect(page.locator('.qd-ask-empty')).toHaveText('No pending questions.');
     await expect(page.locator('#qd-ask-badge')).toBeHidden();
+  });
+
+  // SPEC R-8.7: an ask recovered from disk after a restart can never be answered
+  // (its MCP connection is gone). It renders as expired with only a Dismiss
+  // action — "never answered into the void": no options, no free-text field,
+  // and no live countdown.
+  test('orphaned ask renders expired with only Dismiss (R-8.7)', async ({ page }) => {
+    await gotoAsk(page, 'ask-orphaned');
+
+    await expect(page.locator('.qd-ask-question')).toContainText('Migrate the settings schema now');
+    // Expired marker instead of a live countdown.
+    await expect(page.locator('.qd-ask-countdown')).toHaveText('expired');
+    await expect(page.locator('.qd-ask-empty')).toContainText('can no longer be answered');
+    // No answer surfaces: no option buttons, no free-text input.
+    await expect(page.locator('.qd-ask-option')).toHaveCount(0);
+    await expect(page.locator('.qd-ask-freeform')).toHaveCount(0);
+    // The only action is Dismiss.
+    const actionButtons = page.locator('.qd-ask-actions button');
+    await expect(actionButtons).toHaveCount(1);
+    await expect(actionButtons).toHaveText('Dismiss');
+
+    // Dismissing clears it.
+    await actionButtons.click();
+    await expect(page.locator('.qd-ask-empty')).toHaveText('No pending questions.');
+  });
+
+  // The same orphaned ask, mirrored as a row in the main popup (R-8.3 "also
+  // mirrored as rows-with-input in the main popup", R-8.7 expired rendering).
+  test('orphaned ask is mirrored as an expired row in the popup (R-8.7)', async ({ page }) => {
+    await gotoPopup(page, 'ask-orphaned');
+
+    const expiredRow = page.locator('.qd-ask-row-expired');
+    await expect(expiredRow).toHaveCount(1);
+    await expect(expiredRow).toContainText('expired');
+    await expect(expiredRow.locator('.qd-ask-row-expired-note')).toContainText(
+      'Expired while Quarterdeck was closed.',
+    );
+    // No answer input in an orphaned mirror row; Dismiss is the only action.
+    await expect(expiredRow.locator('.qd-ask-row-input')).toHaveCount(0);
+    await expect(expiredRow.locator('.qd-ask-row-dismiss')).toHaveText('Dismiss');
   });
 });

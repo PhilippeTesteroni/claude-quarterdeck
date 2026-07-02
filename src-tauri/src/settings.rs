@@ -128,6 +128,37 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Builds settings from an already-parsed JSON value, tolerating individual
+    /// wrong-typed known fields (SPEC R-10.1). A single bad known key (e.g.
+    /// `"notifyIdle": "yes"` from a hand-edit or a newer/older build) falls
+    /// back to *that field's* default without discarding the other known fields
+    /// or any unknown keys — a wrong type must never silently wipe consent state
+    /// (`onboardingDone`/`launchAtLogin`) or unknown keys back to defaults.
+    /// Returns `None` only when the top level isn't a JSON object at all.
+    fn from_json_value(value: Value) -> Option<Self> {
+        let Value::Object(mut map) = value else {
+            return None;
+        };
+        // Known keys map to typed fields: take the value if it's the right type,
+        // else fall back to this field's default and drop the bad value (it's a
+        // known key, never an "unknown key to preserve" — dropping it lets a
+        // later save rewrite it cleanly).
+        fn take_bool(map: &mut Map<String, Value>, key: &str, default: bool) -> bool {
+            match map.remove(key) {
+                Some(Value::Bool(b)) => b,
+                _ => default,
+            }
+        }
+        Some(Self {
+            notify_idle: take_bool(&mut map, "notifyIdle", true),
+            notify_attention: take_bool(&mut map, "notifyAttention", true),
+            notify_reminder: take_bool(&mut map, "notifyReminder", false),
+            launch_at_login: take_bool(&mut map, "launchAtLogin", false),
+            onboarding_done: take_bool(&mut map, "onboardingDone", false),
+            extra: map,
+        })
+    }
+
     /// Applies a single `set_setting` intent (IPC contract): known keys map to
     /// typed fields, anything else is preserved verbatim in `extra`.
     pub fn apply(&mut self, key: &str, value: SettingValue) {
@@ -144,16 +175,37 @@ impl Settings {
     }
 }
 
+/// Strip a leading UTF-8 BOM (`EF BB BF`) if present. Windows editors
+/// (Notepad's "UTF-8", PowerShell's default `-Encoding utf8` on 5.x) prepend
+/// one, and `serde_json` rejects it with "expected value at line 1 column 1".
+/// Quarterdeck surfaces the `<data>` dir path for manual inspection, so a
+/// hand-edited settings.json landing here is a real, reachable case (R-10.1
+/// "unknown keys preserved" — a BOM must not silently wipe them). Mirrors
+/// `hooks_config::strip_bom` for the sibling `~/.claude/settings.json`.
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 /// Loads settings from `<dir>/settings.json`. Missing or unparseable files
 /// fall back to defaults rather than crashing the shell (mirrors the spool's
 /// "never crash on malformed input" posture, SPEC R-3.5).
 pub fn load(dir: &Path) -> Settings {
-    match fs::read_to_string(settings_path(dir)) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "settings.json unparseable, using defaults");
+    let Ok(text) = fs::read_to_string(settings_path(dir)) else {
+        return Settings::default();
+    };
+    // Parse to a generic JSON value first, then map known keys leniently
+    // (R-10.1): only broken *syntax* falls back wholesale to defaults; a
+    // well-formed object with a wrong-typed known field keeps every other known
+    // field and all unknown keys instead of being wiped.
+    match serde_json::from_str::<Value>(strip_bom(&text)) {
+        Ok(value) => Settings::from_json_value(value).unwrap_or_else(|| {
+            tracing::warn!("settings.json is not a JSON object, using defaults");
             Settings::default()
         }),
-        Err(_) => Settings::default(),
+        Err(err) => {
+            tracing::warn!(error = %err, "settings.json unparseable, using defaults");
+            Settings::default()
+        }
     }
 }
 
@@ -251,6 +303,60 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(settings_path(&dir), b"{ not json").unwrap();
         assert_eq!(load(&dir), Settings::default());
+    }
+
+    #[test]
+    fn load_wrong_typed_known_field_only_resets_that_field_preserves_the_rest() {
+        // SPEC R-10.1: a syntactically-valid settings.json with a single
+        // wrong-typed known field (e.g. `"notifyIdle": "yes"`) must NOT wipe the
+        // whole struct back to defaults. Only that one field resets; every other
+        // known field and all unknown keys survive.
+        let dir = unique_dir("wrong-typed");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            settings_path(&dir),
+            br#"{"notifyIdle":"yes","onboardingDone":true,"launchAtLogin":true,"customKeepMe":"must-survive"}"#,
+        )
+        .unwrap();
+
+        let loaded = load(&dir);
+        // The broken field falls back to its own default.
+        assert!(loaded.notify_idle, "wrong-typed notifyIdle → field default");
+        // Consent-derived state is NOT silently reset.
+        assert!(loaded.onboarding_done, "onboardingDone preserved");
+        assert!(loaded.launch_at_login, "launchAtLogin preserved");
+        // Unknown keys preserved.
+        assert_eq!(
+            loaded.extra.get("customKeepMe"),
+            Some(&Value::String("must-survive".to_string())),
+            "unknown key survives a wrong-typed known field"
+        );
+        // The wrong-typed known key is not leaked into `extra` (it would
+        // otherwise serialize twice alongside the typed field).
+        assert!(!loaded.extra.contains_key("notifyIdle"));
+    }
+
+    #[test]
+    fn load_tolerates_a_utf8_bom_and_preserves_all_keys() {
+        // A BOM-prefixed but otherwise valid settings.json (a common Windows
+        // editor artifact) must NOT be treated as unparseable and wiped to
+        // defaults (SPEC R-10.1: known + unknown keys preserved).
+        let dir = unique_dir("bom");
+        fs::create_dir_all(&dir).unwrap();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            br#"{"launchAtLogin": true, "onboardingDone": true, "futureFlag": "keep"}"#,
+        );
+        fs::write(settings_path(&dir), bytes).unwrap();
+
+        let loaded = load(&dir);
+        assert!(loaded.launch_at_login, "known key survives the BOM");
+        assert!(loaded.onboarding_done);
+        assert_eq!(
+            loaded.extra.get("futureFlag"),
+            Some(&Value::String("keep".to_string())),
+            "unknown key preserved across a BOM-prefixed load"
+        );
     }
 
     #[test]
