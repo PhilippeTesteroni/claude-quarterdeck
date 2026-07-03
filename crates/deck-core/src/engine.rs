@@ -140,6 +140,13 @@ struct Session {
     /// Epoch ms the effective status was entered (drives `since_ms`, R-2.5).
     entered_at_ms: u64,
     last_activity_ms: u64,
+    /// Timestamp of the most recent `SessionStart` for THIS row incarnation, or
+    /// 0 for a row first materialized by some other event (Stop/Notification/
+    /// prompt/cold-start). Anchors the reordered-`SessionEnd` guard (R-2.5): an
+    /// End older than this row's start belongs to a *previous* incarnation of a
+    /// reused id and must be ignored, but a normal Stop-then-End reorder (whose
+    /// End post-dates the SessionStart) must still remove the row.
+    started_at_ms: u64,
     session_title: Option<String>,
     latest_prompt: Option<String>,
     /// Cached cold-start transcript title so we read the file at most once.
@@ -175,6 +182,7 @@ impl Session {
             effective_status: Status::Idle,
             entered_at_ms: now_ms,
             last_activity_ms: now_ms,
+            started_at_ms: 0,
             session_title: None,
             latest_prompt: None,
             transcript_title: None,
@@ -393,6 +401,32 @@ impl SessionStore {
         // SessionEnd removes the row immediately, any reason (R-2.5, R-5.1), and
         // tombstones the id so a reordered trailing event can't resurrect it.
         if let HookEvent::SessionEnd { .. } = ev.kind {
+            // Guard the mirror image of the tombstone check below: an *older*
+            // SessionEnd applied AFTER a genuinely-newer same-id SessionStart must
+            // not wipe the freshly (re)created row. The live ingest burst
+            // (watcher.rs flush drains a HashSet in nondeterministic order) can
+            // deliver a reused-id SessionStart(ts=tr+n) before a SessionEnd(ts=tr)
+            // that coalesced into the same debounce window; applying the stale End
+            // unconditionally would delete the just-recreated row AND tombstone the
+            // id at the older ts, dropping every subsequent event for the live
+            // session. Ignore only an End strictly older than THIS row's start
+            // (`started_at_ms`) — i.e. one that belongs to a previous incarnation of
+            // a reused id. Keying on the start rather than the last-applied event is
+            // what keeps a normal Stop-then-End reorder (a later-stamped Stop landing
+            // before the genuine End, both post-dating the SessionStart) from being
+            // mistaken for a restart and dropping the real End (R-2.5 "SessionEnd
+            // always wins immediately").
+            if let Some(session) = self.sessions.get(&ev.session_id) {
+                if session.started_at_ms > ts {
+                    tracing::debug!(
+                        session_id = %ev.session_id,
+                        end_ts = ts,
+                        started_at_ms = session.started_at_ms,
+                        "ignoring stale reordered SessionEnd (older than this row's SessionStart)"
+                    );
+                    return Vec::new();
+                }
+            }
             self.sessions.remove(&ev.session_id);
             self.record_ended(ev.session_id.clone(), ts);
             return Vec::new();
@@ -433,6 +467,9 @@ impl SessionStore {
 
         match &ev.kind {
             HookEvent::SessionStart { session_title, .. } => {
+                // Anchor the reordered-SessionEnd guard (R-2.5) on this incarnation's
+                // start, so a later End for an earlier same-id session can't wipe it.
+                session.started_at_ms = ts;
                 if let Some(pid) = ev.claude_pid {
                     session.claude_pid = Some(pid);
                 }
@@ -620,6 +657,22 @@ impl SessionStore {
             // on the next tick). Leave it dead (the override is already cleared);
             // a genuine new turn will re-create the row via SessionStart.
             if s.hook_status == Status::Dead {
+                return;
+            }
+            // A hook-derived permission/elicitation attention can be live at the
+            // same time as the ask we just answered — two agents sharing this cwd
+            // (R-8.2 `match_session` attributes an ask by cwd), where the OTHER
+            // agent independently hit a `permission_prompt`. That prompt is a
+            // separate block the human still owes a decision, so answering the ask
+            // must NOT flip the row to Working. Re-derive from the last hook state
+            // instead (symmetric with `note_ask_cleared`): the row stays Attention
+            // and R-2.2 transcript recovery + R-2.2 self-heal remain armed
+            // (`attention_from_hook` / `last_notification_ms` preserved), rather
+            // than being wiped so the row is stuck yellow until the next hook event.
+            if s.attention_from_hook {
+                if s.resettle_effective(now).is_some() {
+                    s.last_activity_ms = now;
+                }
                 return;
             }
             s.attention_from_hook = false;

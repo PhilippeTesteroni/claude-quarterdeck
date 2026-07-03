@@ -179,6 +179,87 @@ fn genuinely_later_session_start_resumes_an_ended_id() {
 }
 
 #[test]
+fn stale_session_end_after_a_newer_same_id_start_does_not_wipe_the_live_row() {
+    // Mirror image of the tombstone guard: the live ingest burst (watcher.rs
+    // drains a HashSet in nondeterministic order) can apply a genuinely-newer
+    // reused-id SessionStart(ts=tr+40) BEFORE a SessionEnd(ts=tr) that coalesced
+    // into the same debounce window. The stale End must be ignored — otherwise it
+    // deletes the just-recreated live row and tombstones the id at the older ts,
+    // dropping every subsequent event for the live session.
+    let (mut s, _c) = store_at(T0);
+    // Original session lifecycle for id "a".
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "first task", T0 + 5));
+    // Reused-id restart lands first in the reordered burst (newer ts).
+    s.on_event(&session_start("a", "/p", T0 + 40));
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+    // The older End arrives second and must NOT wipe the live row.
+    s.on_event(&session_end("a", "clear", T0 + 10));
+    assert!(
+        s.contains("a"),
+        "a stale reordered SessionEnd must not delete the live re-created row"
+    );
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+    // And the id is not tombstoned, so subsequent live events still apply.
+    s.on_event(&prompt("a", "second task", T0 + 50));
+    assert_eq!(
+        s.status_of("a"),
+        Some(Status::Working),
+        "later events for the live session must still be honored"
+    );
+}
+
+#[test]
+fn later_stamped_stop_before_the_genuine_session_end_still_removes_the_row() {
+    // R-2.5 regression: on session exit Stop and SessionEnd fire as two concurrent
+    // hook processes; PowerShell cold-start jitter can stamp the Stop a LATER
+    // received_at than the End yet write it first, so the watcher applies them in
+    // the order (Stop@end+5, then End@end). The reordered-End guard must key on
+    // this row's SessionStart, not its last-applied event — otherwise it mistakes
+    // the genuine End for a stale reorder and leaves an idle ghost that R-2.5 says
+    // should be gone ("SessionEnd always wins immediately").
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 1));
+    let end = T0 + 100;
+    s.on_event(&stop("a", end + 5)); // later-stamped Stop, applied first
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+    s.on_event(&session_end("a", "logout", end)); // genuine End, earlier stamp
+    assert!(
+        !s.contains("a"),
+        "a real SessionEnd must remove the row even when a later-stamped event preceded it"
+    );
+    assert_eq!(s.status_of("a"), None);
+}
+
+#[test]
+fn session_end_removes_a_start_less_row_regardless_of_ts() {
+    // A row first materialized by a Stop (no SessionStart ⇒ `started_at_ms` is 0,
+    // there is no incarnation-start to protect) must still be removable by a later
+    // SessionEnd whose ts predates the Stop's — the reused-id guard only defends a
+    // row that actually saw a SessionStart.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&stop("a", T0 + 5));
+    assert!(s.contains("a"));
+    s.on_event(&session_end("a", "logout", T0));
+    assert!(
+        !s.contains("a"),
+        "End removes a start-less row even with an earlier ts"
+    );
+}
+
+#[test]
+fn session_end_with_equal_or_newer_ts_still_removes_the_row() {
+    // The guard only ignores an End *strictly older* than the last applied event;
+    // an End at the same ts (or newer) still wins immediately (R-2.5).
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.on_event(&prompt("a", "go", T0 + 5));
+    s.on_event(&session_end("a", "logout", T0 + 5));
+    assert!(!s.contains("a"), "End at equal ts still removes the row");
+}
+
+#[test]
 fn event_for_unknown_session_creates_the_row() {
     // Robustness: a Notification arriving before we saw SessionStart still tracks.
     let (mut s, _c) = store_at(T0);

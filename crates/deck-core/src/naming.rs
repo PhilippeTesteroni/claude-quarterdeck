@@ -43,11 +43,50 @@ pub fn project_name(cwd: Option<&str>) -> String {
     }
 }
 
-/// Collapse all whitespace runs to single spaces, trim, and cap at
-/// [`MAX_TITLE_CHARS`] grapheme clusters (appending `…` when truncated).
+/// Unicode bidirectional formatting controls exploited by the "Trojan Source" /
+/// RLO spoofing technique: the explicit embedding, override, and isolate
+/// characters. Left in agent-supplied display text (a session title from
+/// `SessionStart.session_title`/`UserPromptSubmit.prompt`, or an `ask_user`
+/// question/option/context) they make the browser's bidi algorithm reorder the
+/// rendered glyphs so the text can read as the opposite of its actual code
+/// points (e.g. a `.exe` disguised as a `.doc`) — a rendering-fidelity/trust
+/// defect on the one surface where a human reads agent text to make a decision
+/// (R-8). We strip them before the string ever reaches the DOM.
+///
+/// Only these invisible directional controls are removed; strongly-typed
+/// scripts (Cyrillic, Arabic, Hebrew) are untouched — they derive their
+/// direction from their own strong characters, not from these controls — so
+/// R-5.3's "Cyrillic/Unicode works end-to-end" is preserved.
+const BIDI_CONTROLS: &[char] = &[
+    '\u{202A}', // LEFT-TO-RIGHT EMBEDDING
+    '\u{202B}', // RIGHT-TO-LEFT EMBEDDING
+    '\u{202C}', // POP DIRECTIONAL FORMATTING
+    '\u{202D}', // LEFT-TO-RIGHT OVERRIDE
+    '\u{202E}', // RIGHT-TO-LEFT OVERRIDE
+    '\u{2066}', // LEFT-TO-RIGHT ISOLATE
+    '\u{2067}', // RIGHT-TO-LEFT ISOLATE
+    '\u{2068}', // FIRST STRONG ISOLATE
+    '\u{2069}', // POP DIRECTIONAL ISOLATE
+];
+
+/// Remove the [`BIDI_CONTROLS`] from a display string. Cheap fast-path: returns
+/// the input unchanged when it contains none (the overwhelmingly common case).
+#[must_use]
+pub fn strip_bidi_controls(s: &str) -> String {
+    if s.contains(|c| BIDI_CONTROLS.contains(&c)) {
+        s.chars().filter(|c| !BIDI_CONTROLS.contains(c)).collect()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Collapse all whitespace runs to single spaces, trim, strip Unicode bidi
+/// override controls ([`strip_bidi_controls`]), and cap at [`MAX_TITLE_CHARS`]
+/// grapheme clusters (appending `…` when truncated).
 #[must_use]
 pub fn normalize_title(s: &str) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = strip_bidi_controls(s);
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_graphemes(&collapsed, MAX_TITLE_CHARS)
 }
 

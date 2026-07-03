@@ -48,22 +48,74 @@ fn popup_target_height(content_px: f64) -> f64 {
 }
 
 fn popup_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    app.get_webview_window(POPUP_LABEL)
-        .ok_or_else(|| format!("window `{POPUP_LABEL}` not found (composed by T7)"))
+    if let Some(popup) = app.get_webview_window(POPUP_LABEL) {
+        return Ok(popup);
+    }
+    rebuild_window(app, POPUP_LABEL)
 }
 
 fn ask_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    app.get_webview_window(ASK_LABEL)
-        .ok_or_else(|| format!("window `{ASK_LABEL}` not found (composed by T7)"))
+    if let Some(ask) = app.get_webview_window(ASK_LABEL) {
+        return Ok(ask);
+    }
+    rebuild_window(app, ASK_LABEL)
+}
+
+/// Recreate a declaratively-configured window (`popup`/`ask`) that the Tauri
+/// runtime failed to create at startup (SPEC R-3.6). The two windows are
+/// declared in `tauri.conf.json` and built once by the runtime before
+/// `setup()` runs; a transient WebView2 failure there (e.g. `ERROR_BUSY` /
+/// "The requested resource is in use" while the per-app user-data folder is
+/// briefly locked by AV/EDR, disk pressure, or process contention) would
+/// otherwise leave the window missing for the whole session, so every tray
+/// click / toast / ask surfacing silently no-ops. Rebuilding from the same
+/// config on the next access retries creation once the contention has passed,
+/// so the popup/ask window heals instead of staying permanently dead.
+///
+/// Must be called on the main thread (window creation requirement); all
+/// accessor callers already route through the tray/main thread or `run_on_main`.
+fn rebuild_window(app: &AppHandle, label: &str) -> Result<WebviewWindow, String> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == label)
+        .cloned()
+        .ok_or_else(|| format!("no declarative window config for `{label}`"))?;
+    tracing::warn!(
+        label,
+        "webview window absent (startup creation likely failed); rebuilding from config (R-3.6)"
+    );
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|err| err.to_string())?
+        .build()
+        .map_err(|err| err.to_string())?;
+    // A rebuilt popup must re-arm its hide-on-blur / Esc / close-guard listeners
+    // (the ask window has no such behavior to re-attach).
+    if label == POPUP_LABEL {
+        attach_popup_behavior(&window)?;
+    }
+    Ok(window)
 }
 
 /// Registers hide-on-blur and hide-on-Escape for the popup (SPEC R-7.1). Call
 /// once at startup (composed by T7); the popup is created once and only
 /// hidden/shown afterwards (SPEC R-3.6), so both listeners stay attached for
-/// the app's lifetime — no need to re-register on every show.
+/// the app's lifetime — no need to re-register on every show. If the runtime
+/// failed to create the popup at startup, this rebuilds it (which re-arms the
+/// same behavior), so the tray isn't left permanently dead.
 pub fn setup_popup_behavior(app: &AppHandle) -> Result<(), String> {
-    let popup = popup_window(app)?;
+    match app.get_webview_window(POPUP_LABEL) {
+        Some(popup) => attach_popup_behavior(&popup),
+        None => rebuild_window(app, POPUP_LABEL).map(|_| ()),
+    }
+}
 
+/// Attach the popup's hide-on-blur / Esc-to-hide / close-guard listeners. Split
+/// out of [`setup_popup_behavior`] so [`rebuild_window`] can re-arm them on a
+/// popup recreated after a startup WebView2 failure (R-3.6).
+fn attach_popup_behavior(popup: &WebviewWindow) -> Result<(), String> {
     let on_event = popup.clone();
     popup.on_window_event(move |event| match event {
         WindowEvent::Focused(false) => {

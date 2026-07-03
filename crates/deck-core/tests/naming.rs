@@ -3,8 +3,8 @@
 use std::fs;
 
 use deck_core::naming::{
-    derive_title, normalize_title, project_name, title_from_sources, transcript_cwd,
-    transcript_first_user_text, NO_TITLE, UNKNOWN_PROJECT,
+    derive_title, normalize_title, project_name, strip_bidi_controls, title_from_sources,
+    transcript_cwd, transcript_first_user_text, NO_TITLE, UNKNOWN_PROJECT,
 };
 use tempfile::tempdir;
 
@@ -87,6 +87,38 @@ fn normalize_never_severs_a_zwj_emoji_sequence_at_the_cut() {
         has_whole_family || has_no_family_scalar,
         "family emoji kept whole or dropped whole, never severed: {out:?}"
     );
+}
+
+#[test]
+fn normalize_strips_bidi_override_controls_no_spoofing() {
+    // Trojan-Source / RLO spoof: U+202E (RLO) + U+202C (PDF) make the browser's
+    // bidi algorithm render "cod.exe" reversed as "exe.doc". Stripping the
+    // controls leaves the real code points in their real visual order (R-5.3/R-8).
+    let spoof = "OK to run \u{202E}cod.exe\u{202C} named safe_report_final_";
+    let out = normalize_title(spoof);
+    assert!(
+        !out.contains('\u{202E}') && !out.contains('\u{202C}'),
+        "bidi controls must be stripped: {out:?}"
+    );
+    assert_eq!(out, "OK to run cod.exe named safe_report_final_");
+}
+
+#[test]
+fn strip_bidi_controls_removes_all_directional_formatting_but_keeps_text() {
+    // Every embedding/override/isolate control is removed…
+    for c in [
+        '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}',
+    ] {
+        let s = format!("a{c}b");
+        assert_eq!(strip_bidi_controls(&s), "ab", "control {c:?} not stripped");
+    }
+    // …while strongly-typed scripts (Cyrillic, Arabic) pass through untouched,
+    // since their direction comes from their own strong characters (R-5.3).
+    let cyr = "Почини баг 🐛";
+    assert_eq!(strip_bidi_controls(cyr), cyr);
+    let ar = "مرحبا world";
+    assert_eq!(strip_bidi_controls(ar), ar);
 }
 
 #[test]

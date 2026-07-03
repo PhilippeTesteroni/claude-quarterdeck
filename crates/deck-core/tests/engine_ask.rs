@@ -68,6 +68,39 @@ fn ask_over_hook_attention_returns_to_attention_when_cleared() {
 }
 
 #[test]
+fn ask_over_hook_attention_stays_attention_when_answered() {
+    // Symmetric with `ask_over_hook_attention_returns_to_attention_when_cleared`:
+    // answering ONE agent's ask must not clobber a concurrent hook-derived
+    // permission_prompt attention that a SECOND agent (sharing this cwd, R-8.2)
+    // is still blocked on. The row must stay attention (the human still owes that
+    // terminal a decision), not flip to working — hiding exactly the state the
+    // app exists to surface (SPEC §1).
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0));
+    s.note_pending_ask("a"); // ask override → attention
+    s.on_event(&notification("a", "permission_prompt", None, T0 + 1)); // live hook attention too
+    assert_eq!(s.status_of("a"), Some(Status::Attention));
+    s.note_ask_answered("a");
+    assert_eq!(
+        s.status_of("a"),
+        Some(Status::Attention),
+        "hook permission_prompt still live → stay attention, not working"
+    );
+}
+
+#[test]
+fn answered_ask_still_resumes_working_without_a_live_hook_attention() {
+    // The regression guard for the fix above must not break the common case: with
+    // NO concurrent hook attention, answering the ask resumes the agent to working
+    // (SPEC §2 "MCP ask answered → working").
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start("a", "/p", T0)); // idle
+    s.note_pending_ask("a"); // attention (ask)
+    s.note_ask_answered("a");
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+}
+
+#[test]
 fn hook_events_under_a_pending_ask_do_not_change_shown_status() {
     // A Stop arriving while an ask is pending updates the hidden hook state but
     // the shown status stays attention until the ask resolves.

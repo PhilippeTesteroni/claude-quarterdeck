@@ -325,6 +325,17 @@ impl<C: ThrottleClock> Throttle<C> {
                 return false;
             }
         }
+        // Bound the map before recording this firing: drop every entry whose
+        // window has fully elapsed. Such an entry no longer throttles anything (a
+        // fresh toast for its key would pass), so evicting it changes no decision
+        // — it just stops `last_fired` accreting one permanent entry per distinct
+        // (session, kind) ever toasted across a weeks-long run (each Claude Code
+        // session has a fresh UUID). After any firing the map holds only keys
+        // fired within the last `window`, so its size tracks live activity rather
+        // than lifetime session count.
+        let window = self.window;
+        self.last_fired
+            .retain(|_, &mut last| now.duration_since(last) < window);
         self.last_fired.insert(key, now);
         true
     }
@@ -454,6 +465,38 @@ impl<R: Runtime> Notifier for DesktopNotifier<R> {
             },
             popup_visible_and_focused,
         )
+    }
+}
+
+/// Bounds the number of threads parked in `mac-notification-sys` `send()`
+/// waiting for a toast click (R-9.6). Each `wait_for_click(true)` send blocks
+/// its thread until the user interacts with (or dismisses) that specific toast;
+/// a user who ignores toasts (they linger in Notification Center) would
+/// otherwise leak one parked thread per toast for the life of the process — an
+/// unbounded per-toast thread leak over a long macOS session with parallel
+/// agents. Past the cap, `fire_macos` fires without waiting so the thread
+/// returns immediately, losing only click-to-open routing for toasts fired
+/// while already at the cap (R-9.6 is best-effort) — never the toast itself.
+#[cfg(target_os = "macos")]
+static MACOS_TOAST_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Maximum concurrently-parked macOS click-waiter threads (see
+/// [`MACOS_TOAST_WAITERS`]).
+#[cfg(target_os = "macos")]
+const MACOS_MAX_TOAST_WAITERS: usize = 8;
+
+/// RAII release of a reserved [`MACOS_TOAST_WAITERS`] slot: decrements on the
+/// waiter thread's exit (including via panic in `send()`), so the count can't
+/// drift upward and permanently wedge the cap.
+#[cfg(target_os = "macos")]
+struct MacosWaiterGuard(bool);
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosWaiterGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            MACOS_TOAST_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -615,7 +658,18 @@ impl<R: Runtime> DesktopNotifier<R> {
             None
         };
 
+        // Reserve a click-waiter slot if one is free (R-9.6). Past the cap, fire
+        // without waiting so this thread returns promptly instead of parking
+        // forever on an ignored toast (see `MACOS_TOAST_WAITERS`).
+        let wait_for_click = MACOS_TOAST_WAITERS.load(std::sync::atomic::Ordering::Relaxed)
+            < MACOS_MAX_TOAST_WAITERS;
+        if wait_for_click {
+            MACOS_TOAST_WAITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         std::thread::spawn(move || {
+            // Releases the reserved waiter slot when this thread exits.
+            let _waiter_guard = MacosWaiterGuard(wait_for_click);
             // Best-effort: attribute the toast to Quarterdeck's bundle id (ignore
             // errors — a non-bundled dev binary may not be registered, in which
             // case `send()` below fails and we fall back to the plugin).
@@ -626,7 +680,7 @@ impl<R: Runtime> DesktopNotifier<R> {
                 notification
                     .title(&title)
                     .message(&body)
-                    .wait_for_click(true);
+                    .wait_for_click(wait_for_click);
                 if !sound.is_empty() {
                     notification.sound(sound.as_str());
                 }
@@ -904,6 +958,42 @@ mod tests {
         assert!(throttle.allow("s1", ToastKind::Ask, true));
         assert!(throttle.allow("s1", ToastKind::Ask, false));
         let _ = clock; // silence unused warning if the above changes
+    }
+
+    #[test]
+    fn last_fired_map_stays_bounded_as_sessions_churn() {
+        // Regression: `last_fired` must not accrete one permanent entry per
+        // distinct (session, kind) ever toasted. Drive many one-shot sessions,
+        // advancing past the window between each, and assert the map's size
+        // tracks the live window (here: ~1 entry) rather than the total count.
+        let clock = FakeClock::new();
+        let mut throttle = Throttle::with_clock(clock.clone(), Duration::from_secs(10));
+        for i in 0..1000 {
+            let sid = format!("session-{i}");
+            assert!(throttle.allow(&sid, ToastKind::Idle, false));
+            // Each session ends and its window fully elapses before the next.
+            clock.advance(Duration::from_secs(11));
+        }
+        assert!(
+            throttle.last_fired.len() <= 1,
+            "expired throttle entries must be evicted, got {}",
+            throttle.last_fired.len()
+        );
+    }
+
+    #[test]
+    fn eviction_does_not_relax_an_active_throttle() {
+        // Pruning expired keys must not drop a key that is still inside its
+        // window: s1's second toast must still be suppressed even though many
+        // other (expired) sessions fired in between.
+        let clock = FakeClock::new();
+        let mut throttle = Throttle::with_clock(clock.clone(), Duration::from_secs(10));
+        assert!(throttle.allow("s1", ToastKind::Idle, false));
+        clock.advance(Duration::from_secs(3));
+        // A different session fires, triggering a prune pass.
+        assert!(throttle.allow("s2", ToastKind::Idle, false));
+        // s1 is still within its 10s window → still throttled.
+        assert!(!throttle.allow("s1", ToastKind::Idle, false));
     }
 
     // --- fake-notifier env parsing ---------------------------------------

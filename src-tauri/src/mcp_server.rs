@@ -46,6 +46,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::ipc::AskAnswerKind;
+use deck_core::naming::strip_bidi_controls;
 
 /// The single MCP endpoint path (streamable HTTP transport).
 pub const MCP_PATH: &str = "/mcp";
@@ -438,12 +439,17 @@ async fn call_tool(state: &AppState, id: Value, params: Value) -> Value {
 }
 
 async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
-    let question = args
-        .get("question")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    // Strip Unicode bidi override controls from every agent-supplied string that
+    // the human reads in the ask window / popup row / "Unknown agent (<context>)"
+    // label, so a compromised or prompt-injected agent can't visually spoof the
+    // text into reading the opposite of its real code points (Trojan-Source / RLO;
+    // see `deck_core::naming::strip_bidi_controls`, R-5.3 / R-8).
+    let question = strip_bidi_controls(
+        args.get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim(),
+    );
     if question.is_empty() {
         return rpc_error(id, -32602, "ask_user requires a non-empty `question`");
     }
@@ -453,14 +459,14 @@ async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter_map(|v| v.as_str().map(strip_bidi_controls))
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty());
     let context = args
         .get("context")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(strip_bidi_controls);
 
     let requested = args
         .get("timeout_seconds")
@@ -496,19 +502,19 @@ async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
 }
 
 fn notify_user(state: &AppState, id: Value, args: &Value) -> Value {
-    let message = args
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let message = strip_bidi_controls(
+        args.get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim(),
+    );
     if message.is_empty() {
         return rpc_error(id, -32602, "notify_user requires a non-empty `message`");
     }
     let context = args
         .get("context")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(strip_bidi_controls);
     state.gateway.notify(NotifyRequest { message, context });
     rpc_result(
         id,
@@ -897,6 +903,27 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["kind"], "option");
 
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn ask_user_strips_bidi_override_controls_from_agent_text() {
+        // A compromised/prompt-injected agent embeds RLO (U+202E) + PDF (U+202C)
+        // so the browser would render "cod.exe" reversed as "exe.doc" in the
+        // always-on-top ask window. The transport must strip these before the
+        // string reaches the DOM (R-5.3 / R-8) — assert on what the gateway sees.
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"ask_user\",\"arguments\":{\"question\":\"OK to run \u{202E}cod.exe\u{202C} now\",\"options\":[\"\u{202E}yes\u{202C}\"],\"context\":\"C:/\u{202E}jorp\u{202C}\"}}}";
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.to_string()));
+        signal.recv().await.unwrap();
+        let ask = &gw.asks()[0];
+        assert_eq!(ask.question, "OK to run cod.exe now");
+        assert_eq!(ask.options.as_ref().unwrap(), &["yes"]);
+        assert_eq!(ask.context.as_deref(), Some("C:/jorp"));
+        assert!(gw.answer_next(AskAnswer::option("yes")));
+        let _ = call.await.unwrap();
         let _ = shutdown.send(());
     }
 
