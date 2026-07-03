@@ -228,3 +228,13 @@ Found live by the first user: a session waiting on background subagents/workflow
 - **R-21.2 Subagent badge.** Subscribe to `SubagentStart`/`SubagentStop` hook events (same installer/marker rules; script writes them to the spool). The engine keeps a per-session active-subagent counter; the row shows a compact badge `⛭ N` while N > 0. Counter is SELF-CORRECTING: when the registry reports the session non-busy (or the session goes attention/idle from a fresh Stop with stale registry), reset to 0 — a lost SubagentStop must never wedge the badge.
 - **R-21.3** No toast on idle→working via override (it is not a user-actionable event); the R-9.1 "finished" toast still fires on the hook-derived Stop even if the override immediately flips the row back to working (the turn DID finish; the user may still want to know). Tray color follows the displayed (overridden) status.
 - **R-21.4** Tests: engine unit tests for override precedence/staleness/reset; registry fixture with busy/idle flips; e2e mock scenario showing badge + yellow row while "background" busy.
+
+## 22. Honest time-in-status for pre-existing sessions (v1.1.1, LOCKED 2026-07-03)
+
+Live-found: rows for sessions that were running before Quarterdeck started tick their time-in-status from APP LAUNCH, not from when the agent actually entered that status.
+
+- **R-22.1 Seeding.** When a session row is created by discovery (not by a hook event), its status-entry timestamp seeds from, in order: registry `updatedAt` (matched by sessionId, fresh file) → transcript mtime → only then "now". Never the app start time as a semantic default.
+- **R-22.2 Hook-born rows unchanged** (exact event receivedAt, as today). A later hook event for a discovered row replaces the estimate with exact times from then on.
+- **R-22.3 Session age.** Row tooltip (hover, alongside cwd) shows total session age when known: registry `startedAt`, else SessionStart receivedAt, else transcript birth/first-seen; format "session 2h 14m".
+- **R-22.4 Estimated marker.** Seeded (estimated) times render with the existing inferred "~" convention (e.g. `~12m 40s`) until an exact hook event arrives.
+- **R-22.5 Tests:** discovery seeding precedence (registry vs transcript vs now), estimate→exact upgrade on first hook event, tooltip content.
