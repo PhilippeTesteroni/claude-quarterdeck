@@ -238,3 +238,16 @@ Live-found: rows for sessions that were running before Quarterdeck started tick 
 - **R-22.3 Session age.** Row tooltip (hover, alongside cwd) shows total session age when known: registry `startedAt`, else SessionStart receivedAt, else transcript birth/first-seen; format "session 2h 14m".
 - **R-22.4 Estimated marker.** Seeded (estimated) times render with the existing inferred "~" convention (e.g. `~12m 40s`) until an exact hook event arrives.
 - **R-22.5 Tests:** discovery seeding precedence (registry vs transcript vs now), estimate→exact upgrade on first hook event, tooltip content.
+
+## 23. Token usage & context health (v1.2, LOCKED 2026-07-03)
+
+Per-session token telemetry sourced from transcript `usage` records (undocumented internal format — parse defensively, tolerate absence, never crash; a format drift disables the feature for that session with one WARN log, everything else keeps working).
+
+- **R-23.1 Incremental usage reader.** Per known session, maintain a byte offset into its transcript; on transcript change events (existing watcher/tick) read ONLY appended bytes (cap 4MB per read; on overflow or offset invalidation — file truncated/rotated — rescan from tail 512KB and mark totals "≥"). Extract from assistant-message records: `message.usage` {input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens} and `message.model`.
+- **R-23.2 Metrics per session.**
+  (a) **Context fill**: latest record's input_tokens + cache_read_input_tokens + cache_creation_input_tokens, as % of the model window (window: model id contains "[1m]" → 1,000,000; else 200,000; unknown → 200,000).
+  (b) **Session spend**: cumulative sum of output_tokens + non-cached input_tokens (fresh input + cache_creation) across the session, formatted compactly (12k / 1.4M).
+- **R-23.3 Subagent group aggregate.** Sum R-23.2b across all transcripts under `<projects>/<slug>/<session_id>/**/*.jsonl` (subagent/workflow sidechains), same incremental discipline; shown as the group spend beside the §21 subagent badge (`⛭ 3 · 2.1M`). Cap: track at most 64 sidechain files per session (newest by mtime; log when capped).
+- **R-23.4 Row UI.** Right block gains a second line under time-in-status, mono, muted: `ctx 62% · 1.4M`. Context-health coloring: <75% muted, ≥75% amber, ≥90% red + row hover tooltip line "context nearly full — consider /compact or a fresh session". No toasts for context health in v1.2 (visual only).
+- **R-23.5 Perf guard.** Usage reading must add no measurable jank: all parsing on the Rust side off the UI thread, ≤1 read per session per change-tick, and the whole feature behind a settings toggle `showTokenStats` (default ON).
+- **R-23.6 Tests:** fixture transcripts (real-shape usage records incl. cache fields and [1m] model ids), incremental append/truncate/rotate cases, window inference, subagent aggregation with cap, UI badge rendering + thresholds (mock), toggle off hides all of it.
