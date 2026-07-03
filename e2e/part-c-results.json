@@ -1,0 +1,162 @@
+{
+  "results": [
+    {
+      "gate": 1,
+      "pass": true,
+      "evidence": "hooks=[Notification,PermissionRequest,SessionEnd,SessionStart,Stop,SubagentStart,SubagentStop,UserPromptSubmit] missing=[] cmdOk=true skill=true takeover=true mcpListed=true onboardingDone=true launchAtLogin=false"
+    },
+    {
+      "gate": 2,
+      "pass": true,
+      "evidence": "pong=true out=\"pong\" idleToast.body=\"pong\" bodySource=assistant spoolFiles=0"
+    },
+    {
+      "gate": 3,
+      "pass": true,
+      "evidence": "allow(stdout=\"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PermissionRequ,exit=0) deny(stdout=\"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PermissionRequ,exit=0) failopen(empty=true,exit=0) [real-claude trigger BLOCKED: -p auto-approves, see report]"
+    },
+    {
+      "gate": "4a",
+      "pass": true,
+      "evidence": "detailRendered=\"Build 41 passed CI 10 minutes ago; the night\" answeredVia=option-click claudeOut=\"RESULT kind=option answer=Deploy now\""
+    },
+    {
+      "gate": "4b",
+      "pass": true,
+      "evidence": "via=dismiss-button reflectsDismissed=true claudeOut=\"RESULT kind=dismissed answer=\""
+    },
+    {
+      "gate": "4c",
+      "pass": true,
+      "evidence": "claudeOut=\"{\"delivered\":true,\"id\":\"ntf-1783083900542-0\"}\" notifierRecords=1"
+    },
+    {
+      "gate": 5,
+      "pass": true,
+      "evidence": "registryName=\"scratch-registry-25\" registryStatus=\"undefined\" settledTitle=\"scratch-registry-25\" matchesRegistry=true fromPrompt=false workingSeen=true"
+    },
+    {
+      "gate": 6,
+      "pass": true,
+      "evidence": "logExists=true nonBenignErrors=0"
+    },
+    {
+      "gate": 7,
+      "pass": true,
+      "evidence": "settingsHashMatch=true dotJsonHashMatch=true liveShot=true permShot=true"
+    }
+  ],
+  "artifacts": {
+    "baseSettingsHash": "a7effb331de1740dbcf6687dba642bc2773fc95f8d3e5aef4ae2fdb70e205975",
+    "gate1": {
+      "hookEvents": [
+        "Notification",
+        "PermissionRequest",
+        "SessionEnd",
+        "SessionStart",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "UserPromptSubmit"
+      ],
+      "missing": [],
+      "cmdOk": true,
+      "skillCopied": true,
+      "takeover": true,
+      "mcpListed": true,
+      "mcpList": "Checking MCP server health…\n\nclaude.ai Figma: https://mcp.figma.com/mcp - ✔ Connected\nclaude.ai Notion: https://mcp.notion.com/mcp - ✔ Connected\nclaude.ai Gmail: https://gmailmcp.googleapis.com/mcp/v1",
+      "onboardingBefore": false
+    },
+    "gate2": {
+      "pong": true,
+      "claudeOut": "pong",
+      "idleToast": {
+        "v": 1,
+        "atMs": 1783083851076,
+        "kind": "idle",
+        "sessionId": "ab8c34f3-b07c-4f31-8544-ffeeb1424f78",
+        "project": "scratch-pong",
+        "title": "scratch-pong finished",
+        "body": "pong",
+        "sound": "Default",
+        "bodySource": "assistant"
+      },
+      "spoolCount": 0
+    },
+    "permShot": "C:\\Users\\phily\\projects\\quarterdeck\\docs\\screenshots\\perm-modal-live.png",
+    "gate3": {
+      "surfacedPermId": "20260703T130412725-23792-1d40e9e4",
+      "shot": true,
+      "allow": {
+        "hout": "{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"allow\"}}}",
+        "herr": "",
+        "code": 0
+      },
+      "deny": {
+        "hout": "{\"hookSpecificOutput\":{\"hookEventName\":\"PermissionRequest\",\"decision\":{\"behavior\":\"deny\"}}}",
+        "herr": "",
+        "code": 0
+      },
+      "failopen": {
+        "hout": "",
+        "herr": "",
+        "code": 0
+      }
+    },
+    "liveShot": "C:\\Users\\phily\\projects\\quarterdeck\\docs\\screenshots\\live-real-claude.png",
+    "gate4aAnsweredVia": "option-click",
+    "gate4a": {
+      "detailRendered": "Build 41 passed CI 10 minutes ago; the nightly runs in about 6 hours.",
+      "claudeOut": "RESULT kind=option answer=Deploy now",
+      "echoed": true,
+      "answeredVia": "option-click"
+    },
+    "gate4b": {
+      "via": "dismiss-button",
+      "claudeOut": "RESULT kind=dismissed answer="
+    },
+    "gate4c": {
+      "claudeOut": "{\"delivered\":true,\"id\":\"ntf-1783083900542-0\"}",
+      "notifCalls": [
+        {
+          "v": 1,
+          "atMs": 1783083900543,
+          "kind": "attention",
+          "sessionId": "notify-5f26e1ec-69ff-48a7-bad8-d8cf918ea559",
+          "project": "scratch-notify",
+          "title": "scratch-notify needs you",
+          "body": "Part C automated smoke: notify test",
+          "sound": "Reminder",
+          "bodySource": "fallback",
+          "id": "ntf-1783083900542-0"
+        }
+      ]
+    },
+    "gate5": {
+      "registryName": "scratch-registry-25",
+      "settledTitle": "scratch-registry-25",
+      "titleSamples": [
+        "(no title)",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25",
+        "scratch-registry-25"
+      ],
+      "workingSeen": true,
+      "titleMatchesRegistry": true,
+      "titleFromPrompt": false
+    },
+    "gate6": {
+      "exists": true,
+      "errLines": []
+    },
+    "afterSettingsHash": "a7effb331de1740dbcf6687dba642bc2773fc95f8d3e5aef4ae2fdb70e205975"
+  }
+}
