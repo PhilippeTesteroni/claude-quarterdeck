@@ -219,3 +219,12 @@ Nine items from Philipp's live dogfooding + agent-side API feedback. Same rules:
 ## 20. v1.1 testing gates
 
 Everything in §11 stays green. New: unit tests for registry parsing (fixtures incl. malformed/missing fields), R-14.3 shrink regression, R-19.2/19.3/19.4/19.5 lifecycle tests (fake clock), perm hook script piped-stdin tests (answer/timeout/fail-open), Playwright specs for pin/drag-region presence/close-X/detail rendering/perm modal, e2e real-app: dismiss round-trip asserting kind=dismissed, persistent ask surviving >6min with keepalive (time-compressed via env knob where possible), and Part C live re-run incl. a REAL permission round-trip (claude asks to run a tool → deck Allow → tool runs; deck Deny → claude sees denial; timeout → terminal dialog appears).
+
+## 21. Background work must show as working (v1.1.1, LOCKED 2026-07-03)
+
+Found live by the first user: a session waiting on background subagents/workflows shows 🟢 idle (its `Stop` hook fired) while heavy agent work is running. The session registry (§15, R-15.1) reflects this correctly: `status: "busy"` with a fresh `updatedAt` while background children run.
+
+- **R-21.1 Registry busy-override.** If the hook-derived status is `idle` but the live registry entry for that session says `status: "busy"` with `updatedAt` fresher than 30s, the row displays `working`. `attention` (hook-derived, pending ask, pending perm) always outranks the override. Override clears when the registry reports non-busy or goes stale.
+- **R-21.2 Subagent badge.** Subscribe to `SubagentStart`/`SubagentStop` hook events (same installer/marker rules; script writes them to the spool). The engine keeps a per-session active-subagent counter; the row shows a compact badge `⛭ N` while N > 0. Counter is SELF-CORRECTING: when the registry reports the session non-busy (or the session goes attention/idle from a fresh Stop with stale registry), reset to 0 — a lost SubagentStop must never wedge the badge.
+- **R-21.3** No toast on idle→working via override (it is not a user-actionable event); the R-9.1 "finished" toast still fires on the hook-derived Stop even if the override immediately flips the row back to working (the turn DID finish; the user may still want to know). Tray color follows the displayed (overridden) status.
+- **R-21.4** Tests: engine unit tests for override precedence/staleness/reset; registry fixture with busy/idle flips; e2e mock scenario showing badge + yellow row while "background" busy.
