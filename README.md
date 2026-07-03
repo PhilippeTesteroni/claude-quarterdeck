@@ -49,18 +49,63 @@ toast and a distinct, harder-to-miss "needs you" alert.
 - **The watch line.** A thin segmented bar under the header shows the fleet's
   status mix (red/yellow/green/gray) proportionally, live — a one-glance read
   on how many sessions need you, are working, or are idle.
-- **Native notifications, two tiers.** A standard toast when a session
-  finishes ("*&lt;project&gt; finished* — waiting for new instructions"), and
-  a distinct, alert-styled toast with its own sound when a session is blocked
-  on you (permission prompt, elicitation dialog, or an agent question).
+- **Move it, pin it, shrink it.** Drag the popup anywhere by its header. Pin
+  it (the icon next to the gear) and it stays open — no more hide-on-blur —
+  until you unpin it, hit Esc, or click the tray icon again. While pinned, a
+  second button collapses the popup down to a small traffic-light lamp: one
+  big status dot plus a count badge when something needs you. Click the lamp
+  to expand back to the full list in place; drag it around like the popup.
+  The popup's height also now tracks its content exactly (no fixed floor),
+  growing and shrinking as rows come and go.
+- **Session names come from Claude Code itself.** Titles are read live from
+  Claude Code's own session registry, so a `/rename` mid-session updates the
+  row within seconds — falling back to the prompt text or transcript only
+  when the registry doesn't have a name yet.
+- **Honest time-in-status.** Sessions that were already running before you
+  started Quarterdeck get their timer seeded from the session's own registry
+  or transcript data, not from when the app happened to launch — estimated
+  times are marked with `~` until an exact hook event replaces them. Hovering
+  a row also shows the session's total age.
+- **Click a row to focus its terminal.** Best-effort: Quarterdeck brings the
+  terminal window running that session to the front. It can't jump to a
+  specific tab inside Windows Terminal (Windows Terminal doesn't expose
+  per-tab focusing), so with multiple sessions in one Windows Terminal window
+  you may still need to pick the right tab yourself.
+- **Take over permission prompts.** When Claude Code is about to ask
+  permission for a tool, Quarterdeck can show that prompt in its own popup —
+  Allow, Deny, or "In terminal" to fall back to the normal dialog. This is
+  fail-open by design: if Quarterdeck isn't running or you don't answer in
+  time, Claude Code just falls through to its regular terminal prompt, so it
+  can never leave an agent stuck. Toggle it off anytime in Settings.
+- **Quiet when you're already looking.** If the terminal running a session is
+  the window in front, Quarterdeck skips toasts and doesn't pop the ask/
+  permission window for that session — you're already watching it, so there's
+  nothing to interrupt you with. It still updates status and keeps anything
+  pending queued for when you look away.
+- **Background work shows as working.** A session waiting on subagents or a
+  background workflow no longer looks falsely idle — it displays as working
+  with a small badge (`⛭ N`) showing how many subagents are active.
+- **Token stats per row.** Each row can show context fill (as a percentage of
+  the model's context window, turning amber near 75% and red near 90%) and
+  cumulative session spend, with a combined total next to the subagent badge
+  when background work is running. Toggle "Show token usage on rows" in
+  Settings.
+- **Native notifications, two tiers, clearly Quarterdeck's.** A standard toast
+  when a session finishes, quoting the model's actual last message as the
+  body (falling back to "waiting for new instructions" if that's not
+  available) — and a distinct, alert-styled toast with its own sound when a
+  session is blocked on you (permission prompt, elicitation dialog, or an
+  agent question). On Windows, toasts are branded as "Quarterdeck" with its
+  own icon, not as PowerShell or whatever shell is hosting the session.
 - **Agent questions (`ask_user` / `notify_user`).** A local MCP server lets an
-  agent ask a blocking question (with options and a timeout) or send a
-  fire-and-forget notice — see [Agent questions](#agent-questions-ask-channel)
-  below.
-- **Hook-driven precision.** Status comes from Claude Code's own `SessionStart`
-  / `UserPromptSubmit` / `Notification` / `Stop` / `SessionEnd` hooks, not from
-  polling or parsing transcript contents — cheap, accurate, and it recovers
-  automatically once a permission prompt is answered in the terminal.
+  agent ask a blocking question (with options, an optional long-form detail,
+  and a timeout — or no timeout at all, for a question that waits until
+  answered) or send a fire-and-forget notice — see
+  [Agent questions](#agent-questions-ask-channel) below.
+- **Hook-driven precision.** Status comes from Claude Code's own hooks, not
+  from polling or parsing transcript contents — cheap, accurate, and it
+  recovers automatically once a permission prompt is answered in the
+  terminal.
 - **Cyrillic/Unicode safe.** Project paths and titles in any script render and
   round-trip correctly end to end.
 - **Everything local.** No accounts, no telemetry, no network calls other than
@@ -91,10 +136,13 @@ toast and a distinct, harder-to-miss "needs you" alert.
 Quarterdeck's status tracking depends on Claude Code's hook events. "Install
 hooks" (first run, or Settings → "Install hooks" / "Repair hooks"):
 
-- Adds `SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`, and
-  `SessionEnd` entries to your **user-level** `~/.claude/settings.json`, so
-  they apply to every project on the machine. It deliberately does *not* hook
-  `PreToolUse`/`PostToolUse` — no extra latency on the hot path.
+- Adds `SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`,
+  `SubagentStart`, `SubagentStop`, and `SessionEnd` entries to your
+  **user-level** `~/.claude/settings.json`, so they apply to every project on
+  the machine. It deliberately does *not* hook `PreToolUse`/`PostToolUse` — no
+  extra latency on the hot path.
+- If "Take over permission prompts" is on (default, see below), it also adds
+  a `PermissionRequest` entry — opt-in and toggled independently in Settings.
 - Never touches hooks it didn't add: it merges non-destructively, keeping any
   hooks you already have on those events, and only adds its own entries where
   none tagged `quarterdeck` already exist.
@@ -137,9 +185,28 @@ swallowed silently rather than breaking your Claude Code session.
    question times out or is dismissed.
 
 "Disable agent questions" reverses both. Once enabled, any Claude Code session
-on the machine can call `ask_user(question, options?, context, timeout_seconds?)`
-to block on your answer, or `notify_user(message, context)` to fire off a
-one-line, no-reply heads-up.
+on the machine can call:
+
+- `ask_user(question, options?, detail?, context, timeout_seconds?)` — blocks
+  on your answer. `detail` is an optional longer rationale shown under the
+  question in muted type. `timeout_seconds` is optional too: omit it (or pass
+  `0`) for a persistent question that waits until you answer, dismiss it, or
+  an agent cancels it — no expiry. Returns `{answer, kind, ask_id}`, where
+  `kind` is `option`, `text`, `timeout`, `dismissed`, or `cancelled`.
+  Dismissing a question always resolves the waiting call (it never hangs
+  until a transport timeout).
+- `update_ask(ask_id, question?, options?, detail?)` / `cancel_ask(ask_id)` —
+  revise or withdraw a still-pending question from a parallel tool call or a
+  different session (the blocked `ask_user` call can't do it to itself).
+- `notify_user(message, context)` — fires off a one-line, no-reply heads-up
+  and returns immediately with `{delivered: true, id}`.
+
+While a question is blocked, Quarterdeck keeps the MCP connection alive with a
+periodic heartbeat so long or indefinite waits don't get dropped by Claude
+Code's own idle timeout. The bundled skill
+([`skills/quarterdeck/SKILL.md`](skills/quarterdeck/SKILL.md)) documents all
+of this for the agent side: when to ask, how to write a good question, and
+how to use `update_ask`/`cancel_ask` correctly.
 
 ![Agent question popup, always-on-top, keyboard 1–9 for options](docs/screenshots/ask-dark.png)
 
@@ -166,9 +233,14 @@ A few details worth knowing:
   process sticks around for 5 minutes (in case it's a blip) before being
   removed; a clean `SessionEnd` removes the row immediately regardless.
 - **Cold-start discovery.** On launch, Quarterdeck also scans your recent
-  `~/.claude/projects/*/*.jsonl` transcripts (last 6 hours) for sessions it
-  missed while it wasn't running, and shows them flagged as inferred (`~`) —
-  best-effort, since it has no live process to track for those.
+  `~/.claude/projects/*/*.jsonl` transcripts (last 6 hours) and Claude Code's
+  own session registry for sessions it missed while it wasn't running, and
+  shows them flagged as inferred (`~`) — best-effort, since it has no live
+  process to track for those.
+- **Background work counts as working.** If a session's `Stop` hook fired but
+  it's actually still running subagents or a background workflow, Quarterdeck
+  reads that from the session registry and keeps showing it as working
+  (with the `⛭ N` badge) instead of falsely idle.
 - **The tray icon is always the worst status across your fleet** — one
   session needing you turns the whole tray icon red, so you never have to
   open the popup just to check.
@@ -217,23 +289,25 @@ warnings`, `cargo test`, the UI test suite, and a full `tauri build` on both
 `windows-latest` and `macos-latest`, uploading the resulting installer/bundle
 as a build artifact on every push and pull request.
 
-## Limitations (v1)
+## Limitations
 
-Quarterdeck v1 is intentionally scoped tight. Not (yet) included:
+Quarterdeck is intentionally scoped tight. Not (yet) included:
 
-- **No click-to-focus terminal.** Clicking a row or a notification opens the
-  Quarterdeck popup, not the terminal window running that session — Claude
-  Code hooks don't expose enough to reliably locate and focus the right
-  terminal tab/pane across every terminal app. Deferred to v2.
-- **No per-tab / subagent rows.** Only top-level sessions are tracked; the
-  fleet view doesn't break out subagents individually.
-- **Windows and macOS only.** No Linux tray support in v1.
+- **Windows Terminal tab focus.** Click-to-focus (see above) brings the
+  right terminal *window* to the front, but Windows Terminal doesn't expose a
+  way to focus a specific *tab* inside it — if several sessions live as tabs
+  in one Windows Terminal window, focusing jumps to the window, not
+  necessarily the right tab.
+- **No per-tab / subagent rows.** The fleet view tracks top-level sessions,
+  not one row per subagent — background subagent activity shows as a count
+  badge on its parent session's row, not as separate rows.
+- **Windows and macOS only.** No Linux tray support.
 - **No history or analytics.** Quarterdeck shows current state, not a log of
   past sessions.
 - **No auto-update.** Update by downloading and reinstalling.
 - **Unsigned builds.** Installers aren't code-signed/notarized yet — expect
   the usual first-run SmartScreen/Gatekeeper prompts.
-- **English-only UI.** No localization in v1.
+- **English-only UI.** No localization.
 - **No sound customization.** Notification sounds are fixed system sounds,
   distinct per notification tier, not user-configurable yet.
 
