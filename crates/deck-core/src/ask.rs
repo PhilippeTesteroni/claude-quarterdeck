@@ -24,10 +24,22 @@ pub struct PendingAsk<R> {
     pub project: Option<String>,
     pub question: String,
     pub options: Option<Vec<String>>,
+    /// Long rationale/body rendered under the question (R-19.1), sanitized by
+    /// the transport before it reaches here.
+    pub detail: Option<String>,
     /// Raw `context` (agent cwd) the MCP call carried (R-8.2).
     pub context: Option<String>,
-    /// Epoch ms at which the ask times out.
+    /// Epoch ms the ask was enqueued (arrival time). Drives the shared
+    /// ask/perm FIFO ordering (R-16.2: a pending perm "FIFO-queues with asks",
+    /// one queue by arrival — the ask window's primary slot goes to whichever of
+    /// the front ask / front perm arrived first, not to perms unconditionally).
+    pub enqueued_ms: u64,
+    /// Epoch ms at which the ask times out. Meaningless when `persistent`.
     pub timeout_at_ms: u64,
+    /// True when the ask has no expiry (R-19.2: `timeout_seconds` omitted/0). It
+    /// lives until answered/dismissed/cancelled and is exempt from the timeout
+    /// sweep; the UI shows no countdown.
+    pub persistent: bool,
     /// True when this ask was recovered from disk at startup and can never be
     /// answered (its MCP connection died with the previous process, R-8.7). It
     /// is shown as expired and is exempt from the timeout sweep.
@@ -94,7 +106,8 @@ impl<R> AskStore<R> {
         self.asks.push(ask);
     }
 
-    /// Remove and return the ask with `id`, if present (answer / dismissal).
+    /// Remove and return the ask with `id`, if present (answer / dismissal /
+    /// cancellation).
     pub fn take(&mut self, id: &str) -> Option<PendingAsk<R>> {
         self.asks
             .iter()
@@ -102,14 +115,22 @@ impl<R> AskStore<R> {
             .map(|i| self.asks.remove(i))
     }
 
+    /// Mutable access to a pending ask by id, for in-place mutation
+    /// (`update_ask`, R-19.5). Returns `None` for an unknown id; the queue
+    /// position is preserved (this never removes/reorders).
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut PendingAsk<R>> {
+        self.asks.iter_mut().find(|a| a.id == id)
+    }
+
     /// Remove and return every ask whose timeout has elapsed (R-8.3). Orphaned
-    /// asks are already expired-on-display and are never swept here.
+    /// (R-8.7) and persistent (R-19.2) asks have no expiry and are never swept.
     pub fn sweep_expired(&mut self) -> Vec<PendingAsk<R>> {
         let now = self.clock.now_ms();
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.asks.len() {
-            if !self.asks[i].orphaned && now >= self.asks[i].timeout_at_ms {
+            let a = &self.asks[i];
+            if !a.orphaned && !a.persistent && now >= a.timeout_at_ms {
                 out.push(self.asks.remove(i));
             } else {
                 i += 1;
@@ -151,8 +172,11 @@ mod tests {
             project: None,
             question: "q?".to_string(),
             options: None,
+            detail: None,
             context: None,
+            enqueued_ms: 0,
             timeout_at_ms: timeout_at,
+            persistent: false,
             orphaned: false,
             responder: Some(responder),
         }
@@ -217,6 +241,48 @@ mod tests {
         assert_eq!(store.len(), 1);
         // It can still be dismissed explicitly.
         assert!(store.take("orphan").is_some());
+    }
+
+    #[test]
+    fn persistent_asks_are_never_swept_by_timeout() {
+        // R-19.2: a persistent ask (timeout_seconds omitted/0) has no expiry and
+        // must survive the timeout sweep indefinitely, until explicitly taken
+        // (answer / dismiss / cancel).
+        let (mut store, clock) = store_at(0);
+        let mut persistent = ask("persist", Some("s1"), 0, 7);
+        persistent.persistent = true;
+        store.push(persistent);
+        clock.0.store(u64::MAX, Ordering::SeqCst);
+        assert!(
+            store.sweep_expired().is_empty(),
+            "persistent ask must never time out (R-19.2)"
+        );
+        assert_eq!(store.len(), 1);
+        // It can still be taken (cancel / dismiss / answer).
+        assert!(store.take("persist").is_some());
+    }
+
+    #[test]
+    fn get_mut_updates_in_place_and_keeps_queue_position() {
+        // R-19.5 update_ask: mutating a pending ask keeps its FIFO position.
+        let (mut store, _c) = store_at(0);
+        store.push(ask("a", None, 100, 1));
+        store.push(ask("b", None, 100, 2));
+        store.push(ask("c", None, 100, 3));
+
+        let b = store.get_mut("b").expect("b present");
+        b.question = "updated?".to_string();
+        b.options = Some(vec!["x".to_string(), "y".to_string()]);
+        b.detail = Some("the reasoning".to_string());
+
+        let ids: Vec<&str> = store.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"], "position preserved after update");
+        let updated = store.get_mut("b").unwrap();
+        assert_eq!(updated.question, "updated?");
+        assert_eq!(updated.options.as_deref().unwrap().len(), 2);
+        assert_eq!(updated.detail.as_deref(), Some("the reasoning"));
+
+        assert!(store.get_mut("missing").is_none());
     }
 
     #[test]

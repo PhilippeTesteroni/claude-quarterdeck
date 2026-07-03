@@ -37,13 +37,13 @@
 //! `wait_for_click`, run on a detached thread (the click wait blocks until the
 //! user interacts with or dismisses the toast). Either path falls back to the
 //! plugin if the native send fails, so the toast still shows
-//! (R-9.1/9.2/9.3 never regress). On Windows, click delivery to our own
-//! `on_activated` requires the toast to carry the app's registered
-//! AppUserModelID (packaged builds); unregistered dev builds fall back to the
-//! pre-registered PowerShell AUMID so toasts appear at all, but their
-//! activation is owned by that AUMID, so click routing is a packaged-build
-//! feature there. Linux (a §13 non-goal) keeps the plugin path, which exposes
-//! no click callback.
+//! (R-9.1/9.2/9.3 never regress). On Windows every toast carries Quarterdeck's
+//! own AppUserModelID (registered in HKCU at startup, R-24.2) so the header
+//! reads "Quarterdeck" + icon in dev AND packaged runs. Click delivery to our
+//! own `on_activated` additionally needs a COM activator registration (a Start
+//! Menu shortcut in a packaged build), so click routing (R-9.6) remains a
+//! packaged-build nicety even though the identity is correct everywhere. Linux
+//! (a §13 non-goal) keeps the plugin path, which exposes no click callback.
 //!
 //! Alert icon (R-9.2, "red-badged icon variant where the platform allows"): the
 //! alert toast class (`Attention`/`Ask`) carries the red status icon so it is
@@ -80,16 +80,24 @@ pub struct ToastClickPayload {
     pub session_id: String,
 }
 
-/// Stable Windows AppUserModelID (R-9.3), matching `identifier` in
-/// `tauri.conf.json`. `tauri-plugin-notification` reads
-/// `app.config().identifier` and uses it as the toast's app id in packaged
-/// builds; in `cargo run`/`tauri dev` (exe under `target/debug` or
-/// `target/release`) it deliberately falls back to a well-known, already
-/// registered id (`Toast::POWERSHELL_APP_ID`) instead, because an
-/// unregistered custom AUMID is unreliable before the app has an installed
-/// Start Menu shortcut. That fallback is why toasts work in *both* dev and
-/// packaged modes (R-9.3) without any extra registration code here.
+/// Stable Windows AppUserModelID (R-9.3/R-24.2), matching `identifier` in
+/// `tauri.conf.json`. Registered in HKCU at startup by
+/// [`register_toast_identity`] (DisplayName "Quarterdeck" + the app icon), which
+/// is the documented way to make a custom AUMID usable by an unpackaged app —
+/// so both the WinRT and plugin toast paths carry *this* id and the toast header
+/// reads "Quarterdeck" (+ icon) in dev AND packaged runs, never "Windows
+/// PowerShell" (R-24.2).
 pub const APP_USER_MODEL_ID: &str = "pro.philippgross.quarterdeck";
+
+/// Test override for the HKCU registry base under which the AUMID identity is
+/// written (R-24.2). Unset in production (defaults to
+/// `Software\Classes\AppUserModelId`); a unit/integration test points it at a
+/// throwaway `HKCU\Software\…` subkey so registration can be exercised without
+/// elevation and without touching the real toast-identity key.
+pub const AUMID_BASE_ENV: &str = "QUARTERDECK_AUMID_BASE";
+
+/// The `DisplayName` shown in the toast header for our AUMID (R-24.2).
+pub const AUMID_DISPLAY_NAME: &str = "Quarterdeck";
 
 /// Env var toggling the fake notifier (R-3.2): when set to `"1"`, calls are
 /// appended as JSON lines to `<data>/notifier-calls.jsonl` instead of firing
@@ -115,6 +123,12 @@ pub struct ToastRequest {
     /// question text for `Ask`. Ignored for `Reminder`, whose body is fixed
     /// (R-2.3 gives no custom copy).
     pub detail: String,
+    /// R-24.1: for an `Idle` (finished) toast, the model's last assistant words
+    /// (already sanitized + collapsed + truncated by the caller). When present
+    /// and non-empty it BECOMES the toast body; otherwise the body falls back to
+    /// the R-9.1 "<title> Waiting for new instructions." copy. Ignored for every
+    /// other kind (they carry their own message/question).
+    pub assistant_body: Option<String>,
 }
 
 /// Builds the exact `(title, body)` toast copy per R-9.1/R-9.2/R-8.4/R-2.3.
@@ -124,6 +138,11 @@ pub fn compose(req: &ToastRequest) -> (String, String) {
     match req.kind {
         ToastKind::Idle => {
             let title = format!("{} finished", req.project);
+            // R-24.1: the model's last words become the body when available;
+            // otherwise fall back to the R-9.1 copy (title + waiting line).
+            if let Some(words) = idle_assistant_body(req) {
+                return (title, words);
+            }
             let session_title = if req.detail.trim().is_empty() {
                 "(no title)"
             } else {
@@ -148,6 +167,33 @@ pub fn compose(req: &ToastRequest) -> (String, String) {
             let title = format!("{} still waiting", req.project);
             (title, "Still waiting for your instructions.".to_string())
         }
+    }
+}
+
+/// The trimmed assistant "last words" body for an `Idle` toast, or `None` when
+/// absent (so the caller falls back to the R-9.1 copy). Only meaningful for the
+/// `Idle` kind (R-24.1).
+fn idle_assistant_body(req: &ToastRequest) -> Option<String> {
+    if req.kind != ToastKind::Idle {
+        return None;
+    }
+    req.assistant_body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Provenance of the composed toast body (R-24.1/R-24.4), recorded in the
+/// fake-notifier jsonl: `"assistant"` when an `Idle` toast used the model's last
+/// words, `"fallback"` otherwise (the R-9.1 copy, or any non-`Idle` toast which
+/// carries its own message/question).
+#[must_use]
+pub fn body_source(req: &ToastRequest) -> &'static str {
+    if idle_assistant_body(req).is_some() {
+        "assistant"
+    } else {
+        "fallback"
     }
 }
 
@@ -200,6 +246,98 @@ fn alert_icon_path() -> Option<PathBuf> {
     fs::write(&path, ALERT_ICON_PNG).ok()?;
     Some(path)
 }
+
+/// The clay Quarterdeck app icon bytes (R-24.2 appLogoOverride + AUMID
+/// `IconUri`). The 512px master is embedded once and materialized to a stable
+/// on-disk path so the OS toast APIs (which reference an icon by path) and the
+/// AUMID registry `IconUri` can both point at it.
+#[cfg_attr(not(windows), allow(dead_code))]
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/app/icon-512.png");
+
+/// Materializes the embedded app icon to a stable path under the data dir and
+/// returns it (R-24.2). Used as the toast appLogoOverride for non-alert toasts
+/// and as the AUMID `IconUri`. Returns `None` (icon omitted) if it can't write.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn app_icon_path() -> Option<PathBuf> {
+    let dir = data_dir().join("toast-icons");
+    let path = dir.join("app-icon.png");
+    if path.exists() {
+        return Some(path);
+    }
+    fs::create_dir_all(&dir).ok()?;
+    fs::write(&path, APP_ICON_PNG).ok()?;
+    Some(path)
+}
+
+// --- Windows toast identity (AUMID) registration (R-24.2) -------------------
+
+/// The HKCU base path the AUMID identity is written under: the
+/// [`AUMID_BASE_ENV`] override when set (tests), else the real
+/// `Software\Classes\AppUserModelId`.
+#[cfg(windows)]
+fn aumid_base() -> String {
+    std::env::var(AUMID_BASE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| r"Software\Classes\AppUserModelId".to_string())
+}
+
+/// Register the Quarterdeck AppUserModelID in `HKCU\…\AppUserModelId\<AUMID>`
+/// with `DisplayName` = "Quarterdeck" and `IconUri` = the clay app icon
+/// (R-24.2). Idempotent (re-running just re-sets the values), HKCU-only (no
+/// elevation). Best-effort: a registry error is logged, never fatal.
+#[cfg(windows)]
+pub fn register_toast_identity() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let path = format!("{}\\{}", aumid_base(), APP_USER_MODEL_ID);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = match hkcu.create_subkey(&path) {
+        Ok((key, _)) => key,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to create AUMID registry key (R-24.2)");
+            return;
+        }
+    };
+    if let Err(err) = key.set_value("DisplayName", &AUMID_DISPLAY_NAME) {
+        tracing::warn!(error = %err, "failed to set AUMID DisplayName");
+    }
+    if let Some(icon) = app_icon_path() {
+        if let Err(err) = key.set_value("IconUri", &icon.to_string_lossy().into_owned()) {
+            tracing::warn!(error = %err, "failed to set AUMID IconUri");
+        }
+    }
+    tracing::info!(
+        aumid = APP_USER_MODEL_ID,
+        "toast identity registered (R-24.2)"
+    );
+}
+
+/// Remove the AUMID identity key (R-24.2), reversing [`register_toast_identity`]
+/// — called from Settings → Uninstall hooks and the NSIS uninstaller. A missing
+/// key is a no-op.
+#[cfg(windows)]
+pub fn unregister_toast_identity() {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let path = format!("{}\\{}", aumid_base(), APP_USER_MODEL_ID);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    match hkcu.delete_subkey_all(&path) {
+        Ok(()) => tracing::info!("toast identity unregistered (R-24.2)"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(error = %err, "failed to remove AUMID registry key"),
+    }
+}
+
+/// No-op on non-Windows: toast identity comes from the app bundle there (R-24.3).
+#[cfg(not(windows))]
+pub fn register_toast_identity() {}
+
+/// No-op on non-Windows (R-24.3).
+#[cfg(not(windows))]
+pub fn unregister_toast_identity() {}
 
 // --- Windows sounds (R-9.1/R-9.2) ---------------------------------------
 //
@@ -399,6 +537,12 @@ struct FakeCallRecord<'a> {
     title: &'a str,
     body: &'a str,
     sound: &'a str,
+    /// R-24.4: `"assistant"` when an idle toast body came from the model's last
+    /// words, `"fallback"` otherwise.
+    body_source: &'a str,
+    /// R-19.6: the `notify_user` record id, when this toast came from that tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
 }
 
 /// Appends one JSON line describing a would-be toast to
@@ -411,6 +555,7 @@ fn append_fake_call(
     title: &str,
     body: &str,
     sound: &str,
+    id: Option<&str>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let record = FakeCallRecord {
@@ -425,6 +570,8 @@ fn append_fake_call(
         title,
         body,
         sound,
+        body_source: body_source(req),
+        id,
     };
     let line = serde_json::to_string(&record).unwrap_or_default();
     let mut file = OpenOptions::new()
@@ -462,6 +609,9 @@ impl<R: Runtime> Notifier for DesktopNotifier<R> {
                 session_id: session_id.to_string(),
                 project: project.to_string(),
                 detail: detail.to_string(),
+                // The trait entrypoint carries no assistant body; the shell uses
+                // `send` directly with one for the R-24.1 idle-toast path.
+                assistant_body: None,
             },
             popup_visible_and_focused,
         )
@@ -513,6 +663,27 @@ impl<R: Runtime> DesktopNotifier<R> {
     /// state at call time. Returns whether a toast was actually sent (for
     /// logging/tests).
     pub fn send(&self, req: ToastRequest, popup_visible_and_focused: bool) -> bool {
+        self.send_inner(req, popup_visible_and_focused, None)
+    }
+
+    /// [`send`](Self::send) tagging the fake-notifier record with a `notify_user`
+    /// record id (R-19.6), so e2e assertions can tie the toast back to the
+    /// tool's returned `{delivered, id}`.
+    pub fn send_with_id(
+        &self,
+        req: ToastRequest,
+        popup_visible_and_focused: bool,
+        id: &str,
+    ) -> bool {
+        self.send_inner(req, popup_visible_and_focused, Some(id))
+    }
+
+    fn send_inner(
+        &self,
+        req: ToastRequest,
+        popup_visible_and_focused: bool,
+        id: Option<&str>,
+    ) -> bool {
         let allowed = self
             .throttle
             .lock()
@@ -526,16 +697,16 @@ impl<R: Runtime> DesktopNotifier<R> {
             );
             return false;
         }
-        self.fire(&req);
+        self.fire(&req, id);
         true
     }
 
-    fn fire(&self, req: &ToastRequest) {
+    fn fire(&self, req: &ToastRequest, id: Option<&str>) {
         let (title, body) = compose(req);
         let sound = sound_for(req.kind);
 
         if fake_notifier_enabled() {
-            if let Err(err) = append_fake_call(&data_dir(), req, &title, &body, sound) {
+            if let Err(err) = append_fake_call(&data_dir(), req, &title, &body, sound, id) {
                 tracing::warn!(?err, "failed to append fake notifier call");
             }
             return;
@@ -591,16 +762,18 @@ impl<R: Runtime> DesktopNotifier<R> {
     ) -> tauri_winrt_notification::Result<()> {
         use tauri_winrt_notification::{IconCrop, Sound, Toast};
 
-        // Match the plugin's AppUserModelID behavior (R-9.3): a packaged/installed
-        // build uses its own identifier so click activation reaches us; an
-        // unregistered dev build falls back to the pre-registered PowerShell
-        // AUMID so the toast shows at all (click routing then belongs to that
-        // AUMID — a packaged-build feature).
-        let app_id = if is_dev_exe() {
-            Toast::POWERSHELL_APP_ID.to_string()
-        } else {
-            self.app.config().identifier.clone()
-        };
+        // R-24.2: use Quarterdeck's own AUMID so the toast header reads
+        // "Quarterdeck" (+ icon) in dev AND packaged runs — never "Windows
+        // PowerShell". This is reliable for an unpackaged app precisely because
+        // `register_toast_identity` writes the HKCU
+        // `Software\Classes\AppUserModelId\<AUMID>` DisplayName/IconUri at
+        // startup (the documented way to make a custom AUMID usable without a
+        // Start Menu shortcut). If that registration somehow didn't happen, the
+        // WinRT send simply fails and `fire_windows` falls back to the plugin
+        // path so the toast is never lost (R-9.1/9.2/9.3). Click routing
+        // (`on_activated`, R-9.6) still needs a COM activator registration and
+        // so remains a packaged-build nicety.
+        let app_id = self.app.config().identifier.clone();
 
         let payload = ToastClickPayload {
             kind: req.kind,
@@ -609,14 +782,16 @@ impl<R: Runtime> DesktopNotifier<R> {
         let app = self.app.clone();
 
         let mut toast = Toast::new(&app_id).title(title).text1(body);
-        // R-9.2: red-badged icon for the alert (Attention/Ask) toast class.
-        let alert_icon = if is_alert(req.kind) {
+        // R-24.2: appLogoOverride carries the Quarterdeck app icon so the toast
+        // is visibly ours; R-9.2: the alert (Attention/Ask) class swaps in the
+        // red-badged variant.
+        let logo = if is_alert(req.kind) {
             alert_icon_path()
         } else {
-            None
+            app_icon_path()
         };
-        if let Some(icon) = &alert_icon {
-            toast = toast.icon(icon, IconCrop::Square, "Quarterdeck alert");
+        if let Some(icon) = &logo {
+            toast = toast.icon(icon, IconCrop::Square, "Quarterdeck");
         }
         if let Ok(s) = Sound::try_from(sound) {
             toast = toast.sound(Some(s));
@@ -719,25 +894,6 @@ impl<R: Runtime> DesktopNotifier<R> {
     }
 }
 
-/// True when the running executable is an un-installed dev build
-/// (`target/debug` or `target/release`), mirroring the plugin's own check so
-/// the AppUserModelID decision matches (R-9.3).
-#[cfg(windows)]
-fn is_dev_exe() -> bool {
-    use std::path::MAIN_SEPARATOR as SEP;
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let dir = exe
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            dir.ends_with(&format!("{SEP}target{SEP}debug"))
-                || dir.ends_with(&format!("{SEP}target{SEP}release"))
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +909,7 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: "Refactor auth module".into(),
+            assistant_body: None,
         };
         let (title, body) = compose(&req);
         assert_eq!(title, "quarterdeck finished");
@@ -766,6 +923,7 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: "   ".into(),
+            assistant_body: None,
         };
         let (_, body) = compose(&req);
         assert_eq!(body, "(no title) Waiting for new instructions.");
@@ -778,6 +936,7 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: "Allow Bash to run `rm -rf build`?".into(),
+            assistant_body: None,
         };
         let (title, body) = compose(&req);
         assert_eq!(title, "quarterdeck needs you");
@@ -792,6 +951,7 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: long_question.clone(),
+            assistant_body: None,
         };
         let (title, body) = compose(&req);
         assert!(title.starts_with("quarterdeck asks: "));
@@ -813,6 +973,7 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail,
+            assistant_body: None,
         };
         let (title, _) = compose(&req);
         assert!(title.ends_with('…'));
@@ -841,9 +1002,59 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: "Use Postgres or SQLite?".into(),
+            assistant_body: None,
         };
         let (title, _) = compose(&req);
         assert_eq!(title, "quarterdeck asks: Use Postgres or SQLite?");
+    }
+
+    #[test]
+    fn idle_toast_uses_assistant_last_words_when_present() {
+        // R-24.1: the finished-toast body becomes the model's last words, and
+        // body_source is "assistant".
+        let req = ToastRequest {
+            kind: ToastKind::Idle,
+            session_id: "s1".into(),
+            project: "quarterdeck".into(),
+            detail: "Refactor auth module".into(),
+            assistant_body: Some("Done. I refactored the auth module and added tests.".into()),
+        };
+        let (title, body) = compose(&req);
+        assert_eq!(title, "quarterdeck finished");
+        assert_eq!(body, "Done. I refactored the auth module and added tests.");
+        assert_eq!(body_source(&req), "assistant");
+    }
+
+    #[test]
+    fn idle_toast_falls_back_when_assistant_body_blank() {
+        // R-24.1 fallback: a blank/absent assistant body → the R-9.1 copy, and
+        // body_source is "fallback".
+        let blank = ToastRequest {
+            kind: ToastKind::Idle,
+            session_id: "s1".into(),
+            project: "quarterdeck".into(),
+            detail: "Refactor auth module".into(),
+            assistant_body: Some("   ".into()),
+        };
+        let (_, body) = compose(&blank);
+        assert_eq!(body, "Refactor auth module Waiting for new instructions.");
+        assert_eq!(body_source(&blank), "fallback");
+    }
+
+    #[test]
+    fn assistant_body_ignored_for_non_idle_kinds() {
+        // Only the idle finished-toast adopts assistant words (R-24.1); an
+        // attention toast keeps its own message and reports "fallback".
+        let req = ToastRequest {
+            kind: ToastKind::Attention,
+            session_id: "s1".into(),
+            project: "quarterdeck".into(),
+            detail: "Allow Bash?".into(),
+            assistant_body: Some("some stale assistant text".into()),
+        };
+        let (_, body) = compose(&req);
+        assert_eq!(body, "Allow Bash?");
+        assert_eq!(body_source(&req), "fallback");
     }
 
     #[test]
@@ -853,6 +1064,7 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: "ignored for reminders".into(),
+            assistant_body: None,
         };
         let (title, body) = compose(&req);
         assert_eq!(title, "quarterdeck still waiting");
@@ -1029,11 +1241,13 @@ mod tests {
             session_id: "sess-42".into(),
             project: "dream-book".into(),
             detail: "Allow write access?".into(),
+            assistant_body: None,
         };
         let (title, body) = compose(&req);
 
-        append_fake_call(&dir, &req, &title, &body, "Reminder").expect("first append");
-        append_fake_call(&dir, &req, &title, &body, "Reminder").expect("second append");
+        append_fake_call(&dir, &req, &title, &body, "Reminder", None).expect("first append");
+        append_fake_call(&dir, &req, &title, &body, "Reminder", Some("ntf-7"))
+            .expect("second append");
 
         let contents = fs::read_to_string(dir.join("notifier-calls.jsonl")).expect("read jsonl");
         let lines: Vec<&str> = contents.lines().collect();
@@ -1045,6 +1259,12 @@ mod tests {
         assert_eq!(parsed["sessionId"], "sess-42");
         assert_eq!(parsed["sound"], "Reminder");
         assert_eq!(parsed["title"], "dream-book needs you");
+        // R-24.4: a non-idle toast records body_source "fallback".
+        assert_eq!(parsed["bodySource"], "fallback");
+        // R-19.6: no id on a plain toast; the notify_user record id is present.
+        assert!(parsed.get("id").is_none(), "plain toast omits the id field");
+        let with_id: serde_json::Value = serde_json::from_str(lines[1]).expect("valid json line");
+        assert_eq!(with_id["id"], "ntf-7");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1058,8 +1278,9 @@ mod tests {
             session_id: "s1".into(),
             project: "quarterdeck".into(),
             detail: "Task".into(),
+            assistant_body: None,
         };
-        append_fake_call(&dir, &req, "t", "b", "Default").expect("append creates dir");
+        append_fake_call(&dir, &req, "t", "b", "Default", None).expect("append creates dir");
         assert!(dir.join("notifier-calls.jsonl").exists());
         fs::remove_dir_all(&dir).ok();
     }
@@ -1084,5 +1305,67 @@ mod tests {
             std::env::remove_var(DATA_DIR_ENV);
         }
         assert_eq!(resolved, dir);
+    }
+
+    // --- AUMID toast identity registration (R-24.2, Windows) --------------
+
+    #[cfg(windows)]
+    #[test]
+    fn aumid_registration_is_idempotent_and_reversible() {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        // Serialize env mutation with the other cross-module env tests.
+        let _env = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Point the AUMID base at a throwaway HKCU subkey (no elevation, never
+        // touches the real toast-identity key).
+        let base = format!(
+            "Software\\Quarterdeck-Test\\aumid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // SAFETY (test-only): the lock above makes this the sole env owner.
+        unsafe {
+            std::env::set_var(AUMID_BASE_ENV, &base);
+        }
+
+        let full = format!("{base}\\{APP_USER_MODEL_ID}");
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+        // Register, then read back DisplayName.
+        register_toast_identity();
+        let key = hkcu.open_subkey(&full).expect("AUMID key created");
+        let name: String = key.get_value("DisplayName").expect("DisplayName set");
+        assert_eq!(name, AUMID_DISPLAY_NAME);
+        drop(key);
+
+        // Idempotent: a second registration succeeds and leaves the same value.
+        register_toast_identity();
+        let name2: String = hkcu
+            .open_subkey(&full)
+            .unwrap()
+            .get_value("DisplayName")
+            .unwrap();
+        assert_eq!(name2, AUMID_DISPLAY_NAME);
+
+        // Unregister removes the key; a second unregister is a no-op.
+        unregister_toast_identity();
+        assert!(
+            hkcu.open_subkey(&full).is_err(),
+            "AUMID key removed after unregister"
+        );
+        unregister_toast_identity();
+
+        // Clean up the scratch base tree.
+        let _ = hkcu.delete_subkey_all("Software\\Quarterdeck-Test");
+        unsafe {
+            std::env::remove_var(AUMID_BASE_ENV);
+        }
     }
 }

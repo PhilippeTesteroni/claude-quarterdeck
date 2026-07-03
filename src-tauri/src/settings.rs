@@ -80,6 +80,18 @@ pub fn hooks_dir() -> PathBuf {
     data_dir().join("hooks")
 }
 
+/// `<data>/perms/` — pending permission requests written by the
+/// `PermissionRequest` hook (SPEC §16, R-16.1).
+pub fn perms_dir() -> PathBuf {
+    data_dir().join("perms")
+}
+
+/// `<data>/perm-answers/` — decisions the deck writes for the blocked
+/// `PermissionRequest` hook to poll (SPEC R-16.1).
+pub fn perm_answers_dir() -> PathBuf {
+    data_dir().join("perm-answers")
+}
+
 /// `<data>/logs/` — rotated `quarterdeck.log` (SPEC R-10.4).
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
@@ -92,6 +104,65 @@ pub fn settings_path(dir: &Path) -> PathBuf {
 
 fn default_true() -> bool {
     true
+}
+
+/// Popup display mode (SPEC §25, R-25.2): `List` is the v1.0/v1.1 popup; `Lamp`
+/// is the compact ~56x56 always-on-top traffic light (R-25.1). Persisted so a
+/// pinned+collapsed popup reopens collapsed after a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PopupMode {
+    #[default]
+    List,
+    Lamp,
+}
+
+impl PopupMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "list" => Some(Self::List),
+            "lamp" => Some(Self::Lamp),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Lamp => "lamp",
+        }
+    }
+}
+
+/// Persisted popup position (SPEC R-25.2 `popupPos`), logical pixels. Written
+/// only while the popup is pinned (an unpinned popup always re-anchors to the
+/// tray on open, R-14.2, so its position is never meaningful to restore).
+/// Read back at startup to put a pinned (and possibly collapsed) popup back
+/// where the user left it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PopupPos {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl PopupPos {
+    /// Parses the `"x,y"` wire form used by the generic `set_setting` channel
+    /// (SPEC R-25.2; `SettingValue` only carries bool/string, so the shell-side
+    /// writer in `windows.rs` encodes the position as a comma-joined string).
+    /// Returns `None` for anything malformed rather than panicking — a stray
+    /// hand-edit of `settings.json` must degrade to "no remembered position",
+    /// never crash the load path (mirrors the rest of this module's posture).
+    fn parse(s: &str) -> Option<Self> {
+        let (x, y) = s.split_once(',')?;
+        Some(Self {
+            x: x.trim().parse().ok()?,
+            y: y.trim().parse().ok()?,
+        })
+    }
+
+    pub fn to_setting_string(self) -> String {
+        format!("{},{}", self.x, self.y)
+    }
 }
 
 /// Persisted user settings (SPEC R-10.1). Known keys are typed fields;
@@ -115,6 +186,26 @@ pub struct Settings {
     /// behavior).
     #[serde(default)]
     pub popup_pinned: bool,
+    /// Take over Claude Code permission prompts into the deck (SPEC §16,
+    /// R-16.4). Default ON (after onboarding consent, R-25.4). Drives whether
+    /// the installer adds the `PermissionRequest` hook; toggling it add/removes
+    /// only that entry.
+    #[serde(default = "default_true")]
+    pub takeover_permissions: bool,
+    /// Show per-session token usage on rows (SPEC §23, R-23.5). Default ON. When
+    /// off, the incremental transcript reader is idle and the row usage line +
+    /// the finished-toast "last words" body (R-24.1) are suppressed.
+    #[serde(default = "default_true")]
+    pub show_token_stats: bool,
+    /// Popup display mode (SPEC §25, R-25.2): `list` (default) or `lamp` (the
+    /// compact traffic-light square, R-25.1). Only reachable while pinned; see
+    /// [`crate::windows::should_force_list_on_unpin`].
+    #[serde(default)]
+    pub popup_mode: PopupMode,
+    /// Last user-dragged popup position while pinned (SPEC R-25.2), restored at
+    /// startup so a pinned (possibly collapsed) popup reopens where it was left.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub popup_pos: Option<PopupPos>,
     /// Unknown top-level keys, preserved verbatim (SPEC R-10.1).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -129,6 +220,10 @@ impl Default for Settings {
             launch_at_login: false,
             onboarding_done: false,
             popup_pinned: false,
+            takeover_permissions: true,
+            show_token_stats: true,
+            popup_mode: PopupMode::List,
+            popup_pos: None,
             extra: Map::new(),
         }
     }
@@ -156,6 +251,25 @@ impl Settings {
                 _ => default,
             }
         }
+        // `popupMode`: an unrecognized/wrong-typed value falls back to the field
+        // default (`List`), mirroring `take_bool`'s "reset just this field" policy
+        // rather than discarding the rest of the file.
+        let popup_mode = match map.remove("popupMode") {
+            Some(Value::String(s)) => PopupMode::parse(&s).unwrap_or_default(),
+            _ => PopupMode::default(),
+        };
+        // `popupPos`: stored on disk as `{"x":..,"y":..}` (the derived `Serialize`
+        // shape); a missing/malformed value is simply "no remembered position",
+        // never a load failure.
+        let popup_pos = match map.remove("popupPos") {
+            Some(Value::Object(mut obj)) => {
+                let x = obj.remove("x").and_then(|v| v.as_f64());
+                let y = obj.remove("y").and_then(|v| v.as_f64());
+                x.zip(y).map(|(x, y)| PopupPos { x, y })
+            }
+            _ => None,
+        };
+
         Some(Self {
             notify_idle: take_bool(&mut map, "notifyIdle", true),
             notify_attention: take_bool(&mut map, "notifyAttention", true),
@@ -163,6 +277,10 @@ impl Settings {
             launch_at_login: take_bool(&mut map, "launchAtLogin", false),
             onboarding_done: take_bool(&mut map, "onboardingDone", false),
             popup_pinned: take_bool(&mut map, "popupPinned", false),
+            takeover_permissions: take_bool(&mut map, "takeoverPermissions", true),
+            show_token_stats: take_bool(&mut map, "showTokenStats", true),
+            popup_mode,
+            popup_pos,
             extra: map,
         })
     }
@@ -177,6 +295,24 @@ impl Settings {
             "launchAtLogin" => self.launch_at_login = value.as_bool_lossy(),
             "onboardingDone" => self.onboarding_done = value.as_bool_lossy(),
             "popupPinned" => self.popup_pinned = value.as_bool_lossy(),
+            "takeoverPermissions" => self.takeover_permissions = value.as_bool_lossy(),
+            "showTokenStats" => self.show_token_stats = value.as_bool_lossy(),
+            "popupMode" => {
+                if let SettingValue::Text(s) = &value {
+                    // An unrecognized string is ignored (keeps the current mode)
+                    // rather than silently snapping back to `List` on a stray
+                    // caller — unlike a wrong-TYPED value (bool instead of
+                    // string), where falling back is the established policy.
+                    if let Some(mode) = PopupMode::parse(s) {
+                        self.popup_mode = mode;
+                    }
+                }
+            }
+            "popupPos" => {
+                if let SettingValue::Text(s) = &value {
+                    self.popup_pos = PopupPos::parse(s).or(self.popup_pos);
+                }
+            }
             other => {
                 self.extra.insert(other.to_string(), value.into());
             }
@@ -447,6 +583,145 @@ mod tests {
         let updated = set_setting(&dir, "popupPinned", SettingValue::Bool(true)).unwrap();
         assert!(updated.popup_pinned);
         assert!(load(&dir).popup_pinned, "pin state survives a reload");
+    }
+
+    #[test]
+    fn takeover_permissions_defaults_on_and_persists() {
+        // SPEC R-16.4: "Take over permission prompts" defaults ON. A settings
+        // file with no `takeoverPermissions` key (a pre-v1.1 file) must load as
+        // ON, and an explicit false must round-trip.
+        assert!(Settings::default().takeover_permissions);
+
+        let dir = unique_dir("takeover-missing");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(settings_path(&dir), br#"{"notifyIdle":true}"#).unwrap();
+        assert!(
+            load(&dir).takeover_permissions,
+            "absent key defaults ON (R-16.4)"
+        );
+
+        let updated = set_setting(&dir, "takeoverPermissions", SettingValue::Bool(false)).unwrap();
+        assert!(!updated.takeover_permissions);
+        assert!(
+            !load(&dir).takeover_permissions,
+            "explicit off survives a reload"
+        );
+    }
+
+    #[test]
+    fn show_token_stats_defaults_on_and_persists() {
+        // SPEC R-23.5: token stats default ON. A pre-v1.2 file with no
+        // `showTokenStats` key must load as ON, and an explicit false round-trips.
+        assert!(Settings::default().show_token_stats);
+
+        let dir = unique_dir("token-stats-missing");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(settings_path(&dir), br#"{"notifyIdle":true}"#).unwrap();
+        assert!(
+            load(&dir).show_token_stats,
+            "absent key defaults ON (R-23.5)"
+        );
+
+        let updated = set_setting(&dir, "showTokenStats", SettingValue::Bool(false)).unwrap();
+        assert!(!updated.show_token_stats);
+        assert!(
+            !load(&dir).show_token_stats,
+            "explicit off survives a reload"
+        );
+    }
+
+    #[test]
+    fn popup_mode_defaults_list_and_persists() {
+        // SPEC R-25.2: default mode is `list`; a pre-v1.2 file with no
+        // `popupMode` key must load as `list`.
+        assert_eq!(Settings::default().popup_mode, PopupMode::List);
+
+        let dir = unique_dir("popup-mode-missing");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(settings_path(&dir), br#"{"notifyIdle":true}"#).unwrap();
+        assert_eq!(load(&dir).popup_mode, PopupMode::List);
+
+        let updated =
+            set_setting(&dir, "popupMode", SettingValue::Text("lamp".to_string())).unwrap();
+        assert_eq!(updated.popup_mode, PopupMode::Lamp);
+        assert_eq!(
+            load(&dir).popup_mode,
+            PopupMode::Lamp,
+            "explicit lamp survives a reload"
+        );
+    }
+
+    #[test]
+    fn popup_mode_unrecognized_value_falls_back_to_list_on_load_but_keeps_current_on_apply() {
+        // A hand-edited/garbage `popupMode` on disk (bad TYPE-of-value case) must
+        // not crash the load path — it resets just this field, same as a
+        // wrong-typed boolean (R-10.1's "single bad known key" policy).
+        let dir = unique_dir("popup-mode-garbage");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(settings_path(&dir), br#"{"popupMode":"sideways"}"#).unwrap();
+        assert_eq!(load(&dir).popup_mode, PopupMode::List);
+
+        // `apply()` (the live `set_setting` path) instead keeps the CURRENT
+        // in-memory mode on a garbage string, rather than silently reverting a
+        // user's lamp mode back to list on a stray/misbehaving caller.
+        let mut settings = Settings {
+            popup_mode: PopupMode::Lamp,
+            ..Settings::default()
+        };
+        settings.apply("popupMode", SettingValue::Text("sideways".to_string()));
+        assert_eq!(
+            settings.popup_mode,
+            PopupMode::Lamp,
+            "garbage value ignored, not reset"
+        );
+    }
+
+    #[test]
+    fn popup_pos_round_trips_through_the_comma_wire_form_and_disk_object() {
+        // SPEC R-25.2 `popupPos`: `windows.rs` persists via the generic
+        // `set_setting` channel as a comma string; on disk it's a `{x,y}` object
+        // (the derived `Serialize` shape) that `from_json_value` reads back.
+        assert_eq!(Settings::default().popup_pos, None);
+
+        let dir = unique_dir("popup-pos");
+        let updated = set_setting(
+            &dir,
+            "popupPos",
+            SettingValue::Text("120.5,340".to_string()),
+        )
+        .unwrap();
+        assert_eq!(updated.popup_pos, Some(PopupPos { x: 120.5, y: 340.0 }));
+
+        let reloaded = load(&dir);
+        assert_eq!(reloaded.popup_pos, Some(PopupPos { x: 120.5, y: 340.0 }));
+
+        // The on-disk shape really is a `{x,y}` object, not the wire string.
+        let raw = fs::read_to_string(settings_path(&dir)).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["popupPos"]["x"], 120.5);
+        assert_eq!(value["popupPos"]["y"], 340.0);
+    }
+
+    #[test]
+    fn popup_pos_malformed_wire_value_is_ignored_not_crashing() {
+        let mut settings = Settings::default();
+        settings.apply("popupPos", SettingValue::Text("not-a-position".to_string()));
+        assert_eq!(settings.popup_pos, None, "malformed value leaves it unset");
+
+        settings.popup_pos = Some(PopupPos { x: 1.0, y: 2.0 });
+        settings.apply("popupPos", SettingValue::Text("garbage".to_string()));
+        assert_eq!(
+            settings.popup_pos,
+            Some(PopupPos { x: 1.0, y: 2.0 }),
+            "malformed value keeps the previous position rather than wiping it"
+        );
+    }
+
+    #[test]
+    fn popup_pos_to_setting_string_round_trips() {
+        let pos = PopupPos { x: 12.0, y: -4.5 };
+        let s = pos.to_setting_string();
+        assert_eq!(s, "12,-4.5");
     }
 
     #[test]

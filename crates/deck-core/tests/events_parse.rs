@@ -111,12 +111,28 @@ fn parses_each_event_type() {
 
 #[test]
 fn unknown_event_name_is_tolerated_not_error() {
-    let ev =
-        env(r#"{"event":"SubagentStop","receivedAt":1,"payload":{"session_id":"s"}}"#).unwrap();
+    // A genuinely-unrecognized event name maps to Unknown (R-4.5), never a parse
+    // error. (SubagentStart/SubagentStop are now *known* — see below.)
+    let ev = env(r#"{"event":"PreCompact","receivedAt":1,"payload":{"session_id":"s"}}"#).unwrap();
     match ev.kind {
-        HookEvent::Unknown { name } => assert_eq!(name, "SubagentStop"),
+        HookEvent::Unknown { name } => assert_eq!(name, "PreCompact"),
         other => panic!("expected Unknown, got {other:?}"),
     }
+}
+
+#[test]
+fn subagent_events_are_classified(/* SPEC §21, R-21.2 */) {
+    let start =
+        env(r#"{"event":"SubagentStart","receivedAt":1,"payload":{"session_id":"s"}}"#).unwrap();
+    assert_eq!(start.kind, HookEvent::SubagentStart);
+    let stop =
+        env(r#"{"event":"SubagentStop","receivedAt":1,"payload":{"session_id":"s"}}"#).unwrap();
+    assert_eq!(stop.kind, HookEvent::SubagentStop);
+    // Also resolvable from the payload's hook_event_name (no wrapper `event`).
+    let via_payload =
+        env(r#"{"receivedAt":1,"payload":{"session_id":"s","hook_event_name":"SubagentStop"}}"#)
+            .unwrap();
+    assert_eq!(via_payload.kind, HookEvent::SubagentStop);
 }
 
 #[test]

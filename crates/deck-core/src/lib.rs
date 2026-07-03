@@ -20,3 +20,4 @@ pub mod liveness;
 pub mod naming;
 pub mod registry;
 pub mod traits;
+pub mod usage;

@@ -28,6 +28,7 @@ pub mod tray;
 pub mod watcher;
 pub mod windows;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,16 +42,18 @@ use tokio::sync::oneshot;
 
 use deck_core::ask::{AskStore, PendingAsk};
 use deck_core::engine::{Effect, SessionStore, SessionView, Status as EngineStatus};
+use deck_core::naming::{strip_bidi_controls, truncate_graphemes};
 use deck_core::traits::{Notifier, ProcessTable, ToastKind};
+use deck_core::usage::{self, SessionUsageGroup};
 use deck_core::{discovery, events, hooks_config, registry};
 
 use crate::ipc::{
-    AppState, AskAnswerKind, AskRow, Counts, SessionRow, SessionStatus, SettingsState,
-    StateSnapshot,
+    AppState, AskAnswerKind, AskRow, Counts, PermDecision, PermRow, SessionRow, SessionStatus,
+    SettingsState, StateSnapshot,
 };
-use crate::mcp_server::{AskAnswer, AskGateway, AskRequest, NotifyRequest};
+use crate::mcp_server::{AskAnswer, AskGateway, AskRequest, NotifyRequest, SubmittedAsk};
 use crate::notify::DesktopNotifier;
-use crate::settings::Settings;
+use crate::settings::{PopupMode, Settings};
 
 /// Rust-side liveness / recovery / prune cadence (R-3.6, R-6.1).
 const ENGINE_TICK: Duration = Duration::from_secs(10);
@@ -74,7 +77,15 @@ const SPOOL_SWEEP: Duration = Duration::from_secs(1);
 /// loop), so it never spawns a sampler when there is nothing to un-suppress.
 const FOREGROUND_POLL: Duration = Duration::from_secs(2);
 
+/// Character budget for the R-24.1 finished-toast body (the model's last
+/// words). Matches "the SAME character budget as today's body" — the R-9.1
+/// fallback body is at most a 60-grapheme title (R-5.2) plus the fixed
+/// " Waiting for new instructions." suffix (30 chars).
+const IDLE_BODY_MAX_CHARS: usize = 90;
+
 static ASK_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Monotonic sequence for `notify_user` record ids (R-19.6).
+static NOTIFY_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Serializes the handful of tests across modules that mutate the process-global
 /// `QUARTERDECK_DATA_DIR` env var, so they don't race under the parallel test
@@ -384,6 +395,14 @@ fn map_row(view: &SessionView) -> SessionRow {
         inferred: view.inferred,
         since_ms: view.since_ms,
         cwd: view.cwd.clone(),
+        subagents: view.subagents,
+        age_ms: view.age_ms,
+        // §23 token telemetry is projected in `snapshot` from the shell's usage
+        // map (the engine view carries none); default to absent here.
+        ctx_percent: None,
+        spend: None,
+        spend_approx: false,
+        subagent_spend: None,
     }
 }
 
@@ -404,7 +423,13 @@ fn ask_to_row(ask: &ShellAsk) -> AskRow {
         project: ask.project.clone(),
         question: ask.question.clone(),
         options: ask.options.clone(),
-        timeout_at: Some(ask.timeout_at_ms),
+        detail: ask.detail.clone(),
+        // R-19.2: a persistent ask has no expiry, so it carries no countdown.
+        timeout_at: if ask.persistent {
+            None
+        } else {
+            Some(ask.timeout_at_ms)
+        },
         // R-8.2: only unmatched asks surface the raw context ("Unknown agent (<context>)").
         context: if ask.session_id.is_none() {
             ask.context.clone()
@@ -413,7 +438,86 @@ fn ask_to_row(ask: &ShellAsk) -> AskRow {
         },
         // R-8.7: an ask recovered from disk at startup is shown as expired.
         orphaned: ask.orphaned,
+        // R-16.2: arrival time for the shared ask/perm FIFO ordering.
+        queued_at: ask.enqueued_ms,
     }
+}
+
+/// Display cap for the perm modal's `tool_input` (SPEC R-16.1 "truncated to
+/// 2KB" / R-16.5 length caps). Applied in grapheme units after bidi-stripping.
+const PERM_INPUT_CAP: usize = 2048;
+/// Display cap for a tool name (defence in depth; real names are short).
+const PERM_TOOL_NAME_CAP: usize = 200;
+
+/// SPEC R-16.2: the perm modal body is "tool name + compact pretty-printed input
+/// (truncated)". The hook serialises `tool_input` to a JSON string and caps it at
+/// 2KB (R-16.1). Here we normalise that string into indented (pretty-printed) JSON
+/// for the modal, tool-agnostically — the same output whether the ps1, python, or
+/// jq hook wrote the file. When the input parses (the common case) we re-emit it
+/// via `serde_json` so the indentation is consistent regardless of how the hook
+/// formatted it. When it does NOT parse — a `tool_input` that overflowed the hook's
+/// 2KB cap and was truncated mid-JSON — we keep the hook's text verbatim rather
+/// than invent structure from a fragment (the truncation-safety note from QA round
+/// 6); the ps1/python hooks pretty-print BEFORE truncating, so even that fragment
+/// stays indented up to the cut. Bidi-stripping and the display cap are applied by
+/// the caller AFTER this, per R-16.5.
+fn pretty_tool_input(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| raw.to_string()),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Shell-side pending permission request (SPEC §16). Unlike an ask there is no
+/// blocked in-process caller: the `PermissionRequest` hook polls
+/// `<data>/perm-answers/<id>.json` directly, so the deck only owns the display
+/// state + the decision-file write.
+struct ShellPerm {
+    id: String,
+    session_id: Option<String>,
+    project: Option<String>,
+    tool_name: String,
+    tool_input: String,
+    context: Option<String>,
+    /// Epoch ms the perm arrived — its position in the shared ask/perm FIFO
+    /// (R-16.2). Compared against a front ask's `enqueued_ms` so the ask window's
+    /// primary slot follows arrival order, not a blanket perm-over-ask priority.
+    received_ms: u64,
+}
+
+fn perm_to_row(perm: &ShellPerm) -> PermRow {
+    PermRow {
+        id: perm.id.clone(),
+        session_id: perm.session_id.clone(),
+        project: perm.project.clone(),
+        tool_name: perm.tool_name.clone(),
+        tool_input: perm.tool_input.clone(),
+        context: perm.context.clone(),
+        queued_at: perm.received_ms,
+    }
+}
+
+/// On-disk shape of a perm request file (`<data>/perms/<id>.json`), written by
+/// the `PermissionRequest` hook (SPEC R-16.1). Parsed defensively — every field
+/// is optional so a format drift never crashes ingestion.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct PermFileRecord {
+    #[serde(default)]
+    tool_name: String,
+    /// Compact JSON of the tool input, already truncated by the hook. A string
+    /// (not a nested object) so the 2KB cap is meaningful and the display is a
+    /// single deterministic blob.
+    #[serde(default)]
+    tool_input: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// On-disk shape of a persisted ask file (`<data>/asks/<id>.json`, written by
@@ -432,6 +536,8 @@ struct AskFileRecord {
     question: String,
     #[serde(default)]
     options: Option<Vec<String>>,
+    #[serde(default)]
+    detail: Option<String>,
     #[serde(default)]
     context: Option<String>,
 }
@@ -454,17 +560,31 @@ struct Shell {
     app: AppHandle<Wry>,
     store: Mutex<SessionStore>,
     asks: Mutex<AskStore<oneshot::Sender<AskAnswer>>>,
+    /// Pending permission requests (§16), owned entirely shell-side.
+    perms: Mutex<Vec<ShellPerm>>,
+    /// Per-session incremental token telemetry (§23), keyed by session id. Read
+    /// (ingested) on the engine tick and just before a finished-toast fires;
+    /// projected into `SessionRow` in `snapshot` and mined for the R-24.1 idle
+    /// toast body. Pruned to live sessions each update.
+    usage: Mutex<HashMap<String, SessionUsageGroup>>,
     notifier: DesktopNotifier<Wry>,
     tray: tauri::tray::TrayIcon<Wry>,
     data_dir: PathBuf,
     version: String,
+    /// R-17.1: most recent foreground-pid sample (instant taken + pids). Every
+    /// sample site writes through here so latency-critical hot paths — the
+    /// R-16.3 perm auto-defer — can reuse a recent sample instead of paying the
+    /// ~250ms synchronous foreground-sampler spawn (a `powershell` + CIM query
+    /// on Windows) on the ingest hot path. Bounded by [`FOREGROUND_POLL`] so a
+    /// reused sample is never older than the R-17.1 poll resolution.
+    foreground_cache: Mutex<Option<(Instant, Vec<u32>)>>,
 }
 
 impl Shell {
     // --- state projection --------------------------------------------------
 
     fn snapshot(&self) -> StateSnapshot {
-        let (sessions, counts) = {
+        let (mut sessions, counts) = {
             let store = self.store.lock().expect("store poisoned");
             let sessions: Vec<SessionRow> = store.view().iter().map(map_row).collect();
             let c = store.counts();
@@ -485,8 +605,39 @@ impl Shell {
             .iter()
             .map(ask_to_row)
             .collect();
+        let perms: Vec<PermRow> = self
+            .perms
+            .lock()
+            .expect("perms poisoned")
+            .iter()
+            .map(perm_to_row)
+            .collect();
 
         let settings = settings::load(&self.data_dir);
+
+        // §23: project per-session token telemetry onto the rows (R-23.4). Only
+        // when `showTokenStats` is on (R-23.5/R-23.6 "toggle off hides all of
+        // it"); the heavy transcript IO happened on the tick, this is a cheap
+        // map lookup per row.
+        if settings.show_token_stats {
+            let usage = self.usage.lock().expect("usage poisoned");
+            for row in &mut sessions {
+                let Some(group) = usage.get(&row.id) else {
+                    continue;
+                };
+                row.ctx_percent = group.context_percent();
+                let spend = group.spend();
+                if spend > 0 {
+                    row.spend = Some(usage::format_compact(spend));
+                    row.spend_approx = group.spend_approx();
+                }
+                let group_spend = group.group_spend();
+                if group_spend > 0 {
+                    row.subagent_spend = Some(usage::format_compact(group_spend));
+                }
+            }
+        }
+
         let mcp_enabled = settings
             .extra
             .get("mcpEnabled")
@@ -510,6 +661,9 @@ impl Shell {
             launch_at_login: settings.launch_at_login,
             onboarding_done: settings.onboarding_done,
             popup_pinned: settings.popup_pinned,
+            takeover_permissions: settings.takeover_permissions,
+            show_token_stats: settings.show_token_stats,
+            popup_mode: settings.popup_mode,
             mcp_enabled,
             mcp_cli_available: claude_cli_on_path(),
             mcp_command,
@@ -520,6 +674,7 @@ impl Shell {
         StateSnapshot {
             sessions,
             asks,
+            perms,
             hooks_installed: self.hooks_installed(),
             counts,
             settings: Some(settings_state),
@@ -569,11 +724,36 @@ impl Shell {
             .unwrap_or_default()
     }
 
+    /// Take a fresh foreground-pid sample (R-17.1) and store it in the shared
+    /// cache so latency-critical hot paths (R-16.3 perm auto-defer) can reuse a
+    /// recent sample instead of re-spawning the sampler. Every fresh sample in
+    /// the shell goes through here to keep the cache warm.
+    fn sample_foreground_and_cache(&self) -> Vec<u32> {
+        let fg = foreground::sample_foreground_pids();
+        *self
+            .foreground_cache
+            .lock()
+            .expect("foreground cache poisoned") = Some((Instant::now(), fg.clone()));
+        fg
+    }
+
+    /// The cached foreground sample if it is no older than `max_age`, else
+    /// `None` (cold/stale → caller must take a fresh sample).
+    fn cached_foreground(&self, max_age: Duration) -> Option<Vec<u32>> {
+        self.foreground_cache
+            .lock()
+            .expect("foreground cache poisoned")
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() <= max_age)
+            .map(|(_, pids)| pids.clone())
+    }
+
     /// R-17.2: is the given session's terminal window the foreground window?
     /// Samples the foreground chain (R-17.1) and intersects with the session's
     /// terminal pids. Unmatched asks (`None`) are never terminal-foreground —
-    /// there's no terminal to defer to. A fresh sample is taken here so callers
-    /// get the "immediately before showing / firing" check R-17.1 requires.
+    /// there's no terminal to defer to. A fresh sample is taken here (and cached)
+    /// so callers get the "immediately before showing / firing" check R-17.1
+    /// requires.
     fn session_foreground(&self, session_id: Option<&str>) -> bool {
         let Some(sid) = session_id else {
             return false;
@@ -582,7 +762,28 @@ impl Shell {
         if terminal.is_empty() {
             return false;
         }
-        let fg = foreground::sample_foreground_pids();
+        let fg = self.sample_foreground_and_cache();
+        foreground::session_is_foreground(&terminal, &fg)
+    }
+
+    /// R-16.3: like [`Self::session_foreground`] but reuses the cached R-17.1
+    /// foreground sample when it is fresher than `max_age`, so the perm
+    /// auto-defer decision does not pay the ~250ms synchronous foreground-sampler
+    /// spawn on the ingest hot path (which, added to the watcher debounce, blew
+    /// the 300ms auto-defer budget). Degrades gracefully: a cold/stale cache
+    /// falls back to a fresh sample (still correct, just the old latency).
+    fn session_foreground_cached(&self, session_id: Option<&str>, max_age: Duration) -> bool {
+        let Some(sid) = session_id else {
+            return false;
+        };
+        let terminal = self.session_terminal_pids(sid);
+        if terminal.is_empty() {
+            return false;
+        }
+        let fg = match self.cached_foreground(max_age) {
+            Some(cached) => cached,
+            None => self.sample_foreground_and_cache(),
+        };
         foreground::session_is_foreground(&terminal, &fg)
     }
 
@@ -604,8 +805,9 @@ impl Shell {
         if ask_visible {
             return;
         }
-        // Sample the foreground once, then check every pending ask against it.
-        let fg = foreground::sample_foreground_pids();
+        // Sample the foreground once (caching it for the R-16.3 perm hot path),
+        // then check every pending ask against it.
+        let fg = self.sample_foreground_and_cache();
         let terminal_pids = self.store.lock().expect("store poisoned").terminal_pids();
         let sessions: Vec<Option<String>> = self
             .asks
@@ -655,9 +857,10 @@ impl Shell {
         }
         let settings = settings::load(&self.data_dir);
         let popup = self.popup_focused();
-        // R-17.1: sample the foreground chain once for this batch; a toast whose
-        // session terminal is the foreground window is suppressed (R-17.2).
-        let foreground = foreground::sample_foreground_pids();
+        // R-17.1: sample the foreground chain once for this batch (caching it for
+        // the R-16.3 perm hot path); a toast whose session terminal is the
+        // foreground window is suppressed (R-17.2).
+        let foreground = self.sample_foreground_and_cache();
         let terminal_pids = self.store.lock().expect("store poisoned").terminal_pids();
         for effect in effects {
             let Effect::Toast(decision) = effect;
@@ -679,13 +882,25 @@ impl Shell {
             // it (R-9.4 popup-visible-and-focused suppression, applied inside
             // `notify`, which returns whether a toast fired). Short-circuit so
             // `notify` is not called when the toggle is off / terminal foreground.
-            let shown = enabled
-                && !terminal_foreground
-                && self.notifier.notify(
-                    decision.kind,
-                    &decision.session_id,
-                    &decision.project,
-                    &decision.detail,
+            // R-24.1: a finished (idle) toast carries the model's last words as
+            // its body when the §23 reader has them; every other kind carries
+            // its own message/question (assistant_body ignored). Only read the
+            // transcript when the toast will actually be attempted (R-23.5 perf).
+            let will_attempt = enabled && !terminal_foreground;
+            let assistant_body = if will_attempt && decision.kind == ToastKind::Idle {
+                self.idle_assistant_body(&decision.session_id)
+            } else {
+                None
+            };
+            let shown = will_attempt
+                && self.notifier.send(
+                    crate::notify::ToastRequest {
+                        kind: decision.kind,
+                        session_id: decision.session_id.clone(),
+                        project: decision.project.clone(),
+                        detail: decision.detail.clone(),
+                        assistant_body,
+                    },
                     popup,
                 );
             if !shown {
@@ -704,6 +919,71 @@ impl Shell {
                 );
             }
         }
+    }
+
+    // --- token telemetry (§23) --------------------------------------------
+
+    /// Whether the §23 token-stats feature is enabled (`showTokenStats`,
+    /// default ON, R-23.5). Read fresh so a toggle takes effect at once.
+    fn token_stats_enabled(&self) -> bool {
+        settings::load(&self.data_dir).show_token_stats
+    }
+
+    /// Drive the incremental usage reader for every live session (R-23.1),
+    /// pruning state for gone sessions. Called on the engine tick (≤1 read per
+    /// session per tick, R-23.5). A no-op — clearing any accumulated state — when
+    /// the feature toggle is off (R-23.6 "toggle off hides all of it").
+    fn update_usage(&self) {
+        if !self.token_stats_enabled() {
+            let mut usage = self.usage.lock().expect("usage poisoned");
+            if !usage.is_empty() {
+                usage.clear();
+            }
+            return;
+        }
+        let transcripts = self
+            .store
+            .lock()
+            .expect("store poisoned")
+            .session_transcripts();
+        let present: std::collections::HashSet<&str> =
+            transcripts.iter().map(|(id, _)| id.as_str()).collect();
+        let mut usage = self.usage.lock().expect("usage poisoned");
+        usage.retain(|id, _| present.contains(id.as_str()));
+        for (id, path) in &transcripts {
+            let Some(path) = path.as_deref().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            usage.entry(id.clone()).or_default().update(Path::new(path));
+        }
+    }
+
+    /// R-24.1: the model's last words for a session's finished toast, refreshed
+    /// on demand (the Stop event arrives on the spool path, not the tick, so the
+    /// tail may be newer than the last tick's read), then sanitized (bidi strip,
+    /// R-16.5), whitespace-collapsed, and truncated to the idle-body budget.
+    /// `None` when the feature is off, no assistant text is known yet, or the
+    /// transcript is unavailable — the toast then falls back to the R-9.1 copy.
+    fn idle_assistant_body(&self, session_id: &str) -> Option<String> {
+        if !self.token_stats_enabled() {
+            return None;
+        }
+        let path = self
+            .store
+            .lock()
+            .expect("store poisoned")
+            .transcript_path_of(session_id)
+            .filter(|p| !p.is_empty())?;
+        let text = {
+            let mut usage = self.usage.lock().expect("usage poisoned");
+            let group = usage.entry(session_id.to_string()).or_default();
+            group.update(Path::new(&path));
+            group.last_assistant_text().map(str::to_string)
+        }?;
+        let cleaned = strip_bidi_controls(&text);
+        let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        let out = truncate_graphemes(&collapsed, IDLE_BODY_MAX_CHARS);
+        (!out.trim().is_empty()).then_some(out)
     }
 
     // --- ask channel (§8) --------------------------------------------------
@@ -734,15 +1014,16 @@ impl Shell {
         settings::asks_dir().join(format!("{id}.json"))
     }
 
-    fn write_ask_file(&self, ask: &ShellAsk, timeout_seconds: u64) {
+    fn write_ask_file(&self, ask: &ShellAsk) {
         let record = serde_json::json!({
             "id": ask.id,
             "sessionId": ask.session_id,
             "project": ask.project,
             "question": ask.question,
             "options": ask.options,
+            "detail": ask.detail,
             "context": ask.context,
-            "timeoutSeconds": timeout_seconds,
+            "persistent": ask.persistent,
             "timeoutAtMs": ask.timeout_at_ms,
             "createdAtMs": now_ms(),
         });
@@ -753,7 +1034,7 @@ impl Shell {
         }
     }
 
-    fn submit_ask(&self, req: AskRequest) -> oneshot::Receiver<AskAnswer> {
+    fn submit_ask(&self, req: AskRequest) -> SubmittedAsk {
         let (tx, rx) = oneshot::channel();
         let ask_id = format!(
             "ask-{}-{}",
@@ -761,7 +1042,12 @@ impl Shell {
             ASK_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let (session_id, project) = self.match_session(req.context.as_deref());
-        let timeout_at_ms = now_ms() + req.timeout_seconds.saturating_mul(1000);
+        // R-19.2: `timeout_seconds` is `None` for a persistent ask (no expiry).
+        let persistent = req.timeout_seconds.is_none();
+        let timeout_at_ms = match req.timeout_seconds {
+            Some(secs) => now_ms() + secs.saturating_mul(1000),
+            None => 0,
+        };
 
         if let Some(sid) = &session_id {
             self.store
@@ -776,12 +1062,15 @@ impl Shell {
             project: project.clone(),
             question: req.question.clone(),
             options: req.options.clone(),
+            detail: req.detail.clone(),
             context: req.context.clone(),
+            enqueued_ms: now_ms(),
             timeout_at_ms,
+            persistent,
             orphaned: false,
             responder: Some(tx),
         };
-        self.write_ask_file(&ask, req.timeout_seconds);
+        self.write_ask_file(&ask);
         self.asks.lock().expect("asks poisoned").push(ask);
 
         self.push_state();
@@ -814,17 +1103,92 @@ impl Shell {
         }
 
         tracing::info!(ask_id = %ask_id, matched = session_id.is_some(), "ask submitted");
-        rx
+        SubmittedAsk { id: ask_id, rx }
     }
 
-    fn notify_user(&self, req: NotifyRequest) {
+    /// R-19.5 `update_ask`: mutate a pending ask in place. Keeps its queue
+    /// position; re-persists the ask file; re-renders the UI. Returns `false`
+    /// for an unknown/settled/orphaned id (the MCP layer maps that to an error
+    /// result).
+    fn update_ask(
+        &self,
+        ask_id: &str,
+        question: Option<String>,
+        options: Option<Vec<String>>,
+        detail: Option<String>,
+    ) -> bool {
+        {
+            let mut asks = self.asks.lock().expect("asks poisoned");
+            let Some(ask) = asks.get_mut(ask_id) else {
+                return false;
+            };
+            // An orphaned (expired) ask can no longer be answered, so it can't be
+            // meaningfully revised either.
+            if ask.orphaned {
+                return false;
+            }
+            if let Some(q) = question {
+                if !q.is_empty() {
+                    ask.question = q;
+                }
+            }
+            if let Some(o) = options {
+                ask.options = if o.is_empty() { None } else { Some(o) };
+            }
+            if let Some(d) = detail {
+                ask.detail = if d.is_empty() { None } else { Some(d) };
+            }
+            // Re-persist the revised ask (write_ask_file touches disk, not the
+            // asks lock, so this shared reborrow is safe under the guard).
+            self.write_ask_file(ask);
+        }
+        self.push_state();
+        tracing::info!(ask_id = %ask_id, "ask updated (R-19.5)");
+        true
+    }
+
+    /// R-19.5 `cancel_ask`: resolve a pending ask toward the blocked caller with
+    /// `kind:"cancelled"` and remove it from the UI. Returns `false` for an
+    /// unknown/settled id.
+    fn cancel_ask(&self, ask_id: &str) -> bool {
+        let Some(mut ask) = self.take_ask(ask_id) else {
+            return false;
+        };
+        if let Some(tx) = ask.responder.take() {
+            let _ = tx.send(AskAnswer::cancelled());
+        }
+        if let Some(sid) = &ask.session_id {
+            self.store
+                .lock()
+                .expect("store poisoned")
+                .note_ask_cleared(sid);
+        }
+        let _ = std::fs::remove_file(self.ask_file_path(&ask.id));
+        self.push_state();
+        if self.ask_window_idle() {
+            run_on_main(&self.app, |app| {
+                let _ = windows::hide_ask_window(app);
+            });
+        }
+        tracing::info!(ask_id = %ask_id, "ask cancelled (R-19.5)");
+        true
+    }
+
+    fn notify_user(&self, req: NotifyRequest) -> String {
+        let record_id = format!(
+            "ntf-{}-{}",
+            now_ms(),
+            NOTIFY_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         // R-9.5: the MCP `notify_user` toast uses the alert (Attention) channel,
         // so it honors the `notifyAttention` toggle just like hook-driven
         // attention toasts (`fire_effects`). Unlike `ask_user` (R-8.4 "Ask toasts
         // never suppressed"), no spec text exempts `notify_user` from the toggle.
         if !settings::load(&self.data_dir).notify_attention {
             tracing::debug!("notify_user suppressed: notifyAttention is off (R-9.5)");
-            return;
+            // R-19.6: still return a record id — the notification was accepted,
+            // just not shown (the toggle is off), same as a throttled toast.
+            return record_id;
         }
         let (session_id, project) = self.match_session(req.context.as_deref());
         let project = project
@@ -854,13 +1218,19 @@ impl Shell {
                 None => "notify-agent".to_string(),
             },
         };
-        self.notifier.notify(
-            ToastKind::Attention,
-            &key,
-            &project,
-            &req.message,
+        // R-19.6: fire with the record id so the fake-notifier jsonl carries it.
+        self.notifier.send_with_id(
+            crate::notify::ToastRequest {
+                kind: ToastKind::Attention,
+                session_id: key,
+                project,
+                detail: req.message.clone(),
+                assistant_body: None,
+            },
             self.popup_focused(),
+            &record_id,
         );
+        record_id
     }
 
     /// R-8.7: at startup, recover any ask files left by a previous process. Their
@@ -878,8 +1248,13 @@ impl Shell {
                 project: rec.project,
                 question: rec.question,
                 options: rec.options,
+                detail: rec.detail,
                 context: rec.context,
+                // Recovered from a previous run → older than anything enqueued
+                // this session; 0 sorts it to the front of the FIFO (R-16.2).
+                enqueued_ms: 0,
                 timeout_at_ms: 0,
+                persistent: false,
                 orphaned: true,
                 responder: None,
             };
@@ -954,9 +1329,9 @@ impl Shell {
             if delivered {
                 match parsed.kind {
                     AskAnswerKind::Option | AskAnswerKind::Text => store.note_ask_answered(sid),
-                    AskAnswerKind::Timeout | AskAnswerKind::Dismissed => {
-                        store.note_ask_cleared(sid)
-                    }
+                    AskAnswerKind::Timeout
+                    | AskAnswerKind::Dismissed
+                    | AskAnswerKind::Cancelled => store.note_ask_cleared(sid),
                 }
             } else {
                 // Agent already stopped waiting: just drop the pending-ask
@@ -975,7 +1350,7 @@ impl Shell {
         let _ = std::fs::remove_file(path);
 
         self.push_state();
-        if self.asks_empty() {
+        if self.ask_window_idle() {
             run_on_main(&self.app, |app| {
                 let _ = windows::hide_ask_window(app);
             });
@@ -1001,11 +1376,207 @@ impl Shell {
             let _ = std::fs::remove_file(self.ask_file_path(&ask.id));
             tracing::info!(ask_id = %ask.id, "ask timed out");
         }
-        if self.asks_empty() {
+        if self.ask_window_idle() {
             run_on_main(&self.app, |app| {
                 let _ = windows::hide_ask_window(app);
             });
         }
+    }
+
+    // --- permission requests (§16) ----------------------------------------
+
+    fn perms_empty(&self) -> bool {
+        self.perms.lock().expect("perms poisoned").is_empty()
+    }
+
+    /// Should the ask window be hidden now? Only when NEITHER an ask nor a perm
+    /// is pending — the two share the one always-on-top window (R-16.2).
+    fn ask_window_idle(&self) -> bool {
+        self.asks_empty() && self.perms_empty()
+    }
+
+    /// Match a perm to a known session: by `session_id` first (perms carry the
+    /// real Claude session id, R-16.1), else by cwd (R-8.2-style fallback).
+    /// Returns `(session_id, project, unmatched_context)`.
+    fn match_perm_session(
+        &self,
+        rec: &PermFileRecord,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let views = self.store.lock().expect("store poisoned").view();
+        if let Some(sid) = rec
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(v) = views.iter().find(|v| v.id == sid) {
+                return (Some(v.id.clone()), Some(v.project.clone()), None);
+            }
+        }
+        if let Some(cwd) = rec.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for v in &views {
+                if !v.cwd.is_empty() && paths_eq(&v.cwd, cwd) {
+                    return (Some(v.id.clone()), Some(v.project.clone()), None);
+                }
+            }
+            return (None, None, Some(cwd.to_string()));
+        }
+        (None, None, None)
+    }
+
+    /// Ingest one `<data>/perms/*.json` file (R-16.1): parse defensively, match a
+    /// session, and either surface a deck modal (attention + alert toast + ask
+    /// window) or, if the session's terminal is already the foreground window,
+    /// auto-defer to the terminal dialog (R-16.3). The perm file is consumed
+    /// (the deck now owns the state); a malformed one is quarantined (R-3.5).
+    fn ingest_perm_path(&self, quarantine_dir: &Path, path: &Path) {
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            return;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            return;
+        };
+        // Already tracked (the safety-net drain re-reads the dir): consume + skip.
+        if self
+            .perms
+            .lock()
+            .expect("perms poisoned")
+            .iter()
+            .any(|p| p.id == id)
+        {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            tracing::warn!(?path, "quarantining unreadable perm file (R-3.5)");
+            quarantine_bad_file_to(path, quarantine_dir);
+            return;
+        };
+        let Ok(rec) = serde_json::from_str::<PermFileRecord>(&text) else {
+            tracing::warn!(?path, "quarantining malformed perm file (R-3.5)");
+            quarantine_bad_file_to(path, quarantine_dir);
+            return;
+        };
+        // We own the state now — consume the source file.
+        let _ = std::fs::remove_file(path);
+
+        let (session_id, project, context) = self.match_perm_session(&rec);
+
+        // R-16.5: display tool_name + input VERBATIM but sanitized (bidi strip)
+        // and length-capped.
+        let tool_name = truncate_graphemes(
+            strip_bidi_controls(rec.tool_name.trim()).trim(),
+            PERM_TOOL_NAME_CAP,
+        );
+        let tool_input = truncate_graphemes(
+            &strip_bidi_controls(&pretty_tool_input(&rec.tool_input)),
+            PERM_INPUT_CAP,
+        );
+        let tool_name = if tool_name.is_empty() {
+            "(unknown tool)".to_string()
+        } else {
+            tool_name
+        };
+
+        // R-16.3 / R-17.2: if the session's terminal window is the foreground,
+        // the dialog is already right in front of the user — auto-defer to the
+        // terminal (write a "no decision" answer so the hook exits silently) and
+        // show nothing. Reuse a recent (≤FOREGROUND_POLL) foreground sample so
+        // this stays within the 300ms auto-defer budget instead of spawning a
+        // fresh ~250ms foreground sampler on the ingest hot path.
+        if self.session_foreground_cached(session_id.as_deref(), FOREGROUND_POLL) {
+            if let Err(err) = ipc::write_perm_answer_file(
+                &settings::perm_answers_dir(),
+                &id,
+                PermDecision::Defer,
+                None,
+            ) {
+                tracing::warn!(perm_id = %id, error = %err, "failed to write auto-defer perm answer");
+            }
+            tracing::debug!(perm_id = %id, "perm auto-deferred: session terminal is foreground (R-16.3)");
+            return;
+        }
+
+        // Pending perm forces the session to attention (R-16.2), reusing the
+        // ask override counter (any pending ask/perm ⇒ attention, R-2.4).
+        if let Some(sid) = &session_id {
+            self.store
+                .lock()
+                .expect("store poisoned")
+                .note_pending_ask(sid);
+        }
+
+        let perm = ShellPerm {
+            id: id.clone(),
+            session_id: session_id.clone(),
+            project: project.clone(),
+            tool_name: tool_name.clone(),
+            tool_input,
+            context,
+            received_ms: now_ms(),
+        };
+        self.perms.lock().expect("perms poisoned").push(perm);
+        self.push_state();
+
+        // R-16.2: bring up the always-on-top ask window (shared with asks).
+        run_on_main(&self.app, |app| {
+            if let Err(err) = windows::show_ask_window(app) {
+                tracing::warn!(error = %err, "failed to show ask window for perm");
+            }
+        });
+
+        // R-16.2: alert toast, same class as R-9.2 (attention), honoring the
+        // per-type toggle (R-9.5). Suppressed when the terminal is foreground is
+        // moot here — that path auto-deferred above.
+        if settings::load(&self.data_dir).notify_attention {
+            let toast_project = project
+                .or_else(|| rec.cwd.as_deref().map(basename))
+                .unwrap_or_else(|| "Agent".to_string());
+            self.notifier.notify(
+                ToastKind::Attention,
+                &format!("perm-{id}"),
+                &toast_project,
+                &format!("requests permission to run {tool_name}"),
+                self.popup_focused(),
+            );
+        }
+
+        tracing::info!(perm_id = %id, matched = session_id.is_some(), "perm ingested");
+    }
+
+    /// Answer a pending perm (from the deck UI): persist the decision for the
+    /// blocked hook to poll, drop the perm + its attention override, and hide the
+    /// ask window if nothing else is pending (SPEC §16, R-16.2).
+    fn answer_perm(
+        &self,
+        perm_id: &str,
+        decision: PermDecision,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        ipc::write_perm_answer_file(&settings::perm_answers_dir(), perm_id, decision, reason)?;
+        let removed = {
+            let mut perms = self.perms.lock().expect("perms poisoned");
+            perms
+                .iter()
+                .position(|p| p.id == perm_id)
+                .map(|i| perms.remove(i))
+        };
+        if let Some(perm) = removed {
+            if let Some(sid) = &perm.session_id {
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .note_ask_cleared(sid);
+            }
+        }
+        self.push_state();
+        if self.ask_window_idle() {
+            run_on_main(&self.app, |app| {
+                let _ = windows::hide_ask_window(app);
+            });
+        }
+        tracing::info!(perm_id = %perm_id, ?decision, "perm answered");
+        Ok(())
     }
 }
 
@@ -1095,12 +1666,26 @@ struct EngineGateway {
 }
 
 impl AskGateway for EngineGateway {
-    fn submit_ask(&self, req: AskRequest) -> oneshot::Receiver<AskAnswer> {
+    fn submit_ask(&self, req: AskRequest) -> SubmittedAsk {
         self.shell.submit_ask(req)
     }
 
-    fn notify(&self, req: NotifyRequest) {
-        self.shell.notify_user(req);
+    fn update_ask(
+        &self,
+        ask_id: &str,
+        question: Option<String>,
+        options: Option<Vec<String>>,
+        detail: Option<String>,
+    ) -> bool {
+        self.shell.update_ask(ask_id, question, options, detail)
+    }
+
+    fn cancel_ask(&self, ask_id: &str) -> bool {
+        self.shell.cancel_ask(ask_id)
+    }
+
+    fn notify(&self, req: NotifyRequest) -> String {
+        self.shell.notify_user(req)
     }
 
     fn orphan_stale_asks(&self) {
@@ -1160,6 +1745,15 @@ fn run_engine(shell: Arc<Shell>) {
             let mut store = shell.store.lock().expect("store poisoned");
             let n = registry::merge_registry_into_store(&mut store, &entries, now_ms());
             store.apply_registry(&entries);
+            // R-22.1 seeding precedence: for a discovered (inferred) row that also
+            // has a live registry entry, the registry `updatedAt` outranks the
+            // transcript mtime it was first seeded with. Apply it once, here at
+            // cold start only (the periodic poll must not keep resetting timers).
+            for e in &entries {
+                if let Some(updated) = e.updated_at_ms {
+                    store.seed_inferred_entered_at(&e.session_id, updated);
+                }
+            }
             n
         };
         tracing::info!(
@@ -1330,13 +1924,17 @@ fn run_tick(shell: &Arc<Shell>) {
     // /rename shows up within ≤10 s.
     if let Some(sessions_dir) = registry::sessions_dir_from_env() {
         let entries = registry::read_registry(&sessions_dir);
-        if !entries.is_empty() {
-            shell
-                .store
-                .lock()
-                .expect("store poisoned")
-                .apply_registry(&entries);
-        }
+        // Apply UNCONDITIONALLY, even for an empty poll: `apply_registry`'s
+        // absent-session branch is what clears a vanished session's stale
+        // registry `name` (R-15.2) and busy flag (R-21.1). Guarding it behind
+        // `!entries.is_empty()` used to leave the LAST removed registry file's
+        // name/busy state wedged on its row forever (nothing else refreshes the
+        // name). An empty read is cheap — it just walks the rows and clears.
+        shell
+            .store
+            .lock()
+            .expect("store poisoned")
+            .apply_registry(&entries);
     }
     let procs = SysProcs::refreshed();
     let effects = {
@@ -1345,6 +1943,9 @@ fn run_tick(shell: &Arc<Shell>) {
     };
     shell.fire_effects(effects);
     shell.sweep_expired_asks();
+    // §23: fold newly-appended transcript bytes into per-session token telemetry
+    // (R-23.1), off the UI thread, before the snapshot is pushed below.
+    shell.update_usage();
     enforce_disk_caps();
     shell.push_state();
 }
@@ -1442,6 +2043,85 @@ fn drain_answers(shell: &Arc<Shell>, answers_dir: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Perms watcher (§16): turns `<data>/perms/*.json` (written by the
+// `PermissionRequest` hook) into deck-side perm modals, and reaps stale
+// perm-answer files whose hook already gave up.
+// ---------------------------------------------------------------------------
+
+/// A perm-answer file older than this is stale: the hook that would poll it
+/// (timeout 90 s, R-16.1) has long exited, so nothing will consume it. Reaped
+/// on the perms-watcher sweep so `<data>/perm-answers/` can't grow unbounded.
+const PERM_ANSWER_STALE_MS: u64 = 180_000;
+
+fn run_perms(shell: Arc<Shell>) {
+    let perms_dir = settings::perms_dir();
+    let quarantine_dir = settings::spool_quarantine_dir();
+    // Startup drain: ingest any perm files written while we were down (the hook
+    // is likely still polling; a fresh decision will unblock it).
+    drain_perms(&shell, &perms_dir, &quarantine_dir);
+    let watcher = match watcher::SpoolWatcher::spawn(&perms_dir, watcher::DEFAULT_DEBOUNCE) {
+        Ok(w) => w,
+        Err(err) => {
+            tracing::error!(error = %err, "perms watcher failed to start");
+            return;
+        }
+    };
+    let mut last_sweep = Instant::now();
+    loop {
+        match watcher.paths.recv_timeout(LOOP_SLICE) {
+            Ok(path) => shell.ingest_perm_path(&quarantine_dir, &path),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Safety-net rescan for watch events the OS dropped (mirrors the spool /
+        // answers sweeps), plus stale perm-answer reaping.
+        if last_sweep.elapsed() >= SPOOL_SWEEP {
+            last_sweep = Instant::now();
+            drain_perms(&shell, &perms_dir, &quarantine_dir);
+            sweep_stale_perm_answers(&settings::perm_answers_dir());
+        }
+    }
+}
+
+/// Ingest every `*.json` perm file currently in `perms_dir` — a safety net for
+/// watch events the OS dropped. [`Shell::ingest_perm_path`] consumes each file
+/// it handles, so this is normally a no-op single `read_dir`.
+fn drain_perms(shell: &Arc<Shell>, perms_dir: &Path, quarantine_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(perms_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            shell.ingest_perm_path(quarantine_dir, &path);
+        }
+    }
+}
+
+/// Remove perm-answer files older than [`PERM_ANSWER_STALE_MS`]: the hook that
+/// would poll them has exited, so they are dead weight. Best-effort.
+fn sweep_stale_perm_answers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let stale = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age.as_millis() as u64 >= PERM_ANSWER_STALE_MS);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hook installer wiring (§4, R-4.4), pointed at an isolated settings.json via
 // QUARTERDECK_CLAUDE_DIR for testing.
 // ---------------------------------------------------------------------------
@@ -1477,11 +2157,14 @@ fn resolve_hooks_src(app: &AppHandle<Wry>) -> Option<PathBuf> {
 }
 
 /// Copy the hook scripts to `hooks_dst` (a stable path, R-4.4) and merge our
-/// entries into `settings_path`. Pure (no `AppHandle`) so it is unit-testable.
+/// entries into `settings_path`. When `install_perm` is set (the
+/// `takeoverPermissions` setting is on, R-16.4) the opt-in `PermissionRequest`
+/// entry is added too. Pure (no `AppHandle`) so it is unit-testable.
 fn install_hooks_to(
     settings_path: &Path,
     hooks_src: &Path,
     hooks_dst: &Path,
+    install_perm: bool,
 ) -> Result<hooks_config::HooksChange, String> {
     std::fs::create_dir_all(hooks_dst).map_err(|e| e.to_string())?;
     for name in ["quarterdeck-hook.ps1", "quarterdeck-hook.sh"] {
@@ -1507,25 +2190,87 @@ fn install_hooks_to(
         "quarterdeck-hook.sh"
     });
     let command = hooks_config::command_line(&script);
-    hooks_config::install_hooks(settings_path, &command).map_err(|e| e.to_string())
+    let change = hooks_config::install_hooks(settings_path, &command).map_err(|e| e.to_string())?;
+    // R-16.4: the opt-in PermissionRequest entry, only when the setting is on.
+    if install_perm {
+        let perm_change =
+            hooks_config::install_perm_hook(settings_path, &command).map_err(|e| e.to_string())?;
+        if perm_change.changed {
+            return Ok(hooks_config::HooksChange {
+                changed: true,
+                backup: change.backup.or(perm_change.backup),
+                events_added: change
+                    .events_added
+                    .into_iter()
+                    .chain(perm_change.events_added)
+                    .collect(),
+                entries_removed: 0,
+            });
+        }
+    }
+    Ok(change)
 }
 
 fn perform_install_hooks(app: &AppHandle<Wry>) -> Result<(), String> {
     let hooks_src = resolve_hooks_src(app)
         .ok_or_else(|| "could not locate bundled hook scripts".to_string())?;
-    let change = install_hooks_to(&claude_settings_path(), &hooks_src, &settings::hooks_dir())?;
+    let takeover = settings::load(&settings::data_dir()).takeover_permissions;
+    let change = install_hooks_to(
+        &claude_settings_path(),
+        &hooks_src,
+        &settings::hooks_dir(),
+        takeover,
+    )?;
     tracing::info!(
         changed = change.changed,
         events = ?change.events_added,
         backup = ?change.backup,
+        takeover,
         "hook install complete"
     );
     Ok(())
 }
 
+/// R-16.4: toggle just the `PermissionRequest` hook entry when the
+/// `takeoverPermissions` setting changes. Enabling (re)installs it (copying the
+/// scripts first, so a perm hook can be turned on without a full re-install);
+/// disabling removes only that entry, leaving the five lifecycle hooks intact.
+/// A no-op unless the lifecycle hooks are already installed (nothing to gate).
+fn sync_takeover_permissions(app: &AppHandle<Wry>, enable: bool) {
+    let settings_path = claude_settings_path();
+    let installed = std::fs::read_to_string(&settings_path)
+        .map(|t| t.contains(hooks_config::MARKER))
+        .unwrap_or(false);
+    if !installed {
+        tracing::debug!("takeoverPermissions toggled but hooks not installed; nothing to sync");
+        return;
+    }
+    if enable {
+        let Some(hooks_src) = resolve_hooks_src(app) else {
+            tracing::warn!("could not locate hook scripts to enable permission takeover");
+            return;
+        };
+        match install_hooks_to(&settings_path, &hooks_src, &settings::hooks_dir(), true) {
+            Ok(change) => tracing::info!(changed = change.changed, "permission takeover enabled"),
+            Err(err) => tracing::warn!(error = %err, "failed to enable permission takeover"),
+        }
+    } else {
+        match hooks_config::uninstall_perm_hook(&settings_path, hooks_config::MARKER) {
+            Ok(change) => tracing::info!(
+                removed = change.entries_removed,
+                "permission takeover disabled"
+            ),
+            Err(err) => tracing::warn!(error = %err, "failed to disable permission takeover"),
+        }
+    }
+}
+
 fn perform_uninstall_hooks() -> Result<(), String> {
     let change = hooks_config::uninstall_hooks(&claude_settings_path(), hooks_config::MARKER)
         .map_err(|e| e.to_string())?;
+    // R-24.2: "also remove toast registration" — the AUMID identity key is
+    // reversed alongside the hooks.
+    notify::unregister_toast_identity();
     tracing::info!(
         changed = change.changed,
         removed = change.entries_removed,
@@ -1537,6 +2282,24 @@ fn perform_uninstall_hooks() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Setting side effects: autostart (R-10.3) + agent-questions MCP setup (R-8.6).
 // ---------------------------------------------------------------------------
+
+/// R-24.2: register the Windows toast identity (AUMID DisplayName + icon) in
+/// HKCU at startup, idempotently. Skipped under `QUARTERDECK_DATA_DIR` test
+/// isolation (like autostart) unless an explicit AUMID base override is set, so
+/// the e2e/QA harness never mutates the real HKCU toast-identity key.
+fn register_toast_identity_at_startup() {
+    let isolated = std::env::var("QUARTERDECK_DATA_DIR")
+        .map(|d| !d.is_empty())
+        .unwrap_or(false);
+    let base_override = std::env::var(notify::AUMID_BASE_ENV)
+        .map(|d| !d.is_empty())
+        .unwrap_or(false);
+    if isolated && !base_override {
+        tracing::debug!("skipping toast identity registration under data-dir isolation (R-24.2)");
+        return;
+    }
+    notify::register_toast_identity();
+}
 
 fn sync_autostart(app: &AppHandle<Wry>, enable: bool) {
     // Test-isolation guard (R-3.3). `autolaunch().enable()/.disable()` registers
@@ -1675,6 +2438,32 @@ pub fn apply_setting_side_effect(app: &AppHandle<Wry>, key: &str, settings: &Set
             if let Err(err) = windows::set_popup_pinned(app, settings.popup_pinned) {
                 tracing::warn!(error = %err, "failed to sync popup pin state (R-14.2)");
             }
+            // R-25.2 "Unpin while in lamp mode → expand to list + revert to
+            // v1.0 tray-anchored behavior": the collapse button that reaches
+            // lamp mode only shows while pinned, so this is the path back out
+            // for a user who unpins (e.g. via the lamp's right-click menu)
+            // without expanding first.
+            if windows::should_force_list_on_unpin(settings.popup_pinned, settings.popup_mode) {
+                match crate::settings::set_setting(
+                    &crate::settings::data_dir(),
+                    "popupMode",
+                    crate::ipc::SettingValue::Text(PopupMode::List.as_str().to_string()),
+                ) {
+                    Ok(updated) => {
+                        if let Err(err) = windows::set_popup_mode(app, updated.popup_mode) {
+                            tracing::warn!(error = %err, "failed to expand popup on unpin (R-25.2)");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to force list mode on unpin (R-25.2)")
+                    }
+                }
+            }
+        }
+        "popupMode" => {
+            if let Err(err) = windows::set_popup_mode(app, settings.popup_mode) {
+                tracing::warn!(error = %err, "failed to sync popup mode (R-25.2)");
+            }
         }
         "mcpEnabled" => {
             let enabled = settings
@@ -1683,6 +2472,15 @@ pub fn apply_setting_side_effect(app: &AppHandle<Wry>, key: &str, settings: &Set
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             setup_agent_questions(app, enabled);
+        }
+        "takeoverPermissions" => sync_takeover_permissions(app, settings.takeover_permissions),
+        "showTokenStats" => {
+            // R-23.5: reflect the toggle at once — turning it ON populates the
+            // usage map before the next tick; turning it OFF clears it so the
+            // row usage lines disappear immediately (R-23.6).
+            if let Some(shell) = app.try_state::<Arc<Shell>>() {
+                shell.update_usage();
+            }
         }
         _ => {}
     }
@@ -1708,6 +2506,20 @@ pub fn focus_terminal_command(app: &AppHandle<Wry>, session_id: &str) -> Result<
         .try_state::<Arc<Shell>>()
         .ok_or_else(|| "Quarterdeck is still starting up".to_string())?;
     shell.focus_terminal(session_id)
+}
+
+/// Answer a pending permission request (`answer_perm` command, SPEC §16, T7
+/// seam): persists the decision for the blocked hook and updates deck state.
+pub fn answer_perm_command(
+    app: &AppHandle<Wry>,
+    perm_id: &str,
+    decision: PermDecision,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let shell = app
+        .try_state::<Arc<Shell>>()
+        .ok_or_else(|| "Quarterdeck is still starting up".to_string())?;
+    shell.answer_perm(perm_id, decision, reason)
 }
 
 /// Rebuild + push a state snapshot from the managed [`Shell`] (used by commands
@@ -1788,6 +2600,7 @@ pub fn run() {
             ipc::get_state,
             ipc::remove_row,
             ipc::answer_ask,
+            ipc::answer_perm,
             ipc::set_setting,
             ipc::install_hooks,
             ipc::uninstall_hooks,
@@ -1815,10 +2628,13 @@ pub fn run() {
                 app: handle.clone(),
                 store: Mutex::new(SessionStore::with_system_clock()),
                 asks: Mutex::new(AskStore::with_system_clock()),
+                perms: Mutex::new(Vec::new()),
+                usage: Mutex::new(HashMap::new()),
                 notifier: DesktopNotifier::new(handle.clone()),
                 tray,
                 data_dir: data_dir.clone(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                foreground_cache: Mutex::new(None),
             });
             app.manage(shell.clone());
 
@@ -1849,7 +2665,30 @@ pub fn run() {
 
             // Reflect the persisted autostart preference (no change without prior
             // consent: the default is off, so nothing is enabled here). R-10.2/10.3.
-            sync_autostart(&handle, settings::load(&data_dir).launch_at_login);
+            let startup_settings = settings::load(&data_dir);
+            sync_autostart(&handle, startup_settings.launch_at_login);
+
+            // R-14.2/R-25.2: the native pin/mode state (`windows.rs`'s own
+            // mirrored statics, defaulted at process start) must be brought in
+            // line with what was persisted last run — otherwise a relaunch would
+            // show the header's pin icon as pinned (the UI reads `settings.json`
+            // fresh on every snapshot) while the ACTUAL window still hides on
+            // blur, a real functional mismatch, not just cosmetic.
+            if let Err(err) = windows::set_popup_pinned(&handle, startup_settings.popup_pinned) {
+                tracing::warn!(error = %err, "failed to apply persisted pin state at startup (R-14.2)");
+            }
+            if let Err(err) = windows::set_popup_mode(&handle, startup_settings.popup_mode) {
+                tracing::warn!(error = %err, "failed to apply persisted popup mode at startup (R-25.2)");
+            }
+            if startup_settings.popup_pinned {
+                if let Some(pos) = startup_settings.popup_pos {
+                    windows::restore_popup_position(&handle, pos);
+                }
+            }
+
+            // R-24.2: register the toast identity so toasts read "Quarterdeck"
+            // (+ icon), not "Windows PowerShell", in dev AND packaged runs.
+            register_toast_identity_at_startup();
 
             // MCP server on its own tokio runtime (kept alive via managed state).
             match tokio::runtime::Builder::new_multi_thread()
@@ -1882,6 +2721,11 @@ pub fn run() {
                 .name("quarterdeck-answers".to_string())
                 .spawn(move || run_answers(answers_shell))
                 .expect("failed to spawn answers thread");
+            let perms_shell = shell.clone();
+            thread::Builder::new()
+                .name("quarterdeck-perms".to_string())
+                .spawn(move || run_perms(perms_shell))
+                .expect("failed to spawn perms thread");
 
             Ok(())
         })
@@ -1948,26 +2792,75 @@ mod tests {
     }
 
     #[test]
+    fn foreground_suppression_composition_matches_a_session_terminal_pid() {
+        // R-17.2 composition: the shell decides "is this session's terminal the
+        // foreground window?" by intersecting the engine's per-session terminal
+        // pids (ancestor pid ∪ registry/claude pid, R-15.4a) with the sampled
+        // foreground chain — the exact matching `session_foreground` /
+        // `fire_effects` / `maybe_surface_asks` gate on. The lower-level pieces
+        // (the `QUARTERDECK_FAKE_FOREGROUND` parse, the pid intersection) are
+        // unit-tested in `foreground.rs`; this asserts they compose correctly on
+        // top of a REAL engine terminal-pid set, driving both outcomes:
+        //   (a) terminal IS foreground → suppress (toast withheld / ask stays
+        //       queued), (b) terminal is NOT foreground → surface.
+        let mut store = SessionStore::with_system_clock();
+        // A registry-discovered session gets its host pid from the registry —
+        // this is what liveness + R-17.2 matching read (R-15.3).
+        let entry = registry::RegistryEntry {
+            session_id: "s-fg".to_string(),
+            pid: Some(4242),
+            status: Some("busy".to_string()),
+            ..Default::default()
+        };
+        registry::merge_registry_into_store(&mut store, std::slice::from_ref(&entry), now_ms());
+
+        let terminal: Vec<u32> = store
+            .terminal_pids()
+            .into_iter()
+            .find(|(id, _)| id == "s-fg")
+            .map(|(_, pids)| pids)
+            .expect("the discovered session exposes its registry pid as a terminal pid");
+        assert!(terminal.contains(&4242));
+
+        // (a) The session's terminal pid is in the foreground chain → suppress.
+        assert!(
+            crate::foreground::session_is_foreground(&terminal, &[999, 4242, 7]),
+            "a session whose terminal pid is foreground must match (suppress toast, keep ask queued)"
+        );
+        // (b) An unrelated foreground window → do not suppress (surface).
+        assert!(
+            !crate::foreground::session_is_foreground(&terminal, &[999, 7]),
+            "a foreground window that isn't the session's terminal must not suppress"
+        );
+        // A session with no known pid has no terminal to defer to → never matches.
+        assert!(!crate::foreground::session_is_foreground(&[], &[4242]));
+    }
+
+    #[test]
     fn install_hooks_to_writes_isolated_settings_json() {
         let tmp = unique_tmp("install");
         let settings_path = tmp.join("claude").join("settings.json");
         let hooks_dst = tmp.join("data").join("hooks");
         let hooks_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../hooks");
 
-        let change = install_hooks_to(&settings_path, &hooks_src, &hooks_dst).unwrap();
+        let change = install_hooks_to(&settings_path, &hooks_src, &hooks_dst, true).unwrap();
         assert!(change.changed, "first install writes");
-        assert_eq!(change.events_added.len(), 5, "all five hook events added");
+        assert_eq!(
+            change.events_added.len(),
+            hooks_config::HOOK_EVENTS.len() + 1,
+            "every lifecycle hook event + the opt-in PermissionRequest entry added"
+        );
+        assert!(
+            change
+                .events_added
+                .contains(&"PermissionRequest".to_string()),
+            "PermissionRequest installed when takeover is on"
+        );
 
         let text = std::fs::read_to_string(&settings_path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let hooks = &value["hooks"];
-        for event in [
-            "SessionStart",
-            "UserPromptSubmit",
-            "Notification",
-            "Stop",
-            "SessionEnd",
-        ] {
+        for event in hooks_config::HOOK_EVENTS {
             let arr = hooks[event].as_array().unwrap();
             let entry = &arr[0]["hooks"][0];
             assert!(
@@ -1981,6 +2874,11 @@ mod tests {
             "permission_prompt|idle_prompt|elicitation_dialog"
         );
 
+        // R-16.1: the PermissionRequest entry carries the marker + a 90s timeout.
+        let perm = &hooks["PermissionRequest"].as_array().unwrap()[0]["hooks"][0];
+        assert!(perm["command"].as_str().unwrap().contains("quarterdeck"));
+        assert_eq!(perm["timeout"], 90, "PermissionRequest timeout is 90s");
+
         // Scripts copied to the stable path (R-4.4).
         assert!(
             hooks_dst.join("quarterdeck-hook.ps1").exists()
@@ -1988,8 +2886,24 @@ mod tests {
         );
 
         // Idempotent re-install (R-4.1).
-        let again = install_hooks_to(&settings_path, &hooks_src, &hooks_dst).unwrap();
+        let again = install_hooks_to(&settings_path, &hooks_src, &hooks_dst, true).unwrap();
         assert!(!again.changed, "re-install is a no-op");
+
+        // R-16.4: toggling takeover off removes ONLY the PermissionRequest entry.
+        let perm_off =
+            hooks_config::uninstall_perm_hook(&settings_path, hooks_config::MARKER).unwrap();
+        assert!(perm_off.changed);
+        assert_eq!(perm_off.entries_removed, 1);
+        let mid: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            mid["hooks"].get("PermissionRequest").is_none(),
+            "perm entry gone after takeover-off"
+        );
+        assert!(
+            mid["hooks"].get("Stop").is_some(),
+            "lifecycle hooks survive a takeover-off toggle"
+        );
 
         // Uninstall restores a hook-free config (R-4.2).
         let removed = hooks_config::uninstall_hooks(&settings_path, hooks_config::MARKER).unwrap();
@@ -1999,6 +2913,77 @@ mod tests {
         assert!(after.get("hooks").is_none(), "hooks pruned after uninstall");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn install_hooks_to_omits_perm_entry_when_takeover_off() {
+        // R-16.4: with takeover off, the installer adds the lifecycle hooks
+        // only — no PermissionRequest entry.
+        let tmp = unique_tmp("install-noperm");
+        let settings_path = tmp.join("claude").join("settings.json");
+        let hooks_dst = tmp.join("data").join("hooks");
+        let hooks_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../hooks");
+
+        let change = install_hooks_to(&settings_path, &hooks_src, &hooks_dst, false).unwrap();
+        assert_eq!(
+            change.events_added.len(),
+            hooks_config::HOOK_EVENTS.len(),
+            "no perm entry when takeover off"
+        );
+        assert!(!change
+            .events_added
+            .contains(&"PermissionRequest".to_string()));
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(value["hooks"].get("PermissionRequest").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn perm_file_parses_hook_written_shape() {
+        // Matches the perm envelope the hook writes (R-16.1): snake_case fields,
+        // tool_input as a compact JSON string, unknown fields (v/kind/receivedAt)
+        // ignored.
+        let json = r#"{"v":1,"kind":"perm","tool_name":"Bash","tool_input":"{\"command\":\"rm -rf x\"}","session_id":"sess-1","cwd":"C:/proj","receivedAt":"2026-07-03T00:00:00.000Z"}"#;
+        let rec: PermFileRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.tool_name, "Bash");
+        assert_eq!(rec.tool_input, "{\"command\":\"rm -rf x\"}");
+        assert_eq!(rec.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(rec.cwd.as_deref(), Some("C:/proj"));
+
+        // Missing optional fields tolerated (defensive parse, R-16.1).
+        let sparse: PermFileRecord = serde_json::from_str(r#"{"tool_name":"Read"}"#).unwrap();
+        assert_eq!(sparse.tool_name, "Read");
+        assert!(sparse.tool_input.is_empty());
+        assert!(sparse.session_id.is_none());
+    }
+
+    #[test]
+    fn pretty_tool_input_indents_parseable_json() {
+        // R-16.2: a compact tool_input (as the jq fallback or a legacy hook writes
+        // it) is re-emitted as indented JSON for the modal body.
+        let out = pretty_tool_input(r#"{"command":"rm -rf x","timeout":120000}"#);
+        assert!(out.contains('\n'), "pretty output is multi-line: {out:?}");
+        assert!(
+            out.contains("  \"command\": \"rm -rf x\""),
+            "indented keys: {out:?}"
+        );
+        // Round-trips to the same value (formatting-only change).
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["command"], "rm -rf x");
+        assert_eq!(v["timeout"], 120000);
+    }
+
+    #[test]
+    fn pretty_tool_input_keeps_truncated_fragment_verbatim() {
+        // A tool_input truncated past the hook's 2KB cap no longer parses; we must
+        // NOT invent structure from the fragment — keep it verbatim (already
+        // indented at the source by the ps1/python hooks).
+        let fragment = "{\n  \"content\": \"aaaaaaaaaa"; // unterminated
+        assert_eq!(pretty_tool_input(fragment), fragment);
+        // Empty / whitespace-only input collapses to empty.
+        assert_eq!(pretty_tool_input("   "), "");
     }
 
     #[test]

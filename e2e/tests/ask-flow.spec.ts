@@ -56,6 +56,47 @@ test.describe('ask window', () => {
     await expect(page.locator('.qd-ask-empty')).toBeVisible();
   });
 
+  // SPEC R-19.1: the ask window renders the long-form `detail` muted under the
+  // question. R-19.2: a persistent ask (no timeoutAt) shows no countdown.
+  test('renders detail under the question and no countdown for a persistent ask (R-19.1/R-19.2)', async ({ page }) => {
+    await gotoAsk(page, 'ask-detail');
+    await expect(page.locator('.qd-ask-question')).toContainText('Drop the legacy v1 answer file format?');
+    const detail = page.locator('.qd-ask-detail');
+    await expect(detail).toHaveCount(1);
+    await expect(detail).toContainText('dual-written since 1.0');
+    // Persistent ask: no countdown element at all (R-19.2).
+    await expect(page.locator('.qd-ask-countdown')).toHaveCount(0);
+  });
+
+  // SPEC R-19.1: the popup mirror row also shows the muted detail.
+  test('popup mirror row renders detail (R-19.1)', async ({ page }) => {
+    await gotoPopup(page, 'ask-detail');
+    const detail = page.locator('.qd-ask-row-detail');
+    await expect(detail).toHaveCount(1);
+    await expect(detail).toContainText('dual-written since 1.0');
+  });
+
+  // SPEC R-19.4: dismissing an ask must resolve the blocked MCP call with
+  // kind:"dismissed" — assert the exact kind reaches the backend from BOTH the
+  // ask-window Dismiss button and the popup mirror row's Dismiss.
+  test('ask-window Dismiss sends kind:"dismissed" (R-19.4)', async ({ page }) => {
+    await gotoAsk(page, 'ask-detail');
+    await page.getByRole('button', { name: 'Dismiss' }).click();
+    const last = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastAnswerAsk(): { askId: string; kind: string } | null } }).__qdMock.lastAnswerAsk(),
+    );
+    expect(last).toEqual({ askId: 'a1', kind: 'dismissed' });
+  });
+
+  test('popup mirror Dismiss sends kind:"dismissed" (R-19.4)', async ({ page }) => {
+    await gotoPopup(page, 'ask-detail');
+    await page.locator('.qd-ask-row .qd-ask-row-dismiss').first().click();
+    const last = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastAnswerAsk(): { askId: string; kind: string } | null } }).__qdMock.lastAnswerAsk(),
+    );
+    expect(last).toEqual({ askId: 'a1', kind: 'dismissed' });
+  });
+
   test('unmatched asks show "Unknown agent (<context>)" (R-8.2)', async ({ page }) => {
     await gotoAsk(page, 'ask-unknown');
     await expect(page.locator('.qd-ask-identity-project')).toContainText('Unknown agent (');

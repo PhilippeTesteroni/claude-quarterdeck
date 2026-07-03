@@ -45,6 +45,7 @@ fn fire_demo_toasts(app: tauri::AppHandle) {
         session_id: "demo-idle".into(),
         project: "Quarterdeck".into(),
         detail: "Demo task: write the T5 report".into(),
+        assistant_body: None,
     };
     let (title, body) = compose(&idle);
     flushed_println("[1/2] Firing IDLE toast (system default sound):");
@@ -61,6 +62,7 @@ fn fire_demo_toasts(app: tauri::AppHandle) {
         session_id: "demo-attention".into(),
         project: "Quarterdeck".into(),
         detail: "Allow Bash to run `rm -rf build`?".into(),
+        assistant_body: None,
     };
     let (title, body) = compose(&attention);
     flushed_println("[2/2] Firing ATTENTION toast (distinct alert sound):");

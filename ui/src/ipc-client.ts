@@ -78,3 +78,23 @@ export function hideCurrentWindow(): void {
   }
   void getCurrentWindow().hide();
 }
+
+/**
+ * Starts an OS-native window drag from within an already-pressed mouse button
+ * (SPEC R-25.1 lamp "drag anywhere"). Unlike the header's
+ * `data-tauri-drag-region`, the lamp square is a single clickable element
+ * (click expands it back to the list, R-25.2) — Tauri's built-in drag-region
+ * script never starts a drag FROM a clickable element (see
+ * `tauri-2.11.5/src/window/scripts/drag.js`'s `isClickableElement` check), so
+ * `popup.ts` instead tracks the pointer itself and calls this explicitly only
+ * once the movement crosses a small threshold, discriminating a genuine drag
+ * from a plain click. No-op (aside from a call-count record for Playwright
+ * specs) in mock/browser mode, where there's no real OS window to move.
+ */
+export function startDragging(): void {
+  if (usingMock) {
+    mock.startDraggingMock();
+    return;
+  }
+  void getCurrentWindow().startDragging();
+}

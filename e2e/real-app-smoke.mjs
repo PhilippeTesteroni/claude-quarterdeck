@@ -50,7 +50,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -261,6 +261,78 @@ async function mcpRpc(endpoint, token, method, params, idRef) {
   return json.result;
 }
 
+/**
+ * Fire a blocking `ask_user` over the streamable-HTTP SSE path (R-19.3): sends a
+ * `progressToken` so the server interleaves `notifications/progress` keepalive
+ * frames while it waits, and reads the event stream incrementally. Returns
+ * immediately with `{ id, progressFrames, result }` where `progressFrames` fills
+ * as keepalives arrive and `result` resolves with the final JSON-RPC response
+ * once the ask is answered/dismissed/cancelled/times-out. Does NOT block on the
+ * answer, so the caller can observe survival across keepalive ticks, then answer.
+ */
+async function startSseAsk(endpoint, token, args, idRef) {
+  idRef.id += 1;
+  const id = idRef.id;
+  const message = {
+    jsonrpc: '2.0',
+    id,
+    method: 'tools/call',
+    params: { name: 'ask_user', arguments: args, _meta: { progressToken: `ka-${id}` } },
+  };
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'text/event-stream',
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(message),
+  });
+  if (res.status !== 200) throw new Error(`ask_user SSE: expected 200, got ${res.status}`);
+
+  const progressFrames = [];
+  let resolveResult;
+  let rejectResult;
+  const result = new Promise((resolve, reject) => { resolveResult = resolve; rejectResult = reject; });
+
+  (async () => {
+    try {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep;
+        // SSE frames are separated by a blank line; each carries `data:` lines.
+        while ((sep = buf.indexOf('\n\n')) >= 0 || (sep = buf.indexOf('\r\n\r\n')) >= 0) {
+          const rawFrame = buf.slice(0, sep);
+          buf = buf.slice(sep + (buf.startsWith('\r\n\r\n', sep) ? 4 : 2));
+          const data = rawFrame
+            .split(/\r?\n/)
+            .filter((l) => l.startsWith('data:'))
+            .map((l) => l.slice(5).trim())
+            .join('\n');
+          if (!data) continue;
+          const json = JSON.parse(data);
+          if (json.method === 'notifications/progress') {
+            progressFrames.push(json);
+          } else if (json.id === id) {
+            resolveResult(json);
+            return;
+          }
+        }
+      }
+      rejectResult(new Error('SSE stream closed before a final ask_user result'));
+    } catch (err) {
+      rejectResult(err);
+    }
+  })();
+
+  return { id, progressFrames, result };
+}
+
 async function main() {
   const flags = parseArgs(process.argv.slice(2));
   const exe = flags.exe ?? join(repoRoot, 'target', 'release', 'quarterdeck.exe');
@@ -299,6 +371,12 @@ async function main() {
     QUARTERDECK_CLAUDE_DIR: claudeDir,
     QUARTERDECK_FAKE_NOTIFIER: '1',
     QUARTERDECK_DEBUG: '1',
+    // R-19.3 / §20: time-compress the keepalive so a persistent ask's
+    // notifications/progress cadence (normally 30s) fires several times within
+    // the smoke's wall-clock budget — the "time-compressed via env knob" the
+    // spec's §20 gate calls for. The persistent-ask survival check below spans
+    // many of these intervals to prove the call is NOT idle-aborted.
+    QUARTERDECK_MCP_KEEPALIVE_MS: '300',
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${cdpPort}`,
   };
 
@@ -345,7 +423,59 @@ async function main() {
       return hasAttention && hasIdle ? lines : null;
     });
     log(`notifier-calls.jsonl OK — ${calls.length} call(s) recorded:`);
-    for (const c of calls) log(`  ${c.kind} [${c.sessionId}] "${c.title}" / "${c.body}"`);
+    for (const c of calls) log(`  ${c.kind} [${c.sessionId}] "${c.title}" / "${c.body}" [${c.bodySource ?? '?'}]`);
+
+    // --- 3a. R-24.1/R-24.4: the finished-toast body is the model's last words -
+    // Give a session a transcript with a known assistant tail, drive it to
+    // working then Stop, and assert its idle toast body == those words with
+    // body_source "assistant" (the §23 incremental reader feeding the toast).
+    try {
+      const wordsSession = 'smoke-words';
+      const wordsCwd = join(cwdBase, `${project}-words`);
+      const transcriptPath = join(runDir, 'transcripts', `${wordsSession}.jsonl`);
+      mkdirSync(dirname(transcriptPath), { recursive: true });
+      const lastWords = 'All done — shipped the widget and added tests.';
+      // A minimal but real-shaped assistant record (matches usage.rs parsing).
+      const record = {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          model: 'claude-sonnet-4-5',
+          content: [{ type: 'text', text: lastWords }],
+          usage: { input_tokens: 120, cache_creation_input_tokens: 0, cache_read_input_tokens: 40000, output_tokens: 300 },
+        },
+      };
+      writeFileSync(transcriptPath, `${JSON.stringify(record)}\n`, 'utf8');
+
+      for (const [cmd, extra] of [
+        ['session-start', ['--title', 'words smoke']],
+        ['prompt', ['--prompt', 'do the thing']],
+        ['stop', []],
+      ]) {
+        execFileSync('node', [
+          injector, '--data-dir', dataDir, cmd,
+          '--session', wordsSession, '--cwd', wordsCwd, '--transcript', transcriptPath,
+          ...extra,
+        ], { stdio: 'ignore' });
+        // Space the writes past the 250ms watcher debounce so SessionStart ->
+        // prompt (working) -> Stop (idle) apply in order (the live ingest path
+        // drains a coalesced burst in nondeterministic order).
+        await sleep(500);
+      }
+
+      const wordsCall = await waitFor('idle toast body = assistant last words (R-24.1/R-24.4)', 15_000, () => {
+        if (!existsSync(notifierPath)) return null;
+        const lines = readFileSync(notifierPath, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+        return lines.find((l) => l.kind === 'idle' && l.sessionId === wordsSession) ?? null;
+      });
+      if (wordsCall.body !== lastWords || wordsCall.bodySource !== 'assistant') {
+        hardFailures.push(`R-24.1: idle toast body/source mismatch — body="${wordsCall.body}" source="${wordsCall.bodySource}"`);
+      } else {
+        log(`idle-toast last-words OK — body="${wordsCall.body}" [${wordsCall.bodySource}]`);
+      }
+    } catch (err) {
+      hardFailures.push(`R-24.1 last-words check failed: ${err.message}`);
+    }
 
     // --- 3b. assert the tray icon actually changed (SPEC §11 test hook) -----
     // The fleet has an `attention` session, so the worst-of tray status (R-2.6)
@@ -514,6 +644,76 @@ async function main() {
       } catch (err) {
         hardFailures.push(`MCP ask_user round-trip did not complete: ${err.message}`);
         log(`FAIL: MCP ask_user round-trip: ${err.message}`);
+      }
+
+      // --- persistent ask survives many keepalive intervals (R-19.3 / §20) ---
+      // A persistent ask (no timeout_seconds) must NOT be idle-aborted: while it
+      // is blocked, the server streams notifications/progress every keepalive
+      // interval (time-compressed to 300ms via QUARTERDECK_MCP_KEEPALIVE_MS in
+      // env). Prove the call stays open across many intervals (stand-in for the
+      // ">6min" the spec names, at 30s real cadence), then answer it and assert
+      // the real result — the §20 keepalive-survival gate against the real exe.
+      try {
+        const mcp = JSON.parse(readFileSync(join(dataDir, 'mcp.json'), 'utf8'));
+        const endpoint = `http://127.0.0.1:${mcp.port}/mcp`;
+        const idRef = { id: 100 };
+        await mcpRpc(endpoint, mcp.token, 'initialize', {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'quarterdeck-keepalive-smoke', version: '1.0.0' },
+        }, idRef);
+        await mcpRpc(endpoint, mcp.token, 'notifications/initialized', {}, idRef);
+
+        const question = 'Persistent keepalive smoke: keep waiting?';
+        // No timeout_seconds → persistent (R-19.2); progressToken → keepalive SSE.
+        const sse = await startSseAsk(
+          endpoint,
+          mcp.token,
+          { question, context: join(runDir, 'projects') },
+          idRef,
+        );
+
+        // It must surface as a persistent ask — NO countdown (timeoutAt absent).
+        const askId = await waitFor('persistent ask in app state (no timeout)', 20_000, async () => {
+          const snap = await popupPage.evaluate(() => window.__TAURI__.core.invoke('get_state'));
+          const ask = (snap.asks || []).find((a) => a.question === question);
+          if (!ask) return null;
+          if (ask.timeoutAt !== undefined && ask.timeoutAt !== null) {
+            throw new Error(`persistent ask must carry no timeout, got timeoutAt=${ask.timeoutAt}`);
+          }
+          return ask.id;
+        });
+
+        // Span many keepalive intervals (300ms each) — well past when a
+        // non-keepalived call would look idle — and require the ask to still be
+        // pending with several progress frames received (proof of survival).
+        const survived = await waitFor('>=6 keepalive progress frames while still pending', 15_000, async () => {
+          if (sse.progressFrames.length < 6) return null;
+          const snap = await popupPage.evaluate(() => window.__TAURI__.core.invoke('get_state'));
+          const stillPending = (snap.asks || []).some((a) => a.id === askId);
+          return stillPending ? sse.progressFrames.length : null;
+        });
+        log(`persistent ask survived ${survived} keepalive frame(s) while still pending (R-19.3)`);
+
+        // Answer through the REAL answer_ask command; the blocked SSE call must
+        // then deliver the final result over the same stream.
+        await popupPage.evaluate(
+          ({ id }) => window.__TAURI__.core.invoke('answer_ask', { askId: id, answer: 'keep going', kind: 'text' }),
+          { id: askId },
+        );
+        const final = await sse.result;
+        const structured = final.result?.structuredContent || JSON.parse(final.result.content[0].text);
+        if (structured.answer !== 'keep going' || structured.kind !== 'text') {
+          hardFailures.push(
+            `R-19.3 persistent ask: expected {answer:"keep going", kind:"text"}, got ${JSON.stringify(structured)}`,
+          );
+          log(`FAIL: R-19.3 persistent ask returned ${JSON.stringify(structured)}`);
+        } else {
+          log(`persistent ask answered after keepalive survival -> {answer:"${structured.answer}", kind:"${structured.kind}"} (R-19.3 OK)`);
+        }
+      } catch (err) {
+        hardFailures.push(`R-19.3 persistent-ask keepalive survival did not complete: ${err.message}`);
+        log(`FAIL: R-19.3 persistent-ask keepalive: ${err.message}`);
       }
     } finally {
       await browser.close().catch(() => {});

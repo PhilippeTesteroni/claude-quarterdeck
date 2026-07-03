@@ -112,6 +112,54 @@ fn no_pid_no_transcript_is_dead() {
 }
 
 #[test]
+fn registry_discovered_pidless_no_transcript_survives_on_fresh_registry() {
+    // R-15.3 vs R-6: a registry entry that omits its pid discovers a row with
+    // NO pid and NO transcript. Its fresh registry `updatedAt` is the only
+    // activity signal — it must NOT be declared dead on the very next liveness
+    // tick; it persists (registry-driven discovery), honoring R-6.2's grace.
+    use deck_core::registry::{merge_registry_into_store, RegistryEntry};
+    let (mut s, _c) = store_at(T0);
+    let entry = RegistryEntry {
+        session_id: "reg".into(),
+        cwd: Some("/p".into()),
+        name: Some("Background job".into()),
+        status: Some("busy".into()),
+        updated_at_ms: Some(T0 - 5_000), // fresh, no pid, no transcript
+        ..Default::default()
+    };
+    merge_registry_into_store(&mut s, std::slice::from_ref(&entry), T0);
+    assert!(s.contains("reg"));
+    let procs = FakeProcessTable::new();
+    // No pid, no transcript, but a fresh registry updatedAt → still alive.
+    s.poll_liveness(&procs, |_p| None);
+    assert_ne!(s.status_of("reg"), Some(Status::Dead));
+
+    // Once the registry entry vanishes, its updatedAt is cleared → the pid-less,
+    // transcript-less row correctly falls through to dead on the next tick.
+    s.apply_registry(&[]);
+    s.poll_liveness(&procs, |_p| None);
+    assert_eq!(s.status_of("reg"), Some(Status::Dead));
+}
+
+#[test]
+fn registry_pidless_dead_when_registry_updatedat_stale_over_6h() {
+    // R-6.2 grace still bounds it: a registry-discovered pid-less row whose only
+    // signal (registry updatedAt) is stale > 6h is dead.
+    use deck_core::registry::{merge_registry_into_store, RegistryEntry};
+    let (mut s, _c) = store_at(T0);
+    let entry = RegistryEntry {
+        session_id: "old".into(),
+        cwd: Some("/p".into()),
+        updated_at_ms: Some(T0 - SIX_H - 1),
+        ..Default::default()
+    };
+    merge_registry_into_store(&mut s, std::slice::from_ref(&entry), T0);
+    let procs = FakeProcessTable::new();
+    s.poll_liveness(&procs, |_p| None);
+    assert_eq!(s.status_of("old"), Some(Status::Dead));
+}
+
+#[test]
 fn dead_row_persists_5min_then_is_pruned() {
     // R-2.5
     let (mut s, c) = store_at(T0);

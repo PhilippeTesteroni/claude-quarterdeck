@@ -54,6 +54,11 @@ pub enum HookEvent {
     },
     /// `Stop` — Claude finished responding.
     Stop,
+    /// `SubagentStart` — a Task/subagent child started (SPEC §21, R-21.2). Feeds
+    /// the per-session active-subagent counter (the `⛭ N` badge).
+    SubagentStart,
+    /// `SubagentStop` — a Task/subagent child finished (SPEC §21, R-21.2).
+    SubagentStop,
     /// `SessionEnd` — session terminated.
     SessionEnd { reason: Option<String> },
     /// Any other (forward-compatible) event name — tolerated and logged, never a
@@ -98,6 +103,8 @@ impl HookEvent {
             HookEvent::UserPromptSubmit { .. } => "UserPromptSubmit",
             HookEvent::Notification { .. } => "Notification",
             HookEvent::Stop => "Stop",
+            HookEvent::SubagentStart => "SubagentStart",
+            HookEvent::SubagentStop => "SubagentStop",
             HookEvent::SessionEnd { .. } => "SessionEnd",
             HookEvent::Unknown { name } => name,
         }
@@ -299,6 +306,8 @@ fn classify_event(name: &str, payload: &RawPayload) -> HookEvent {
             notification_type: clean(payload.notification_type.clone()),
         },
         "Stop" => HookEvent::Stop,
+        "SubagentStart" => HookEvent::SubagentStart,
+        "SubagentStop" => HookEvent::SubagentStop,
         "SessionEnd" => HookEvent::SessionEnd {
             reason: clean(payload.reason.clone()),
         },

@@ -6,7 +6,7 @@
  */
 
 import { hideCurrentWindow, invoke, onState } from './ipc-client';
-import type { AskAnswerKind, AskRow, SessionRow, StateSnapshot } from './ipc-contract';
+import type { AskAnswerKind, AskRow, PermDecision, PermRow, SessionRow, StateSnapshot } from './ipc-contract';
 import { formatCountdown, truncate } from './format';
 import { clear, h } from './dom';
 
@@ -18,6 +18,10 @@ let latest: StateSnapshot | null = null;
 let countdownEl: HTMLElement | null = null;
 let countdownTarget: number | null = null;
 let freeTextInput: HTMLInputElement | null = null;
+/** The permission request currently rendered as the primary item, if any (SPEC
+ * §16). Perms take priority over asks in the shared window; while one is primary
+ * the keyboard maps A/D/Esc to Allow/Deny/In-terminal instead of the ask keys. */
+let primaryPerm: PermRow | null = null;
 /** Id of the ask currently rendered, so a re-render of the SAME ask (triggered
  * by an unrelated session's `deck://state` push) can restore the in-progress
  * free-text answer + focus instead of wiping it (R-8). */
@@ -153,6 +157,8 @@ function renderAsk(ask: AskRow, sessions: SessionRow[]): void {
   elContent.append(
     renderIdentity(ask, sessions),
     h('div', { className: 'qd-ask-question' }, [ask.question]),
+    // R-19.1: optional long-form rationale, muted + smaller, scrollable if long.
+    ...(ask.detail ? [h('div', { className: 'qd-ask-detail' }, [ask.detail])] : []),
     renderOptions(ask),
     renderFreeform(ask),
     h('div', { className: 'qd-ask-actions' }, [
@@ -165,6 +171,60 @@ function renderAsk(ask: AskRow, sessions: SessionRow[]): void {
   );
 }
 
+function sendPerm(perm: PermRow, decision: PermDecision): void {
+  if (answered.has(perm.id)) return;
+  answered.add(perm.id);
+  void invoke('answer_perm', { permId: perm.id, decision }).catch(() => {
+    answered.delete(perm.id);
+  });
+}
+
+/** SPEC §16 (R-16.2): the permission modal — amber accent, "<project> requests
+ * permission", tool name + compact pretty-printed input (already sanitized +
+ * capped by the shell, R-16.5), and Allow / Deny / In terminal actions. */
+function renderPerm(perm: PermRow, sessions: SessionRow[]): void {
+  clear(elContent);
+  freeTextInput = null;
+  countdownEl = null;
+  countdownTarget = null;
+
+  const session = findSession(sessions, perm.sessionId);
+  const dot = h('span', { className: 'qd-row-dot', 'data-status': session?.status ?? 'attention' });
+  const label =
+    session?.project ??
+    perm.project ??
+    (perm.context ? `Unknown agent (${truncate(perm.context, 42)})` : 'Unknown agent');
+
+  elContent.append(
+    h('div', { className: 'qd-perm' }, [
+      h('div', { className: 'qd-ask-identity qd-perm-identity' }, [
+        dot,
+        h('span', { className: 'qd-ask-identity-project' }, [label]),
+        h('span', { className: 'qd-perm-tag mono' }, ['requests permission']),
+      ]),
+      h('div', { className: 'qd-ask-question qd-perm-tool' }, [`Run ${perm.toolName}?`]),
+      h('pre', { className: 'qd-perm-input mono' }, [perm.toolInput || '(no input)']),
+      h('div', { className: 'qd-ask-actions qd-perm-actions' }, [
+        h(
+          'button',
+          { className: 'qd-btn qd-btn-primary qd-perm-allow', type: 'button', onclick: () => sendPerm(perm, 'allow') },
+          ['Allow'],
+        ),
+        h(
+          'button',
+          { className: 'qd-btn qd-perm-deny', type: 'button', onclick: () => sendPerm(perm, 'deny') },
+          ['Deny'],
+        ),
+        h(
+          'button',
+          { className: 'qd-btn qd-btn-ghost qd-perm-defer', type: 'button', onclick: () => sendPerm(perm, 'defer') },
+          ['In terminal'],
+        ),
+      ]),
+    ]),
+  );
+}
+
 function renderEmpty(): void {
   clear(elContent);
   countdownEl = null;
@@ -173,7 +233,9 @@ function renderEmpty(): void {
 }
 
 function render(snap: StateSnapshot): void {
-  const [primary, ...rest] = snap.asks;
+  const perms = snap.perms ?? [];
+  const asks = snap.asks;
+  const total = perms.length + asks.length;
 
   // R-8 data-loss guard: `push_state()` broadcasts to every window on ANY
   // session's state change (a sibling session finishing, a liveness tick, …),
@@ -191,18 +253,39 @@ function render(snap: StateSnapshot): void {
         }
       : null;
 
-  if (!primary) {
+  if (total === 0) {
     elBadge.hidden = true;
     renderedAskId = null;
+    primaryPerm = null;
     renderEmpty();
     return;
   }
-  if (rest.length > 0) {
+  // "N more waiting" counts every OTHER pending item (asks + perms), R-16.2.
+  if (total > 1) {
     elBadge.hidden = false;
-    elBadge.textContent = `${rest.length} more waiting`;
+    elBadge.textContent = `${total - 1} more waiting`;
   } else {
     elBadge.hidden = true;
   }
+
+  // R-16.2: perms and asks share ONE FIFO queue by arrival — the primary slot
+  // goes to whichever of the front perm / front ask arrived first (smaller
+  // `queuedAt`), NOT to perms unconditionally. Both `perms` and `asks` are
+  // already arrival-ordered within themselves (the backend pushes at the back),
+  // so comparing the two fronts is enough. A perm wins ties (a blocked terminal
+  // is the more latency-sensitive case when arrivals are simultaneous).
+  const frontPerm = perms[0];
+  const frontAsk = asks[0];
+  const permIsPrimary = frontPerm !== undefined && (frontAsk === undefined || frontPerm.queuedAt <= frontAsk.queuedAt);
+  if (permIsPrimary) {
+    renderedAskId = null;
+    primaryPerm = frontPerm;
+    renderPerm(frontPerm, snap.sessions);
+    return;
+  }
+
+  primaryPerm = null;
+  const primary = frontAsk;
   renderAsk(primary, snap.sessions);
   renderedAskId = primary.id;
 
@@ -233,6 +316,27 @@ onState((snap) => {
 elClose.addEventListener('click', () => hideCurrentWindow());
 
 document.addEventListener('keydown', (ev) => {
+  // SPEC §16 (R-16.2): while a permission request is primary, the keyboard maps
+  // A → Allow, D → Deny, Esc → In terminal (defer). This overrides the ask
+  // window's Esc-hides-the-window behavior for that item specifically.
+  if (primaryPerm) {
+    const key = ev.key.toLowerCase();
+    if (key === 'a') {
+      sendPerm(primaryPerm, 'allow');
+      return;
+    }
+    if (key === 'd') {
+      sendPerm(primaryPerm, 'deny');
+      return;
+    }
+    if (ev.key === 'Escape') {
+      // R-16.2: Esc = In terminal (answers "no decision" → the terminal dialog
+      // appears immediately), NOT hide-the-window.
+      sendPerm(primaryPerm, 'defer');
+      return;
+    }
+    return;
+  }
   if (ev.key === 'Escape') {
     // R-18.1: Esc is ALWAYS the same as the X button — it hides the window,
     // it never silently dismisses a pending ask, whether one or many are

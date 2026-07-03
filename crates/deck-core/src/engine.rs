@@ -28,6 +28,12 @@ pub const DEAD_RETENTION_MS: u64 = 5 * 60 * 1000;
 /// session per 10 s; rapid bursts collapse.
 pub const TOAST_THROTTLE_MS: u64 = 10_000;
 
+/// Registry busy-override freshness window (R-21.1): a hook-idle session is
+/// displayed as `working` only while the live registry reports it `busy` with an
+/// `updatedAt` no older than this. Beyond it the registry signal is stale and
+/// the override clears.
+pub const REGISTRY_BUSY_FRESH_MS: u64 = 30_000;
+
 /// Session status (SPEC §2). `dead` sessions linger for [`DEAD_RETENTION_MS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
@@ -119,6 +125,12 @@ pub struct SessionView {
     pub cwd: String,
     /// Terminal-window ancestor for click-to-focus (R-15.4), when captured.
     pub ancestor: Option<Ancestor>,
+    /// Active background subagents for the `⛭ N` badge (R-21.2); 0 hides it.
+    pub subagents: u32,
+    /// Total session age in ms when an anchor is known (R-22.3): registry
+    /// `startedAt` → `SessionStart` receivedAt → first-seen. Drives the tooltip
+    /// "session 2h 14m" line alongside the cwd.
+    pub age_ms: Option<u64>,
 }
 
 /// Per-status counts (engine-side mirror of `ipc::Counts`).
@@ -179,6 +191,34 @@ struct Session {
     /// `(session, status-change kind)`, so an idle toast never swallows a
     /// genuinely-different attention/reminder alert within the same window).
     last_toast_ms: HashMap<ToastKind, u64>,
+    /// Raw registry busy flag from the last poll that mentioned this session
+    /// (R-21.1): `true` iff the registry `status` mapped to `working`/busy.
+    /// Combined with [`Session::registry_updated_at_ms`] freshness to derive
+    /// [`Session::busy_override`], recomputed every tick so the override ages out
+    /// even on a tick where the registry poll was empty/skipped.
+    registry_busy: bool,
+    /// The registry `updatedAt` (epoch ms) from the last poll that mentioned this
+    /// session — the freshness clock for the busy-override (R-21.1).
+    registry_updated_at_ms: Option<u64>,
+    /// Registry busy-override state (R-21.1), derived from `registry_busy` +
+    /// `registry_updated_at_ms` freshness. While set AND the hook-derived status
+    /// is `idle`, the row displays `working` (background subagents/workflows are
+    /// running though the turn's `Stop` fired). Attention always outranks it; it
+    /// clears when the registry reports non-busy or the `updatedAt` goes stale.
+    busy_override: bool,
+    /// Active background subagents (R-21.2): incremented on `SubagentStart`,
+    /// decremented on `SubagentStop`, and SELF-CORRECTING — reset to 0 whenever
+    /// the session settles to a non-`working` state (fresh `Stop` with a stale
+    /// registry, attention, dead) or the registry reports it non-busy, so a lost
+    /// `SubagentStop` can never wedge the `⛭ N` badge on.
+    active_subagents: u32,
+    /// Registry `startedAt` (epoch ms), highest-precedence session-age anchor
+    /// (R-22.3), refreshed from the registry poll.
+    registry_started_ms: Option<u64>,
+    /// When this row was first materialized (clock now at [`Session::new`]) —
+    /// the "first-seen" fallback anchor for session age (R-22.3) when neither a
+    /// registry `startedAt` nor a `SessionStart` receivedAt is known.
+    created_ms: u64,
 }
 
 impl Session {
@@ -206,15 +246,98 @@ impl Session {
             last_notification_ms: None,
             dead_since_ms: None,
             last_toast_ms: HashMap::new(),
+            registry_busy: false,
+            registry_updated_at_ms: None,
+            busy_override: false,
+            active_subagents: 0,
+            registry_started_ms: None,
+            created_ms: now_ms,
         }
     }
 
     fn effective(&self) -> Status {
         if self.pending_asks > 0 {
-            Status::Attention
-        } else {
-            self.hook_status
+            // Attention (pending ask/perm) always outranks the busy-override (R-21.1).
+            return Status::Attention;
         }
+        // R-21.1: a hook-idle session the registry says is busy (fresh) displays
+        // `working`. Only `idle` is overridden — a hook `attention`/`dead` never is.
+        if self.busy_override && self.hook_status == Status::Idle {
+            return Status::Working;
+        }
+        self.hook_status
+    }
+
+    /// Reset the subagent counter when the session has settled to a non-`working`
+    /// display (R-21.2 self-correction). Called after status-settling hook events
+    /// (fresh `Stop`, attention) and liveness `dead`, never on the subagent
+    /// events themselves (whose ordering vs. the registry busy signal can lag).
+    fn settle_subagents(&mut self) {
+        if self.effective() != Status::Working {
+            self.active_subagents = 0;
+        }
+    }
+
+    /// Recompute [`Session::busy_override`] from the raw registry flag + the
+    /// `updatedAt` freshness at `now` (R-21.1), re-settling the shown status and
+    /// the subagent badge when it flips. Returns whether the displayed status
+    /// changed. Runs both on a registry poll and on every tick, so the override
+    /// ages out to stale even when a tick's registry read was empty/skipped.
+    fn recompute_busy_override(&mut self, now: u64) -> bool {
+        let fresh = self
+            .registry_updated_at_ms
+            .is_some_and(|u| now.saturating_sub(u) < REGISTRY_BUSY_FRESH_MS);
+        let want = self.registry_busy && fresh;
+        let mut changed = false;
+        if want != self.busy_override {
+            self.busy_override = want;
+            // R-22.1: a discovered (inferred) row that the override flips INTO
+            // `working` at cold start did NOT enter `working` at app-launch
+            // `now`. Its status-entry timestamp must stay seeded from the
+            // activity estimate (`entered_at_ms`: transcript mtime, later walked
+            // to the registry `updatedAt` by `seed_inferred_entered_at`), never
+            // restamped to `now` — that is the exact §22 dishonesty (a `~0s`
+            // "just now" on background work whose registry `updatedAt` is
+            // seconds old). Clamp defends against a future-dated estimate. For a
+            // hook-tracked row, or the override CLEARING (`want == false`), the
+            // transition genuinely happens now, so `now` stands.
+            let settle_ts = if self.inferred && want {
+                self.entered_at_ms.min(now)
+            } else {
+                now
+            };
+            if self.resettle_effective(settle_ts).is_some() {
+                self.last_activity_ms = now;
+                changed = true;
+            }
+        }
+        // R-21.2: keep the badge honest — drop any count once the row no longer
+        // displays working (override lifted / never applied).
+        self.settle_subagents();
+        changed
+    }
+
+    /// Best-known session start anchor for the age tooltip (R-22.3): registry
+    /// `startedAt` → `SessionStart` receivedAt → first-seen (row creation).
+    ///
+    /// Whatever the source, the anchor is clamped to be no more recent than
+    /// `entered_at_ms`: a session cannot have entered its current status BEFORE
+    /// it was born, so age (`now - anchor`) must always be ≥ time-in-status
+    /// (`now - entered_at`). This matters for a discovered/inferred row seeded
+    /// (R-22.1) from a past transcript mtime whose only age anchor is the
+    /// app-launch `created_ms` (first-seen): without the clamp the tooltip could
+    /// read "session just now" beside a "~12m" time-in-status — an age younger
+    /// than the current status, which is logically impossible. The clamp is a
+    /// no-op for the normal case (session birth precedes the current status).
+    fn age_anchor_ms(&self) -> u64 {
+        let anchor = if let Some(started) = self.registry_started_ms {
+            started
+        } else if self.started_at_ms > 0 {
+            self.started_at_ms
+        } else {
+            self.created_ms
+        };
+        anchor.min(self.entered_at_ms)
     }
 
     /// Set the hook-derived status; returns `Some(new_effective)` iff the
@@ -387,6 +510,12 @@ impl SessionStore {
         self.sessions.get(session_id).map(Session::effective)
     }
 
+    /// Active background-subagent count for a session (R-21.2 `⛭ N` badge).
+    #[must_use]
+    pub fn subagents_of(&self, session_id: &str) -> Option<u32> {
+        self.sessions.get(session_id).map(|s| s.active_subagents)
+    }
+
     /// Milliseconds the session has spent in its current status (R-2.5).
     #[must_use]
     pub fn since_ms_of(&self, session_id: &str) -> Option<u64> {
@@ -476,6 +605,10 @@ impl SessionStore {
         }
         session.last_activity_ms = ts;
 
+        // R-22.2: whether this row is still a cold-start estimate. The first
+        // genuine status-marking hook event upgrades it to exact tracking below.
+        let was_inferred = session.inferred;
+
         let mut effect: Option<(ToastDecision, u64)> = None;
 
         match &ev.kind {
@@ -522,6 +655,9 @@ impl SessionStore {
                     NotifClass::Attention => {
                         session.attention_from_hook = true;
                         session.last_notification_ms = Some(ts);
+                        // R-21.2: the session is now blocked on a human (attention),
+                        // not working — no subagents should still be counted.
+                        session.active_subagents = 0;
                         if session.set_hook_status(Status::Attention, ts) == Some(Status::Attention)
                         {
                             let detail = message
@@ -574,7 +710,21 @@ impl SessionStore {
                 session.recompute_title();
                 session.attention_from_hook = false;
                 session.last_notification_ms = None;
-                if session.set_hook_status(Status::Idle, ts) == Some(Status::Idle) {
+                // Capture whether the hook status genuinely transitioned INTO
+                // idle (a real turn finished), independent of what the row will
+                // *display*: with a live busy-override the effective status can
+                // stay `working` across this Stop (R-21.3).
+                let finished_a_turn = session.hook_status != Status::Idle;
+                session.set_hook_status(Status::Idle, ts);
+                // R-21.2 self-correcting badge: a fresh Stop that settles the
+                // session to idle (no live busy-override keeping it working)
+                // means no subagents should still be counted.
+                session.settle_subagents();
+                // R-9.1 / R-21.3: fire the "finished" toast whenever the turn
+                // finished and the session isn't still blocked on a pending ask —
+                // EVEN if the busy-override immediately keeps the row displayed as
+                // working (the turn DID finish; the user may still want to know).
+                if finished_a_turn && session.pending_asks == 0 {
                     // `detail` = the session task title; empty when unknown so the
                     // shell renders just "Waiting for new instructions." (R-9.1).
                     let detail = if session.display_title == naming::NO_TITLE {
@@ -594,10 +744,41 @@ impl SessionStore {
                     ));
                 }
             }
+            HookEvent::SubagentStart => {
+                // R-21.2: a background subagent/workflow child started. Bump the
+                // per-session counter for the `⛭ N` badge. Does NOT change status
+                // (the registry busy-override drives `working`, R-21.1).
+                session.active_subagents = session.active_subagents.saturating_add(1);
+            }
+            HookEvent::SubagentStop => {
+                // R-21.2: a subagent child finished. Saturating so a stray/extra
+                // stop can't underflow; a LOST stop is caught by `settle_subagents`.
+                session.active_subagents = session.active_subagents.saturating_sub(1);
+            }
             HookEvent::SessionEnd { .. } => unreachable!("handled above"),
             HookEvent::Unknown { name } => {
                 tracing::debug!(session_id = %session.id, event = %name, "unknown hook event ignored (R-4.5)");
                 session.recompute_title();
+            }
+        }
+
+        // R-22.2: the first genuine status-marking hook event upgrades a
+        // discovered (estimated) row to exact tracking — drop the inferred `~`
+        // and re-stamp the status-entry from the event's real receivedAt from
+        // here on. Non-status events (idle_prompt, subagent, unknown) leave the
+        // estimate in place until a real transition lands.
+        if was_inferred {
+            let status_marker = matches!(
+                ev.kind,
+                HookEvent::SessionStart { .. }
+                    | HookEvent::UserPromptSubmit { .. }
+                    | HookEvent::Stop
+            ) || (matches!(ev.kind, HookEvent::Notification { .. })
+                && session.attention_from_hook);
+            if status_marker {
+                session.inferred = false;
+                session.entered_at_ms = ts;
+                session.last_activity_ms = ts;
             }
         }
 
@@ -788,6 +969,11 @@ impl SessionStore {
             let input = liveness::LivenessInput {
                 claude_pid: s.claude_pid,
                 transcript_mtime_ms: mtime,
+                // R-15.3: a registry-discovered PID-less row with no transcript
+                // yet stays alive on the registry file's freshness, not dead on
+                // the next tick. Cleared to `None` by `apply_registry` once the
+                // registry entry vanishes.
+                registry_updated_at_ms: s.registry_updated_at_ms,
             };
             if liveness::is_dead(&input, procs, now) {
                 s.attention_from_hook = false;
@@ -795,6 +981,11 @@ impl SessionStore {
                 s.hook_status = Status::Dead;
                 // Dead overrides even a pending ask: the process is gone.
                 s.pending_asks = 0;
+                // A dead process runs nothing — clear the busy-override and its
+                // subagent badge (R-21.1/R-21.2) so a stale registry file can't
+                // keep a gone session showing `working`.
+                s.busy_override = false;
+                s.active_subagents = 0;
                 s.effective_status = Status::Dead;
                 s.entered_at_ms = now;
                 s.dead_since_ms = Some(now);
@@ -823,13 +1014,27 @@ impl SessionStore {
         expired
     }
 
-    /// Convenience: run recovery, then liveness, then prune — the shell's 10 s
-    /// tick (R-3.6). `mtime_of` is shared by recovery and liveness.
+    /// Age out stale busy-overrides (R-21.1) from each session's stored raw
+    /// registry state, independent of whether this tick's registry poll ran or
+    /// was empty. Without this, a registry that goes entirely empty (so the
+    /// shell skips `apply_registry`) would leave a session wedged displaying
+    /// `working` past the freshness window.
+    pub fn poll_busy_override(&mut self) {
+        let now = self.clock.now_ms();
+        for s in self.sessions.values_mut() {
+            s.recompute_busy_override(now);
+        }
+    }
+
+    /// Convenience: age busy-overrides, then run recovery, liveness, and prune —
+    /// the shell's 10 s tick (R-3.6). `mtime_of` is shared by recovery and
+    /// liveness.
     pub fn tick(
         &mut self,
         procs: &impl ProcessTable,
         mut mtime_of: impl FnMut(&str) -> Option<u64>,
     ) -> Vec<Effect> {
+        self.poll_busy_override();
         let mut effects = self.poll_recovery(&mut mtime_of);
         effects.extend(self.poll_liveness(procs, &mut mtime_of));
         self.prune_dead();
@@ -863,7 +1068,12 @@ impl SessionStore {
         s.inferred = true;
         s.hook_status = status;
         s.effective_status = status;
-        s.entered_at_ms = now;
+        // R-22.1: a discovery-created row seeds its status-entry timestamp from
+        // the caller's best activity estimate (transcript mtime, or registry
+        // `updatedAt`), NOT app-launch "now" — so its time-in-status reflects
+        // when the agent actually entered that status. The registry-vs-transcript
+        // precedence is applied by `seed_inferred_entered_at` at cold start.
+        s.entered_at_ms = activity_ms;
         s.last_activity_ms = activity_ms;
         s.display_title = if title.trim().is_empty() {
             naming::NO_TITLE.to_string()
@@ -875,6 +1085,31 @@ impl SessionStore {
         self.sessions.insert(id, s);
     }
 
+    /// Re-seed a discovered (inferred) row's status-entry timestamp (R-22.1
+    /// precedence: registry `updatedAt`, matched by sessionId, from a **fresh
+    /// file**, outranks the transcript mtime it was first seeded with). No-op for
+    /// a hook-tracked row (whose times are exact) or an unknown session. Called
+    /// once at cold start, never on the periodic poll (which would keep resetting
+    /// a live row's timer).
+    ///
+    /// R-22.1's parenthetical "fresh file" qualifier is enforced here: the
+    /// registry `updatedAt` only wins when it is at least as fresh as the
+    /// transcript-mtime estimate the row already carries (`seed_ms >=
+    /// entered_at_ms`). A STALE registry `updatedAt` (older than the transcript's
+    /// last activity) must NOT drag the row backwards — that would inflate
+    /// time-in-status past reality, exactly the dishonest time §22 exists to
+    /// remove. In that case the fresher transcript mtime stands.
+    pub fn seed_inferred_entered_at(&mut self, session_id: &str, seed_ms: u64) {
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            if s.inferred && seed_ms >= s.entered_at_ms {
+                s.entered_at_ms = seed_ms;
+                if seed_ms > s.last_activity_ms {
+                    s.last_activity_ms = seed_ms;
+                }
+            }
+        }
+    }
+
     // --- Live registry poll (§15) -----------------------------------------
 
     /// Apply one live-registry entry (R-15.2/R-15.3) to its matching row (by
@@ -882,6 +1117,7 @@ impl SessionStore {
     /// feed the registry pid into liveness. No-op for an unknown session.
     /// Returns whether anything the UI would show changed.
     pub fn apply_registry_entry(&mut self, entry: &RegistryEntry) -> bool {
+        let now = self.clock.now_ms();
         let Some(s) = self.sessions.get_mut(&entry.session_id) else {
             return false;
         };
@@ -894,6 +1130,23 @@ impl SessionStore {
                 s.claude_pid = Some(pid);
             }
         }
+        // R-22.3: remember the registry `startedAt` as the top-precedence
+        // session-age anchor.
+        if let Some(started) = entry.started_at_ms {
+            s.registry_started_ms = Some(started);
+        }
+        // R-21.1 busy-override: store the raw registry busy flag + `updatedAt`,
+        // then derive the override (busy AND fresh) via the shared helper — which
+        // also re-settles the shown status (R-21.3 tray follows the displayed
+        // status, no toast) and the subagent badge (R-21.2). The display effect
+        // only bites while the hook status is `idle` (handled in `effective`);
+        // attention always outranks.
+        s.registry_busy = matches!(
+            crate::registry::registry_status_to_engine(entry.status.as_deref()),
+            Status::Working
+        );
+        s.registry_updated_at_ms = entry.updated_at_ms;
+        changed |= s.recompute_busy_override(now);
         // R-15.2: the registry `name` refreshes on every poll. Only re-derive
         // the title (which may touch the transcript for a fallback) when the
         // name actually changed, so a /rename lands within one poll but a stable
@@ -912,12 +1165,44 @@ impl SessionStore {
         changed
     }
 
-    /// Apply a whole registry poll's worth of entries (R-15.2/R-15.3). Returns
-    /// whether any row's displayed state changed.
+    /// Apply a whole registry poll's worth of entries (R-15.2/R-15.3/R-21.1).
+    /// Sessions absent from this poll have their busy-override cleared (their
+    /// registry file vanished → no longer busy). Returns whether any row's
+    /// displayed state changed.
     pub fn apply_registry(&mut self, entries: &[RegistryEntry]) -> bool {
+        let now = self.clock.now_ms();
+        let present: HashSet<&str> = entries.iter().map(|e| e.session_id.as_str()).collect();
         let mut changed = false;
         for entry in entries {
             changed |= self.apply_registry_entry(entry);
+        }
+        // R-21.1: a session no longer reported by the registry can't be "busy" —
+        // clear the raw busy flag and re-derive, so a removed registry file
+        // doesn't wedge a row displaying `working` forever. `recompute_busy_over-
+        // ride` also self-corrects the badge (R-21.2) without blanket-zeroing a
+        // session that is genuinely hook-`working` but simply absent from the
+        // registry (its subagent counter is then owned by the SubagentStart/Stop
+        // events + `settle_subagents`).
+        for s in self.sessions.values_mut() {
+            if present.contains(s.id.as_str()) {
+                continue;
+            }
+            s.registry_busy = false;
+            s.registry_updated_at_ms = None;
+            changed |= s.recompute_busy_override(now);
+            // R-15.2: "Registry names refresh on every poll." A session the
+            // registry no longer reports is no longer claimed by it, so its
+            // registry `name` must not linger — clear it symmetrically with the
+            // busy flag above and let the title fall back down the precedence
+            // chain (session_title → prompt → transcript). Without this, a live
+            // row whose `~/.claude/sessions/<id>.json` vanished while the process
+            // is still alive would keep displaying its last registry name forever.
+            if s.registry_name.is_some() {
+                s.registry_name = None;
+                let before = s.display_title.clone();
+                s.recompute_title();
+                changed |= s.display_title != before;
+            }
         }
         changed
     }
@@ -965,6 +1250,29 @@ impl SessionStore {
             .collect()
     }
 
+    /// Per-session transcript paths (SPEC §23 token reader): `(session_id,
+    /// transcript_path)` for every tracked session. The shell's incremental
+    /// usage reader iterates these on its tick; `None` transcript paths (a row
+    /// that never carried one) are still returned so the caller can prune stale
+    /// usage state for gone sessions by intersecting ids.
+    #[must_use]
+    pub fn session_transcripts(&self) -> Vec<(String, Option<String>)> {
+        self.sessions
+            .values()
+            .map(|s| (s.id.clone(), s.transcript_path.clone()))
+            .collect()
+    }
+
+    /// The transcript path for one session (SPEC §23 / R-24.1): used to refresh
+    /// a session's usage on demand (e.g. right before its finished-toast fires,
+    /// so the toast body carries the model's actual last words).
+    #[must_use]
+    pub fn transcript_path_of(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.transcript_path.clone())
+    }
+
     // --- Projection for the UI / tray -------------------------------------
 
     /// Full snapshot for the UI, sorted per R-7.3 (attention → working → idle →
@@ -985,6 +1293,8 @@ impl SessionStore {
                 since_ms: now.saturating_sub(s.entered_at_ms),
                 cwd: s.cwd.clone().unwrap_or_default(),
                 ancestor: s.ancestor.clone(),
+                subagents: s.active_subagents,
+                age_ms: Some(now.saturating_sub(s.age_anchor_ms())),
             })
             .collect();
         rows.sort_by(|a, b| {

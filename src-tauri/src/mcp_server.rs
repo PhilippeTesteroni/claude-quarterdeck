@@ -2,11 +2,18 @@
 //! to `127.0.0.1:<port>` that lets Claude Code agents reach the human through
 //! Quarterdeck. It serves two tools:
 //!
-//! * `ask_user(question, options?, context?, timeout_seconds?)` — **blocks** until
-//!   the user answers, the ask times out (`timeout_seconds` ≤ 600), or it is
-//!   dismissed/orphaned. Returns `{answer, kind}` with `kind ∈ option|text|
-//!   timeout|dismissed` (R-8.1).
-//! * `notify_user(message, context?)` — fire-and-forget toast, returns immediately.
+//! * `ask_user(question, options?, context?, detail?, timeout_seconds?)` —
+//!   **blocks** until the user answers, the ask times out, or it is
+//!   dismissed/cancelled/orphaned. `timeout_seconds` is optional (≤ 3600);
+//!   omitted/0 → **persistent** (no expiry, R-19.2). Returns
+//!   `{answer, kind, ask_id}` with `kind ∈ option|text|timeout|dismissed|
+//!   cancelled` (R-8.1, R-19.5). While blocked and a `progressToken` was sent,
+//!   the server streams `notifications/progress` every 30s to keep the call
+//!   alive (R-19.3).
+//! * `update_ask(ask_id, question?, options?, detail?)` / `cancel_ask(ask_id)` —
+//!   mutate / cancel a pending ask from a parallel call (R-19.5).
+//! * `notify_user(message, context?)` — fire-and-forget toast; returns
+//!   `{delivered, id}` immediately (R-19.6).
 //!
 //! ## Auth
 //! A random bearer token + a stable port are persisted to `<data>/mcp.json`
@@ -29,6 +36,7 @@
 //! the gateway drops the answer channel (teardown), `ask_user` returns a tool
 //! error rather than hanging.
 
+use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +45,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
@@ -44,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::ipc::AskAnswerKind;
 use deck_core::naming::strip_bidi_controls;
@@ -53,21 +63,49 @@ pub const MCP_PATH: &str = "/mcp";
 /// MCP protocol revision we advertise in `initialize`.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-const MAX_TIMEOUT_SECONDS: u64 = 600;
-const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
+/// Cap for an explicit `timeout_seconds` (R-19.2: raised 600 → 3600). Omitted/0
+/// means persistent (no expiry), handled separately.
+const MAX_TIMEOUT_SECONDS: u64 = 3600;
+/// Keepalive cadence (R-19.3): while an `ask_user` call is blocked and the
+/// client sent a `progressToken`, the server emits `notifications/progress`
+/// this often to reset Claude Code's idle abort. Overridable (ms) via
+/// `QUARTERDECK_MCP_KEEPALIVE_MS` so tests can time-compress it (SPEC §20).
+const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(30);
+
+fn keepalive_interval() -> Duration {
+    match std::env::var("QUARTERDECK_MCP_KEEPALIVE_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => DEFAULT_KEEPALIVE,
+        },
+        Err(_) => DEFAULT_KEEPALIVE,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data types crossing the T7 seam
 // ---------------------------------------------------------------------------
 
-/// A question routed from an agent to the human. `timeout_seconds` is already
-/// clamped to `1..=600` by the transport before the gateway sees it.
+/// A question routed from an agent to the human (R-8.1, R-19.1/19.2).
 #[derive(Debug, Clone)]
 pub struct AskRequest {
     pub question: String,
     pub options: Option<Vec<String>>,
+    /// Long rationale/body (R-19.1), already bidi-stripped by the transport.
+    pub detail: Option<String>,
     pub context: Option<String>,
-    pub timeout_seconds: u64,
+    /// `Some(n)` = expires in `n` seconds (already clamped to `1..=3600`);
+    /// `None` = persistent (R-19.2), no expiry.
+    pub timeout_seconds: Option<u64>,
+}
+
+/// The handle the gateway returns from [`AskGateway::submit_ask`]: the
+/// engine-generated `ask_id` (surfaced in the `ask_user` result and used by
+/// `update_ask`/`cancel_ask`, R-19.5) plus the channel that resolves when the
+/// ask is answered/dismissed/cancelled/timed-out.
+pub struct SubmittedAsk {
+    pub id: String,
+    pub rx: oneshot::Receiver<AskAnswer>,
 }
 
 /// A fire-and-forget notification from an agent (`notify_user`).
@@ -114,18 +152,47 @@ impl AskAnswer {
             kind: AskAnswerKind::Dismissed,
         }
     }
+    /// The ask was cancelled by a `cancel_ask` tool call (R-19.5).
+    pub fn cancelled() -> Self {
+        Self {
+            answer: String::new(),
+            kind: AskAnswerKind::Cancelled,
+        }
+    }
 }
 
 /// The narrow seam between the MCP transport and the deck engine (see module
 /// docs). T7 wires a real, engine-backed implementation; tests use a fake.
 pub trait AskGateway: Send + Sync + 'static {
-    /// Register a new ask and return a channel that resolves when the user
-    /// answers, the ask times out, or it is dismissed. Dropping the sender
-    /// (engine teardown) surfaces as an orphaned ask on the caller side.
-    fn submit_ask(&self, req: AskRequest) -> oneshot::Receiver<AskAnswer>;
+    /// Register a new ask and return its id + a channel that resolves when the
+    /// user answers, the ask times out, or it is dismissed/cancelled. Dropping
+    /// the sender (engine teardown) surfaces as an orphaned ask on the caller
+    /// side.
+    fn submit_ask(&self, req: AskRequest) -> SubmittedAsk;
 
-    /// Deliver a fire-and-forget notification toast.
-    fn notify(&self, req: NotifyRequest);
+    /// Mutate a PENDING ask in place (R-19.5 `update_ask`): any of
+    /// question/options/detail. Returns `false` for an unknown or already-settled
+    /// id (the transport turns that into an error result, not an exception).
+    fn update_ask(
+        &self,
+        _ask_id: &str,
+        _question: Option<String>,
+        _options: Option<Vec<String>>,
+        _detail: Option<String>,
+    ) -> bool {
+        false
+    }
+
+    /// Cancel a PENDING ask (R-19.5 `cancel_ask`): resolve the blocked caller
+    /// with `kind:"cancelled"` and remove it from the UI. Returns `false` for an
+    /// unknown or already-settled id.
+    fn cancel_ask(&self, _ask_id: &str) -> bool {
+        false
+    }
+
+    /// Deliver a fire-and-forget notification toast (R-19.6). Returns the
+    /// notification record id (also logged in `notifier-calls.jsonl`).
+    fn notify(&self, req: NotifyRequest) -> String;
 
     /// Called once at server startup: mark any asks left pending by a previous
     /// process as orphaned/expired so late answers are never delivered into the
@@ -240,6 +307,11 @@ fn generate_token() -> String {
 struct AppState {
     token: Arc<String>,
     gateway: Arc<dyn AskGateway>,
+    /// R-19.3 keepalive cadence for the SSE `ask_user` path. Resolved once at
+    /// bind time (`keepalive_interval`), carried here so the request path never
+    /// re-reads the env (and tests can inject a short interval without a
+    /// process-global env var).
+    keepalive: Duration,
 }
 
 /// A running MCP server. Query [`port`](Self::port)/[`token`](Self::token) to
@@ -329,6 +401,7 @@ fn spawn_server(
     let state = AppState {
         token: Arc::new(token.clone()),
         gateway,
+        keepalive: keepalive_interval(),
     };
     let router = build_router(state);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -411,10 +484,37 @@ async fn handle_post(State(state): State<AppState>, headers: HeaderMap, body: By
             StatusCode::ACCEPTED.into_response()
         }
         Some(id) => {
+            // R-19.3 keepalive: a blocking `ask_user` for which the client sent a
+            // `progressToken` is answered over an SSE stream so the server can
+            // interleave `notifications/progress` while it waits. Every other
+            // request (and an `ask_user` with no progressToken) gets a single
+            // JSON response, unchanged.
+            if method == "tools/call" && tool_name(&params) == "ask_user" {
+                if let Some(token) = progress_token(&params) {
+                    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                    return ask_user_sse(&state, id, &args, token);
+                }
+            }
             let response = dispatch(&state, &method, id, params).await;
             json_response(StatusCode::OK, &response)
         }
     }
+}
+
+/// The tool name of a `tools/call` request, or `""`.
+fn tool_name(params: &Value) -> &str {
+    params.get("name").and_then(Value::as_str).unwrap_or("")
+}
+
+/// The request's `params._meta.progressToken` (string or number), if the client
+/// opted into progress notifications (R-19.3). Kept as a raw JSON value so it is
+/// echoed back verbatim in every `notifications/progress`.
+fn progress_token(params: &Value) -> Option<Value> {
+    params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .filter(|t| !t.is_null())
+        .cloned()
 }
 
 async fn dispatch(state: &AppState, method: &str, id: Value, params: Value) -> Value {
@@ -433,17 +533,21 @@ async fn call_tool(state: &AppState, id: Value, params: Value) -> Value {
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     match name {
         "ask_user" => ask_user(state, id, &args).await,
+        "update_ask" => update_ask(state, id, &args),
+        "cancel_ask" => cancel_ask(state, id, &args),
         "notify_user" => notify_user(state, id, &args),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
 }
 
-async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
-    // Strip Unicode bidi override controls from every agent-supplied string that
-    // the human reads in the ask window / popup row / "Unknown agent (<context>)"
-    // label, so a compromised or prompt-injected agent can't visually spoof the
-    // text into reading the opposite of its real code points (Trojan-Source / RLO;
-    // see `deck_core::naming::strip_bidi_controls`, R-5.3 / R-8).
+/// Parse + sanitize `ask_user` arguments into an [`AskRequest`], or return the
+/// `rpc_error` [`Value`] to send back. Strips Unicode bidi override controls
+/// from every agent-supplied string the human reads in the ask window / popup
+/// row / "Unknown agent (<context>)" label, so a compromised or prompt-injected
+/// agent can't visually spoof the text into reading the opposite of its real
+/// code points (Trojan-Source / RLO; see `deck_core::naming::strip_bidi_controls`,
+/// R-5.3 / R-8).
+fn parse_ask_request(id: &Value, args: &Value) -> Result<AskRequest, Value> {
     let question = strip_bidi_controls(
         args.get("question")
             .and_then(Value::as_str)
@@ -451,7 +555,11 @@ async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
             .trim(),
     );
     if question.is_empty() {
-        return rpc_error(id, -32602, "ask_user requires a non-empty `question`");
+        return Err(rpc_error(
+            id.clone(),
+            -32602,
+            "ask_user requires a non-empty `question`",
+        ));
     }
 
     let options = args
@@ -463,42 +571,227 @@ async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty());
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(|s| strip_bidi_controls(s.trim()))
+        .filter(|s| !s.is_empty());
     let context = args
         .get("context")
         .and_then(Value::as_str)
         .map(strip_bidi_controls);
 
+    // R-19.2: `timeout_seconds` is optional; omitted / 0 / negative → persistent
+    // (None). An explicit positive value is clamped to `1..=3600`.
     let requested = args
         .get("timeout_seconds")
         .and_then(|t| t.as_u64().or_else(|| t.as_f64().map(|f| f as u64)));
     let timeout_seconds = requested
         .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
-        .min(MAX_TIMEOUT_SECONDS);
+        .map(|s| s.min(MAX_TIMEOUT_SECONDS));
 
-    let req = AskRequest {
+    Ok(AskRequest {
         question,
         options,
+        detail,
         context,
         timeout_seconds,
-    };
-    let rx = state.gateway.submit_ask(req);
+    })
+}
 
-    let answer = match tokio::time::timeout(Duration::from_secs(timeout_seconds), rx).await {
-        Ok(Ok(answer)) => answer,
-        Ok(Err(_)) => {
-            // Answer channel dropped: the ask was orphaned (R-8.7). Never a
-            // silent success — surface a tool error.
-            return rpc_result(
-                id,
-                tool_error_content(
-                    "The ask was orphaned: Quarterdeck was closed or restarted while the question was pending.",
-                ),
-            );
-        }
-        Err(_) => AskAnswer::timeout(),
+/// Non-streaming `ask_user`: blocks on the ask and returns a single JSON result.
+/// Used when the client did NOT send a `progressToken` (no keepalive needed).
+async fn ask_user(state: &AppState, id: Value, args: &Value) -> Value {
+    let req = match parse_ask_request(&id, args) {
+        Ok(req) => req,
+        Err(err) => return err,
     };
-    rpc_result(id, tool_answer_content(&answer))
+    let timeout = req.timeout_seconds;
+    let SubmittedAsk { id: ask_id, rx } = state.gateway.submit_ask(req);
+
+    let result = match timeout {
+        // Persistent (R-19.2): await indefinitely — no MCP-side timer.
+        None => match rx.await {
+            Ok(answer) => ask_answer_content(&ask_id, &answer),
+            Err(_) => orphaned_content(),
+        },
+        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), rx).await {
+            Ok(Ok(answer)) => ask_answer_content(&ask_id, &answer),
+            Ok(Err(_)) => orphaned_content(),
+            Err(_) => ask_answer_content(&ask_id, &AskAnswer::timeout()),
+        },
+    };
+    rpc_result(id, result)
+}
+
+/// Streaming `ask_user` (R-19.3): answers over an SSE stream, emitting
+/// `notifications/progress` every [`keepalive_interval`] while blocked, then the
+/// final JSON-RPC response, then closing the stream. Used only when the client
+/// sent a `progressToken`.
+fn ask_user_sse(state: &AppState, id: Value, args: &Value, token: Value) -> Response {
+    let req = match parse_ask_request(&id, args) {
+        Ok(req) => req,
+        // A parse error still goes back as a single SSE message so the client's
+        // stream reader sees one JSON-RPC error and the connection closes.
+        Err(err) => return single_event_sse(err),
+    };
+    let timeout = req.timeout_seconds;
+    let SubmittedAsk { id: ask_id, rx } = state.gateway.submit_ask(req);
+    let interval = state.keepalive;
+
+    let (tx_ev, rx_ev) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(8);
+    tokio::spawn(async move {
+        let final_msg = drive_ask(rx, timeout, interval, &id, &ask_id, &token, &tx_ev).await;
+        let _ = tx_ev
+            .send(Ok(Event::default().data(final_msg.to_string())))
+            .await;
+        // Dropping `tx_ev` here ends the stream → the HTTP body closes, so the
+        // client's `fetch`/reader completes right after the final result.
+    });
+
+    Sse::new(ReceiverStream::new(rx_ev)).into_response()
+}
+
+/// The select loop shared by the SSE path: pump `notifications/progress` on the
+/// keepalive tick until the ask resolves (or its explicit timeout elapses), then
+/// return the final JSON-RPC response value.
+async fn drive_ask(
+    rx: oneshot::Receiver<AskAnswer>,
+    timeout: Option<u64>,
+    interval: Duration,
+    id: &Value,
+    ask_id: &str,
+    token: &Value,
+    tx_ev: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+) -> Value {
+    tokio::pin!(rx);
+    let deadline = timeout.map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // consume the immediate first tick
+    let mut progress: u64 = 0;
+
+    loop {
+        let sleep = async {
+            match deadline {
+                Some(d) => tokio::time::sleep_until(d).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            res = &mut rx => {
+                return match res {
+                    Ok(answer) => rpc_result(id.clone(), ask_answer_content(ask_id, &answer)),
+                    Err(_) => rpc_result(id.clone(), orphaned_content()),
+                };
+            }
+            _ = sleep => {
+                return rpc_result(id.clone(), ask_answer_content(ask_id, &AskAnswer::timeout()));
+            }
+            _ = ticker.tick() => {
+                progress += 1;
+                let note = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progressToken": token,
+                        "progress": progress,
+                        "message": "waiting for the human to answer",
+                    }
+                });
+                // If the receiver is gone (client disconnected) stop pumping.
+                if tx_ev.send(Ok(Event::default().data(note.to_string()))).await.is_err() {
+                    return rpc_result(id.clone(), ask_answer_content(ask_id, &AskAnswer::timeout()));
+                }
+            }
+        }
+    }
+}
+
+/// A one-shot SSE response carrying a single JSON-RPC message then closing (used
+/// for a parse error on the streaming path).
+fn single_event_sse(msg: Value) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(1);
+    tokio::spawn(async move {
+        let _ = tx.send(Ok(Event::default().data(msg.to_string()))).await;
+    });
+    Sse::new(ReceiverStream::new(rx)).into_response()
+}
+
+/// R-19.5 `update_ask`: mutate a pending ask in place. Unknown/settled id → an
+/// error *result* (not a JSON-RPC exception).
+fn update_ask(state: &AppState, id: Value, args: &Value) -> Value {
+    let Some(ask_id) = args
+        .get("ask_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return rpc_error(id, -32602, "update_ask requires a non-empty `ask_id`");
+    };
+    let question = args
+        .get("question")
+        .and_then(Value::as_str)
+        .map(|s| strip_bidi_controls(s.trim()))
+        .filter(|s| !s.is_empty());
+    let options = args.get("options").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(strip_bidi_controls))
+            .collect::<Vec<_>>()
+    });
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(|s| strip_bidi_controls(s.trim()));
+
+    if state.gateway.update_ask(ask_id, question, options, detail) {
+        rpc_result(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": "Ask updated." }],
+                "structuredContent": { "ask_id": ask_id, "updated": true },
+                "isError": false,
+            }),
+        )
+    } else {
+        rpc_result(
+            id,
+            tool_error_content(&format!(
+                "No pending ask with id {ask_id:?} — it may have been answered, dismissed, cancelled, or timed out."
+            )),
+        )
+    }
+}
+
+/// R-19.5 `cancel_ask`: cancel a pending ask (resolves the blocked caller with
+/// `kind:"cancelled"`). Unknown/settled id → an error result.
+fn cancel_ask(state: &AppState, id: Value, args: &Value) -> Value {
+    let Some(ask_id) = args
+        .get("ask_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return rpc_error(id, -32602, "cancel_ask requires a non-empty `ask_id`");
+    };
+    if state.gateway.cancel_ask(ask_id) {
+        rpc_result(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": "Ask cancelled." }],
+                "structuredContent": { "ask_id": ask_id, "cancelled": true },
+                "isError": false,
+            }),
+        )
+    } else {
+        rpc_result(
+            id,
+            tool_error_content(&format!(
+                "No pending ask with id {ask_id:?} — it may have already been answered, dismissed, cancelled, or timed out."
+            )),
+        )
+    }
 }
 
 fn notify_user(state: &AppState, id: Value, args: &Value) -> Value {
@@ -515,11 +808,14 @@ fn notify_user(state: &AppState, id: Value, args: &Value) -> Value {
         .get("context")
         .and_then(Value::as_str)
         .map(strip_bidi_controls);
-    state.gateway.notify(NotifyRequest { message, context });
+    // R-19.6: return the notification record id (also logged in the fake-notifier
+    // jsonl).
+    let record_id = state.gateway.notify(NotifyRequest { message, context });
     rpc_result(
         id,
         json!({
             "content": [{ "type": "text", "text": "Notification delivered." }],
+            "structuredContent": { "delivered": true, "id": record_id },
             "isError": false,
         }),
     )
@@ -537,16 +833,27 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// A successful `CallToolResult` carrying the answer both as text and as
-/// `structuredContent` so clients can parse either shape.
-fn tool_answer_content(answer: &AskAnswer) -> Value {
-    let structured = serde_json::to_value(answer).unwrap_or_else(|_| json!({}));
+/// A successful `CallToolResult` carrying `{answer, kind, ask_id}` (R-19.5) both
+/// as text and as `structuredContent` so clients can parse either shape.
+fn ask_answer_content(ask_id: &str, answer: &AskAnswer) -> Value {
+    let mut structured = serde_json::to_value(answer).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = structured.as_object_mut() {
+        obj.insert("ask_id".to_string(), Value::String(ask_id.to_string()));
+    }
     let text = serde_json::to_string(&structured).unwrap_or_default();
     json!({
         "content": [{ "type": "text", "text": text }],
         "structuredContent": structured,
         "isError": false,
     })
+}
+
+/// The `CallToolResult` for an ask whose answer channel was dropped — the ask
+/// was orphaned (R-8.7): Quarterdeck was closed/restarted while it was pending.
+fn orphaned_content() -> Value {
+    tool_error_content(
+        "The ask was orphaned: Quarterdeck was closed or restarted while the question was pending.",
+    )
 }
 
 fn tool_error_content(message: &str) -> Value {
@@ -569,21 +876,47 @@ fn tools_list_result() -> Value {
         "tools": [
             {
                 "name": "ask_user",
-                "description": "Ask the human operating this machine a question and BLOCK until they answer. Use during long autonomous runs when you hit a decision only a human can make. Pass your current working directory as `context` so Quarterdeck attributes the question to your session. Prefer `options` for multiple-choice decisions. Returns {answer, kind} where kind is option|text|timeout|dismissed; on timeout or dismissal, proceed on your best judgment.",
+                "description": "Ask the human operating this machine a question and BLOCK until they answer. Use during long autonomous runs when you hit a decision only a human can make. Pass your current working directory as `context` so Quarterdeck attributes the question to your session. Keep `question` short; put the reasoning/body in `detail`. Prefer `options` for multiple-choice decisions. Omit `timeout_seconds` (or pass 0) to wait indefinitely (persistent). Returns {answer, kind, ask_id} where kind is option|text|timeout|dismissed|cancelled; on timeout/dismissal, proceed on your best judgment. Keep the returned `ask_id` if a parallel task may need to update_ask/cancel_ask it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "question": { "type": "string", "description": "The question to put to the user. Be concise and specific." },
+                        "question": { "type": "string", "description": "The question to put to the user. One short, specific decision." },
                         "options": { "type": "array", "items": { "type": "string" }, "description": "Optional multiple-choice answers; the user may still type a free-text reply." },
+                        "detail": { "type": "string", "description": "Optional long-form rationale/body shown under the question in muted, smaller type. Put the context the user needs to decide here, not in `question`." },
                         "context": { "type": "string", "description": "Your current working directory (cwd), used to attribute the question to the right session." },
-                        "timeout_seconds": { "type": "number", "maximum": 600, "description": "Seconds to wait before giving up (max 600). Defaults to 600." }
+                        "timeout_seconds": { "type": "number", "maximum": 3600, "description": "Seconds to wait before giving up (max 3600). Omit or pass 0 to wait indefinitely (persistent)." }
                     },
                     "required": ["question"]
                 }
             },
             {
+                "name": "update_ask",
+                "description": "Revise a still-pending ask_user question in place (its situation changed). Pass the `ask_id` returned by ask_user and any of question/options/detail to replace. Typically called from a PARALLEL tool call or a different session — the blocked ask_user call cannot update itself. Errors if the ask is no longer pending (already answered/dismissed/cancelled/timed out).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "ask_id": { "type": "string", "description": "The id returned by the ask_user call to revise." },
+                        "question": { "type": "string", "description": "New question text (optional)." },
+                        "options": { "type": "array", "items": { "type": "string" }, "description": "New option list (optional; pass [] to clear)." },
+                        "detail": { "type": "string", "description": "New detail/body (optional; pass \"\" to clear)." }
+                    },
+                    "required": ["ask_id"]
+                }
+            },
+            {
+                "name": "cancel_ask",
+                "description": "Cancel a still-pending ask_user question (the decision is no longer needed). Pass the `ask_id` returned by ask_user; the blocked ask_user call returns with kind:\"cancelled\". Call from a PARALLEL tool call or a different session — the blocked call cannot cancel itself. Errors if the ask is no longer pending.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "ask_id": { "type": "string", "description": "The id returned by the ask_user call to cancel." }
+                    },
+                    "required": ["ask_id"]
+                }
+            },
+            {
                 "name": "notify_user",
-                "description": "Send the human a fire-and-forget notification (toast) and return immediately. Use for progress FYIs that need no answer.",
+                "description": "Send the human a fire-and-forget notification (toast) and return immediately. Use for progress FYIs that need no answer. Returns {delivered, id}.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -653,10 +986,12 @@ mod tests {
     use tokio::sync::mpsc;
 
     struct TestInner {
-        pending: VecDeque<(AskRequest, oneshot::Sender<AskAnswer>)>,
+        pending: VecDeque<(String, AskRequest, oneshot::Sender<AskAnswer>)>,
         asks: Vec<AskRequest>,
+        ids: Vec<String>,
         notifies: Vec<NotifyRequest>,
         orphaned: bool,
+        seq: u64,
     }
 
     /// Fake [`AskGateway`] whose pending asks can be answered programmatically —
@@ -674,8 +1009,10 @@ mod tests {
             let inner = TestInner {
                 pending: VecDeque::new(),
                 asks: Vec::new(),
+                ids: Vec::new(),
                 notifies: Vec::new(),
                 orphaned: false,
+                seq: 0,
             };
             (
                 Self {
@@ -689,15 +1026,7 @@ mod tests {
         fn answer_next(&self, answer: AskAnswer) -> bool {
             let popped = self.inner.lock().unwrap().pending.pop_front();
             match popped {
-                Some((_, tx)) => tx.send(answer).is_ok(),
-                None => false,
-            }
-        }
-
-        fn answer_next_with<F: FnOnce(&AskRequest) -> AskAnswer>(&self, f: F) -> bool {
-            let popped = self.inner.lock().unwrap().pending.pop_front();
-            match popped {
-                Some((req, tx)) => tx.send(f(&req)).is_ok(),
+                Some((_, _, tx)) => tx.send(answer).is_ok(),
                 None => false,
             }
         }
@@ -706,8 +1035,19 @@ mod tests {
             self.inner.lock().unwrap().pending.pop_front().is_some()
         }
 
+        /// Pop the front pending ask (id, request, responder) so a test can
+        /// inspect it and answer on its own schedule (e.g. delay so a keepalive
+        /// progress fires first).
+        #[allow(clippy::type_complexity)]
+        fn pop_next(&self) -> Option<(String, AskRequest, oneshot::Sender<AskAnswer>)> {
+            self.inner.lock().unwrap().pending.pop_front()
+        }
+
         fn asks(&self) -> Vec<AskRequest> {
             self.inner.lock().unwrap().asks.clone()
+        }
+        fn last_id(&self) -> Option<String> {
+            self.inner.lock().unwrap().ids.last().cloned()
         }
         fn notifies(&self) -> Vec<NotifyRequest> {
             self.inner.lock().unwrap().notifies.clone()
@@ -718,18 +1058,63 @@ mod tests {
     }
 
     impl AskGateway for TestGateway {
-        fn submit_ask(&self, req: AskRequest) -> oneshot::Receiver<AskAnswer> {
+        fn submit_ask(&self, req: AskRequest) -> SubmittedAsk {
             let (tx, rx) = oneshot::channel();
-            {
+            let id = {
                 let mut g = self.inner.lock().unwrap();
+                let id = format!("test-ask-{}", g.seq);
+                g.seq += 1;
                 g.asks.push(req.clone());
-                g.pending.push_back((req, tx));
-            }
+                g.ids.push(id.clone());
+                g.pending.push_back((id.clone(), req, tx));
+                id
+            };
             let _ = self.signal.send(());
-            rx
+            SubmittedAsk { id, rx }
         }
-        fn notify(&self, req: NotifyRequest) {
-            self.inner.lock().unwrap().notifies.push(req);
+        fn update_ask(
+            &self,
+            ask_id: &str,
+            question: Option<String>,
+            options: Option<Vec<String>>,
+            detail: Option<String>,
+        ) -> bool {
+            let mut g = self.inner.lock().unwrap();
+            let Some((_, req, _)) = g.pending.iter_mut().find(|(id, _, _)| id == ask_id) else {
+                return false;
+            };
+            if let Some(q) = question {
+                req.question = q;
+            }
+            if let Some(o) = options {
+                req.options = if o.is_empty() { None } else { Some(o) };
+            }
+            if let Some(d) = detail {
+                req.detail = if d.is_empty() { None } else { Some(d) };
+            }
+            true
+        }
+        fn cancel_ask(&self, ask_id: &str) -> bool {
+            let popped = {
+                let mut g = self.inner.lock().unwrap();
+                g.pending
+                    .iter()
+                    .position(|(id, _, _)| id == ask_id)
+                    .and_then(|i| g.pending.remove(i))
+            };
+            match popped {
+                Some((_, _, tx)) => {
+                    let _ = tx.send(AskAnswer::cancelled());
+                    true
+                }
+                None => false,
+            }
+        }
+        fn notify(&self, req: NotifyRequest) -> String {
+            let mut g = self.inner.lock().unwrap();
+            let id = format!("test-notify-{}", g.notifies.len());
+            g.notifies.push(req);
+            id
         }
         fn orphan_stale_asks(&self) {
             self.inner.lock().unwrap().orphaned = true;
@@ -745,6 +1130,9 @@ mod tests {
         let state = AppState {
             token: Arc::new(token.to_string()),
             gateway,
+            // Short keepalive so the SSE/progress tests emit a few ticks quickly
+            // without a process-global env var (no cross-test race).
+            keepalive: Duration::from_millis(80),
         };
         let router = build_router(state);
         let (tx, rx) = oneshot::channel::<()>();
@@ -792,6 +1180,17 @@ mod tests {
             .unwrap_or("")
             .to_string();
         (status, body)
+    }
+
+    /// Parse the `data: {json}` lines out of a raw SSE HTTP body. `http_post`
+    /// does not decode chunked transfer-encoding, so chunk-size lines are
+    /// interleaved — they never start with `data:`, so scanning by line skips
+    /// them.
+    fn sse_frames(raw: &str) -> Vec<Value> {
+        raw.lines()
+            .filter_map(|l| l.trim_start().strip_prefix("data:"))
+            .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+            .collect()
     }
 
     fn unique_temp_dir() -> PathBuf {
@@ -898,10 +1297,16 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(v["result"]["structuredContent"]["answer"], "yes");
         assert_eq!(v["result"]["structuredContent"]["kind"], "option");
+        // R-19.5: the result carries the ask_id for update_ask/cancel_ask.
+        assert_eq!(
+            v["result"]["structuredContent"]["ask_id"],
+            gw.last_id().unwrap()
+        );
         // The content text mirrors the structured answer.
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["kind"], "option");
+        assert!(parsed["ask_id"].is_string());
 
         let _ = shutdown.send(());
     }
@@ -941,17 +1346,170 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_clamps_timeout_to_600() {
+    async fn ask_user_clamps_timeout_to_3600() {
+        // R-19.2: the explicit-timeout cap was raised 600 → 3600.
         let (gw, mut signal) = TestGateway::new();
         let gw = Arc::new(gw);
         let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
         let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"q","timeout_seconds":99999}}}"#;
         let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
         signal.recv().await.unwrap();
-        assert_eq!(gw.asks()[0].timeout_seconds, MAX_TIMEOUT_SECONDS);
+        assert_eq!(gw.asks()[0].timeout_seconds, Some(MAX_TIMEOUT_SECONDS));
         assert!(gw.answer_next(AskAnswer::text("done")));
         let (status, _resp) = call.await.unwrap();
         assert_eq!(status, 200);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn ask_user_omitted_timeout_is_persistent() {
+        // R-19.2: omitting timeout_seconds → persistent (None), no MCP-side timer.
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        let body = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"forever?","detail":"the long rationale"}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        assert_eq!(gw.asks()[0].timeout_seconds, None, "persistent");
+        assert_eq!(gw.asks()[0].detail.as_deref(), Some("the long rationale"));
+        // Only an explicit answer resolves it.
+        assert!(gw.answer_next(AskAnswer::text("done")));
+        let (status, resp) = call.await.unwrap();
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["kind"], "text");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn cancel_ask_resolves_blocked_call_as_cancelled() {
+        // R-19.5: cancel_ask from a parallel call resolves the blocked ask_user
+        // with kind:"cancelled".
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        // Persistent ask so it stays blocked until we cancel it.
+        let body = r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"still needed?"}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        let ask_id = gw.last_id().unwrap();
+
+        // A parallel cancel_ask call.
+        let cancel_body = format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{{"name":"cancel_ask","arguments":{{"ask_id":"{ask_id}"}}}}}}"#
+        );
+        let (cs, cresp) = http_post(port, Some("t".into()), cancel_body).await;
+        assert_eq!(cs, 200);
+        let cv: Value = serde_json::from_str(&cresp).unwrap();
+        assert_eq!(cv["result"]["isError"], false);
+        assert_eq!(cv["result"]["structuredContent"]["cancelled"], true);
+
+        // The blocked ask_user returns cancelled.
+        let (status, resp) = call.await.unwrap();
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["kind"], "cancelled");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn update_ask_mutates_pending_and_errors_on_unknown_id() {
+        // R-19.5: update_ask mutates a pending ask; an unknown/settled id yields
+        // an error RESULT (isError:true), never a JSON-RPC exception.
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        let body = r#"{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"old?"}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        let ask_id = gw.last_id().unwrap();
+
+        let upd = format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{{"name":"update_ask","arguments":{{"ask_id":"{ask_id}","question":"new?","detail":"why"}}}}}}"#
+        );
+        let (us, uresp) = http_post(port, Some("t".into()), upd).await;
+        assert_eq!(us, 200);
+        let uv: Value = serde_json::from_str(&uresp).unwrap();
+        assert_eq!(uv["result"]["isError"], false);
+        assert_eq!(uv["result"]["structuredContent"]["updated"], true);
+        assert_eq!(gw.asks()[0].question, "old?", "snapshot is submit-time");
+
+        // Unknown id → error result.
+        let bad = r#"{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"update_ask","arguments":{"ask_id":"nope"}}}"#;
+        let (bs, bresp) = http_post(port, Some("t".into()), bad.into()).await;
+        assert_eq!(bs, 200);
+        let bv: Value = serde_json::from_str(&bresp).unwrap();
+        assert_eq!(bv["result"]["isError"], true);
+
+        assert!(gw.answer_next(AskAnswer::text("done")));
+        let _ = call.await.unwrap();
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn cancel_ask_unknown_id_is_error_result() {
+        let (gw, _sig) = TestGateway::new();
+        let (port, shutdown) = spawn_test_server("t", Arc::new(gw)).await;
+        let body = r#"{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"cancel_ask","arguments":{"ask_id":"missing"}}}"#;
+        let (status, resp) = http_post(port, Some("t".into()), body.into()).await;
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn ask_user_progress_notifications_stream_over_sse() {
+        // R-19.3: with a progressToken, the blocked ask_user answers over SSE and
+        // interleaves at least one notifications/progress before the final result.
+        // The test server's keepalive is 80ms (see `spawn_test_server`).
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        let body = r#"{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"slow?"},"_meta":{"progressToken":"tok-1"}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        // Let a couple of keepalive ticks fire, then answer.
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert!(gw.answer_next(AskAnswer::text("ok")));
+
+        let (status, resp) = call.await.unwrap();
+        assert_eq!(status, 200);
+        // The SSE body is a sequence of `data: {json}` lines. `http_post` returns
+        // the raw HTTP body without decoding chunked transfer-encoding, so scan
+        // line-by-line (chunk-size lines never start with `data:`).
+        let frames: Vec<Value> = sse_frames(&resp);
+        let progress: Vec<&Value> = frames
+            .iter()
+            .filter(|f| f["method"] == "notifications/progress")
+            .collect();
+        assert!(
+            !progress.is_empty(),
+            "expected >=1 progress notification, got frames: {resp}"
+        );
+        assert_eq!(progress[0]["params"]["progressToken"], "tok-1");
+        // The last frame is the final result with the answer.
+        let last = frames.last().unwrap();
+        assert_eq!(last["result"]["structuredContent"]["kind"], "text");
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn dismiss_resolves_blocked_call_over_sse_not_a_timeout() {
+        // R-19.4 regression: a dismiss must resolve the blocked call with
+        // kind:"dismissed" — even on the SSE (progressToken) path — rather than
+        // hanging until a transport timeout.
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        let body = r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"dismiss me"},"_meta":{"progressToken":9}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        assert!(gw.answer_next(AskAnswer::dismissed()));
+        let (status, resp) = call.await.unwrap();
+        assert_eq!(status, 200);
+        let last = sse_frames(&resp).pop().expect("a final SSE frame");
+        assert_eq!(last["result"]["structuredContent"]["kind"], "dismissed");
         let _ = shutdown.send(());
     }
 
@@ -984,6 +1542,12 @@ mod tests {
         assert_eq!(status, 200);
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["isError"], false);
+        // R-19.6: returns {delivered, id}.
+        assert_eq!(v["result"]["structuredContent"]["delivered"], true);
+        assert!(
+            v["result"]["structuredContent"]["id"].is_string(),
+            "notify_user returns a record id"
+        );
         let notifies = gw.notifies();
         assert_eq!(notifies.len(), 1);
         assert_eq!(notifies[0].message, "build done");
@@ -1063,15 +1627,32 @@ mod tests {
         let gw = Arc::new(gw);
         let (port, shutdown) = spawn_test_server("node-token", gw.clone()).await;
 
-        // Auto-answer each incoming ask via the exposed test channel: pick the
-        // first offered option, else echo a text answer.
+        // Auto-answer each incoming ask via the exposed test channel. The node
+        // script tags questions so this harness can drive the R-19 flows:
+        //   * "DISMISS" → resolve as dismissed (R-19.4 regression)
+        //   * "PROGRESS" → delay past a keepalive tick, then answer (R-19.3)
+        //   * otherwise → first option, else a text answer.
         let gw_ans = gw.clone();
         let answerer = tokio::spawn(async move {
             while signal.recv().await.is_some() {
-                gw_ans.answer_next_with(|req| match req.options.as_ref().and_then(|o| o.first()) {
-                    Some(opt) => AskAnswer::option(opt.clone()),
-                    None => AskAnswer::text("ok from test channel"),
-                });
+                let Some((_, req, tx)) = gw_ans.pop_next() else {
+                    continue;
+                };
+                let q = req.question.clone();
+                if q.contains("DISMISS") {
+                    let _ = tx.send(AskAnswer::dismissed());
+                } else if q.contains("PROGRESS") {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let _ = tx.send(AskAnswer::text("ok after progress"));
+                    });
+                } else {
+                    let ans = match req.options.as_ref().and_then(|o| o.first()) {
+                        Some(opt) => AskAnswer::option(opt.clone()),
+                        None => AskAnswer::text("ok from test channel"),
+                    };
+                    let _ = tx.send(ans);
+                }
             }
         });
 

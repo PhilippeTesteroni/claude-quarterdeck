@@ -17,6 +17,20 @@ export function formatDuration(ms: number): string {
   return `${m}m ${String(s).padStart(2, '0')}s`;
 }
 
+/**
+ * Coarse duration for the session-age tooltip (SPEC R-22.3), e.g. "2h 14m",
+ * "14m", or "just now". Minutes granularity (age is a broad "how long has this
+ * session been alive" signal, not a live-ticking timer).
+ */
+export function formatAge(ms: number): string {
+  const totalMin = Math.max(0, Math.floor(ms / 60_000));
+  if (totalMin < 1) return 'just now';
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
+  return `${m}m`;
+}
+
 /** mm:ss countdown for the ask window timeout. */
 export function formatCountdown(ms: number): string {
   const totalSec = Math.max(0, Math.ceil(ms / 1000));
@@ -47,6 +61,22 @@ export function footerText(counts: { attention: number; working: number; idle: n
     .filter((status) => counts[status] > 0)
     .map((status) => `${counts[status]} ${FOOTER_LABELS[status]}`);
   return parts.join(' · ');
+}
+
+/**
+ * Worst-of aggregate status (SPEC §25 R-25.1, mirrors `TrayStatus::worst_of`
+ * in `src-tauri/src/tray.rs` and the tray icon it drives): the lamp shows this
+ * as its single color. `'gray'` covers zero sessions or all-dead, same as the
+ * tray icon (R-2.6). A pure, trivial derivation from `counts` — computed
+ * client-side same as `footerText`/the watch line segments, not a violation of
+ * "frontend is dumb" (R-3.4), which is about business logic, not re-deriving
+ * a max() over data already on the wire.
+ */
+export function worstStatus(counts: { attention: number; working: number; idle: number }): SessionStatus | 'gray' {
+  if (counts.attention > 0) return 'attention';
+  if (counts.working > 0) return 'working';
+  if (counts.idle > 0) return 'idle';
+  return 'gray';
 }
 
 export function truncate(text: string, max: number): string {

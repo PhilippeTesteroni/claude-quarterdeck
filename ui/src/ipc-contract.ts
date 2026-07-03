@@ -15,11 +15,44 @@ export interface SessionRow {
   title: string;
   branch?: string;
   status: SessionStatus;
-  /** True when the row was inferred from cold-start discovery (UI shows `~`). */
+  /**
+   * True when the row is a cold-start estimate (R-5.4/R-22): its time-in-status
+   * is seeded, not hook-exact, so the UI renders the time with a `~` prefix
+   * (R-22.4). Cleared on the first status-marking hook event (R-22.2).
+   */
   inferred: boolean;
   /** Milliseconds spent in the current status. */
   sinceMs: number;
   cwd: string;
+  /**
+   * Active background subagents (SPEC R-21.2): the row shows a compact `⛭ N`
+   * badge while > 0. Absent/0 hides it.
+   */
+  subagents?: number;
+  /**
+   * Total session age in ms when an anchor is known (SPEC R-22.3): shown in the
+   * row's hover tooltip alongside the cwd as "session 2h 14m".
+   */
+  ageMs?: number;
+  /**
+   * Context fill percent (SPEC R-23.2a/R-23.4): the row's second line reads
+   * `ctx {ctxPercent}% · …`, amber ≥75, red ≥90 (+ a "context nearly full"
+   * tooltip). Absent until a usage record is read, or when `showTokenStats` off.
+   */
+  ctxPercent?: number;
+  /**
+   * Session spend, compact (SPEC R-23.2b/R-23.4): the `· {spend}` half of the
+   * second line (e.g. `1.4M`). Absent when zero/unavailable.
+   */
+  spend?: string;
+  /** True when `spend` is a lower bound after a truncation/overflow rescan
+   * (SPEC R-23.1) — rendered with a "≥" prefix. */
+  spendApprox?: boolean;
+  /**
+   * Combined subagent/sidechain spend, compact (SPEC R-23.3): the `· {spend}`
+   * suffix on the `⛭ N` badge (`⛭ 3 · 2.1M`). Absent when zero.
+   */
+  subagentSpend?: string;
 }
 
 export interface AskRow {
@@ -28,7 +61,12 @@ export interface AskRow {
   project?: string;
   question: string;
   options?: string[];
-  /** Epoch milliseconds when the ask times out, if a timeout was set. */
+  /** Long rationale/body (R-19.1), rendered muted under the question. */
+  detail?: string;
+  /**
+   * Epoch milliseconds when the ask times out, if a timeout was set. Absent for
+   * persistent asks (R-19.2), which render with no countdown.
+   */
   timeoutAt?: number;
   /**
    * T4 addition: the raw `context` (agent cwd) the MCP call carried, needed
@@ -43,7 +81,39 @@ export interface AskRow {
    * with only a Dismiss action.
    */
   orphaned?: boolean;
+  /**
+   * Epoch ms the ask was enqueued (arrival time). The shared ask/perm FIFO
+   * (R-16.2): the ask window's primary slot goes to whichever of the front ask
+   * / front perm has the smaller `queuedAt` — arrival order, not perms-first.
+   */
+  queuedAt: number;
 }
+
+/**
+ * A pending permission request (SPEC §16, R-16.2). Shares the always-on-top ask
+ * window with {@link AskRow} but renders distinctly (amber) with Allow / Deny /
+ * In terminal actions. Mirror of `PermRow` in `src-tauri/src/ipc.rs`.
+ */
+export interface PermRow {
+  id: string;
+  sessionId?: string;
+  project?: string;
+  /** The tool Claude Code wants to run (e.g. `Bash`), sanitized. */
+  toolName: string;
+  /** Compact tool input, sanitized + capped (R-16.1/R-16.5), shown verbatim. */
+  toolInput: string;
+  /** Raw calling context for an unmatched perm ("Unknown agent (<context>)"). */
+  context?: string;
+  /**
+   * Epoch ms the perm arrived — its position in the shared ask/perm FIFO
+   * (R-16.2). Compared against a front ask's `queuedAt`.
+   */
+  queuedAt: number;
+}
+
+/** The deck-side decision for a perm (SPEC R-16.2). `defer` = "In terminal" —
+ * no decision, the hook falls through to the terminal dialog. */
+export type PermDecision = 'allow' | 'deny' | 'defer';
 
 export interface Counts {
   attention: number;
@@ -76,6 +146,24 @@ export interface SettingsState {
    * call, same mechanism as `mcpEnabled` (R-8.6).
    */
   popupPinned: boolean;
+  /**
+   * Take over Claude Code permission prompts into the deck (SPEC §16, R-16.4).
+   * Default ON after onboarding consent; the settings toggle + onboarding
+   * consent line drive it via `set_setting('takeoverPermissions', …)`.
+   */
+  takeoverPermissions: boolean;
+  /**
+   * Show per-session token usage on rows (SPEC R-23.5). Default ON. Drives the
+   * "Token stats" settings toggle and gates the row usage line + subagent-spend
+   * badge suffix client-side.
+   */
+  showTokenStats: boolean;
+  /**
+   * Popup display mode (SPEC §25, R-25.2): `list` is the full popup; `lamp` is
+   * the compact ~56x56 always-on-top traffic-light square (R-25.1). Driven by
+   * `set_setting('popupMode', …)`, same mechanism as `popupPinned`.
+   */
+  popupMode: 'list' | 'lamp';
   /** Agent-questions (MCP) enabled, R-8.6. */
   mcpEnabled: boolean;
   /**
@@ -96,6 +184,8 @@ export interface SettingsState {
 export interface StateSnapshot {
   sessions: SessionRow[];
   asks: AskRow[];
+  /** Pending permission requests (SPEC §16), rendered in the ask window. */
+  perms: PermRow[];
   hooksInstalled: boolean;
   counts: Counts;
   /** Optional until the backend mirrors `SettingsState` (see note above). */
@@ -105,8 +195,9 @@ export interface StateSnapshot {
 /** Tauri event channel the shell emits full snapshots on. */
 export const STATE_EVENT = 'deck://state';
 
-/** Result kind of an MCP `ask_user` call, mirrored to the UI. */
-export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed';
+/** Result kind of an MCP `ask_user` call, mirrored to the UI. `cancelled` (R-19.5)
+ * is produced by a `cancel_ask` tool call, never by a UI action. */
+export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed' | 'cancelled';
 
 /**
  * Tauri commands exposed by the shell (implemented in T3). Argument objects are
@@ -114,6 +205,12 @@ export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed';
  */
 export interface Commands {
   answer_ask: (args: { askId: string; answer: string; kind: AskAnswerKind }) => Promise<void>;
+  /**
+   * Answers a pending permission request (SPEC §16, R-16.2). `decision` is
+   * `allow` / `deny` / `defer` ("In terminal"); `reason` is the optional deny
+   * reason. The decision is persisted for the blocked `PermissionRequest` hook.
+   */
+  answer_perm: (args: { permId: string; decision: PermDecision; reason?: string }) => Promise<void>;
   remove_row: (args: { sessionId: string }) => Promise<void>;
   /**
    * Generic settings setter. `key` is one of the `SettingsState` keys above

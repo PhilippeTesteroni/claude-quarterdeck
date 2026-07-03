@@ -19,6 +19,7 @@ import type {
   AskAnswerKind,
   AskRow,
   Commands,
+  PermRow,
   SessionRow,
   SessionStatus,
   SettingsState,
@@ -36,6 +37,18 @@ interface InternalSession {
   inferred: boolean;
   cwd: string;
   statusChangedAt: number;
+  /** R-21.2: active background subagents → `⛭ N` badge. */
+  subagents?: number;
+  /** R-22.3: total session age in ms → tooltip "session 2h 14m". */
+  ageMs?: number;
+  /** R-23.4: context fill percent → row second line `ctx {n}%`. */
+  ctxPercent?: number;
+  /** R-23.4: compact session spend → row second line `· {spend}`. */
+  spend?: string;
+  /** R-23.1: spend is a lower bound → rendered with a "≥" prefix. */
+  spendApprox?: boolean;
+  /** R-23.3: compact subagent group spend → `⛭ N · {spend}` badge. */
+  subagentSpend?: string;
 }
 
 interface InternalAsk {
@@ -45,10 +58,23 @@ interface InternalAsk {
   context?: string;
   question: string;
   options?: string[];
+  /** R-19.1: long-form rationale rendered muted under the question. */
+  detail?: string;
   timeoutAt?: number;
   createdAt: number;
   /** R-8.7: recovered-after-restart ask — renders as expired, Dismiss-only. */
   orphaned?: boolean;
+}
+
+interface InternalPerm {
+  id: string;
+  sessionId?: string;
+  project?: string;
+  context?: string;
+  toolName: string;
+  toolInput: string;
+  /** Arrival time for the shared ask/perm FIFO (R-16.2). */
+  createdAt?: number;
 }
 
 const params = new URLSearchParams(location.search);
@@ -56,6 +82,7 @@ const storyEnabled = params.get('story') !== 'off';
 
 let sessions: InternalSession[] = [];
 let asks: InternalAsk[] = [];
+let perms: InternalPerm[] = [];
 let hooksInstalled = true;
 let installShouldFail = false;
 /** When set (via `?scenario=focus-fail`), the next `focus_terminal` call rejects
@@ -75,6 +102,9 @@ function defaultSettings(): SettingsState {
     launchAtLogin: false,
     onboardingDone: true,
     popupPinned: false,
+    takeoverPermissions: true,
+    showTokenStats: true,
+    popupMode: 'list',
     mcpEnabled: true,
     mcpCliAvailable: true,
     mcpCommand:
@@ -97,7 +127,7 @@ function session(partial: Omit<InternalSession, 'statusChangedAt'> & { since: nu
 }
 
 /** Named fixture states. See module doc for how to select one. */
-const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: InternalAsk[]; hooksInstalled: boolean; settings: SettingsState }> = {
+const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: InternalAsk[]; perms?: InternalPerm[]; hooksInstalled: boolean; settings: SettingsState }> = {
   default: () => ({
     hooksInstalled: true,
     settings: defaultSettings(),
@@ -196,6 +226,147 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
       }),
     ),
     asks: [],
+  }),
+  // SPEC §21 (R-21.1/R-21.2/R-21.4): a session whose Stop hook fired but whose
+  // registry says busy displays yellow (working) with a `⛭ N` subagent badge,
+  // while an estimated row shows the `~` time + age tooltip (§22).
+  'background-busy': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Fan-out refactor across 6 crates',
+        branch: 'main',
+        // Displayed working via the busy-override even though the turn's Stop
+        // fired — the shell computes this; the mock just reflects the result.
+        status: 'working',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(38),
+        subagents: 3,
+        ageMs: 2 * 3_600_000 + 14 * 60_000, // "session 2h 14m"
+      }),
+      session({
+        id: 's2',
+        project: 'dream-book-web',
+        title: 'Locale-native generator sweep',
+        status: 'idle',
+        // Pre-existing at launch → estimated time (`~`) + a discovery age.
+        inferred: true,
+        cwd: 'C:/Users/phily/projects/dream-book-web',
+        since: minutesAgo(12) - 40_000, // renders as ~12m 40s
+        ageMs: 47 * 60_000,
+      }),
+    ],
+    asks: [],
+  }),
+  // SPEC §23 (R-23.4): per-session token telemetry on rows — the `ctx {n}% ·
+  // {spend}` second line with amber/red context-health coloring, a "≥"
+  // lower-bound spend, and the `⛭ N · {spend}` subagent-group badge.
+  'token-stats': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Fan-out refactor across crates',
+        status: 'working',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(38),
+        subagents: 3,
+        ctxPercent: 62,
+        spend: '1.4M',
+        subagentSpend: '2.1M',
+      }),
+      session({
+        id: 's2',
+        project: 'dream-book-web',
+        title: 'Near-full context window',
+        status: 'idle',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/dream-book-web',
+        since: secondsAgo(9),
+        ctxPercent: 93,
+        spend: '812k',
+      }),
+      session({
+        id: 's3',
+        project: 'dating-coach',
+        title: 'Amber-band context',
+        status: 'working',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/dating-coach',
+        since: secondsAgo(4),
+        ctxPercent: 80,
+        spend: '120k',
+        spendApprox: true,
+      }),
+    ],
+    asks: [],
+  }),
+  // R-23.6: same rows, `showTokenStats` off — no usage line renders anywhere.
+  'token-stats-off': () => ({
+    hooksInstalled: true,
+    settings: { ...defaultSettings(), showTokenStats: false },
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Fan-out refactor across crates',
+        status: 'working',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(38),
+        subagents: 3,
+        ctxPercent: 62,
+        spend: '1.4M',
+        subagentSpend: '2.1M',
+      }),
+    ],
+    asks: [],
+  }),
+  // SPEC §25 (R-25.1/R-25.2): the pinned popup collapsed into the compact
+  // traffic-light lamp. One attention session drives a red lamp + "1" badge
+  // (the worst-of aggregate, mirroring `TrayStatus::worst_of` in `tray.rs`).
+  lamp: () => ({
+    hooksInstalled: true,
+    settings: { ...defaultSettings(), popupPinned: true, popupMode: 'lamp' },
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Fan-out refactor across crates',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(20),
+      }),
+      session({
+        id: 's2',
+        project: 'dream-book-web',
+        title: 'Locale-native generator sweep',
+        status: 'working',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/dream-book-web',
+        since: secondsAgo(5),
+      }),
+    ],
+    // R-25.3: a pending ask alongside the collapsed lamp proves nothing
+    // auto-expands it on arrival (the ask window handles the urgency instead).
+    asks: [
+      {
+        id: 'a1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        question: 'Ship the migration in this PR, or split it out?',
+        options: ['This PR', 'Split it out'],
+        createdAt: Date.now() - 3_000,
+      },
+    ],
   }),
   nohooks: () => ({
     hooksInstalled: false,
@@ -338,6 +509,128 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
       },
     ],
   }),
+  // SPEC R-19.1/R-19.2: an ask carrying long-form `detail` and NO timeout
+  // (persistent — renders with no countdown).
+  'ask-detail': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(30),
+      }),
+    ],
+    asks: [
+      {
+        id: 'a1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        question: 'Drop the legacy v1 answer file format?',
+        detail:
+          'The v1 format has been dual-written since 1.0. No sessions have read it in the last 30 days. Removing it simplifies the answers watcher, but a downgrade to 1.0 would then fail to read new answer files.',
+        options: ['Drop it', 'Keep dual-write'],
+        // No timeoutAt: persistent (R-19.2) — the window shows no countdown.
+        createdAt: Date.now() - 5_000,
+      },
+    ],
+  }),
+  // SPEC §16 (R-16.2): a pending permission request rendered in the ask window
+  // (amber) and mirrored in the popup, with an ask queued behind it. The perm
+  // arrived BEFORE the ask (older `createdAt`), so under the shared ask/perm
+  // FIFO it holds the primary slot.
+  perm: () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(6),
+      }),
+    ],
+    asks: [
+      {
+        id: 'a1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        question: 'Ship the migration in this PR, or split it out?',
+        options: ['This PR', 'Split it out'],
+        createdAt: Date.now() - 3_000,
+      },
+    ],
+    perms: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        toolName: 'Bash',
+        toolInput: '{"command":"rm -rf ./dist && npm run build","timeout":120000}',
+        createdAt: Date.now() - 5_000,
+      },
+    ],
+  }),
+  // SPEC §16 (R-16.2) FIFO: an ask that arrived BEFORE a later perm keeps the
+  // primary slot — perms do NOT preempt an already-queued ask. The perm queues
+  // behind it ("1 more waiting") and still renders as an answerable mirror row.
+  'perm-after-ask': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(6),
+      }),
+    ],
+    asks: [
+      {
+        id: 'a1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        question: 'Ship the migration in this PR, or split it out?',
+        options: ['This PR', 'Split it out'],
+        createdAt: Date.now() - 8_000,
+      },
+    ],
+    perms: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        toolName: 'Bash',
+        toolInput: '{"command":"rm -rf ./dist && npm run build","timeout":120000}',
+        createdAt: Date.now() - 2_000,
+      },
+    ],
+  }),
+  // R-16.2 / R-8.2: an unmatched perm shows "Unknown agent (<context>)".
+  'perm-unknown': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [],
+    asks: [],
+    perms: [
+      {
+        id: 'p1',
+        context: 'C:/Users/phily/projects/some-untracked-script',
+        toolName: 'Write',
+        toolInput: '{"file_path":"/etc/hosts","content":"127.0.0.1 example.com"}',
+      },
+    ],
+  }),
   error: () => ({
     hooksInstalled: false,
     settings: defaultSettings(),
@@ -351,6 +644,7 @@ function loadScenario(name: string): void {
   const fixture = build();
   sessions = fixture.sessions;
   asks = fixture.asks;
+  perms = fixture.perms ?? [];
   hooksInstalled = fixture.hooksInstalled;
   settings = fixture.settings;
   installShouldFail = name === 'error';
@@ -393,6 +687,12 @@ function snapshot(): StateSnapshot {
     inferred: s.inferred,
     sinceMs: Math.max(0, now - s.statusChangedAt),
     cwd: s.cwd,
+    subagents: s.subagents ?? 0,
+    ageMs: s.ageMs,
+    ctxPercent: s.ctxPercent,
+    spend: s.spend,
+    spendApprox: s.spendApprox,
+    subagentSpend: s.subagentSpend,
   }));
   const askRows: AskRow[] = asks.map((a) => ({
     id: a.id,
@@ -400,9 +700,22 @@ function snapshot(): StateSnapshot {
     project: a.project,
     question: a.question,
     options: a.options,
+    detail: a.detail,
     timeoutAt: a.timeoutAt,
     context: a.context,
     orphaned: a.orphaned,
+    // R-16.2: arrival time for the shared ask/perm FIFO.
+    queuedAt: a.createdAt,
+  }));
+  const permRows: PermRow[] = perms.map((p) => ({
+    id: p.id,
+    sessionId: p.sessionId,
+    project: p.project,
+    toolName: p.toolName,
+    toolInput: p.toolInput,
+    context: p.context,
+    // R-16.2: a perm with no explicit arrival is treated as just-now (newest).
+    queuedAt: p.createdAt ?? Date.now(),
   }));
   const counts = {
     attention: sessions.filter((s) => s.status === 'attention').length,
@@ -410,7 +723,7 @@ function snapshot(): StateSnapshot {
     idle: sessions.filter((s) => s.status === 'idle').length,
     dead: sessions.filter((s) => s.status === 'dead').length,
   };
-  return { sessions: rows, asks: askRows, hooksInstalled, counts, settings: { ...settings } };
+  return { sessions: rows, asks: askRows, perms: permRows, hooksInstalled, counts, settings: { ...settings } };
 }
 
 function emit(): void {
@@ -445,11 +758,30 @@ let lastFocusTerminalId: string | null = null;
  * here instead so a spec can assert the close action fired without
  * dismissing the pending ask. */
 let hideCurrentWindowCalls = 0;
+/** Count of `startDragging()` calls (SPEC R-25.1): the lamp's manual
+ * pointer-drag discrimination (see `ipc-client.ts`) calls this once movement
+ * crosses the threshold; a plain click never should. No real OS window to
+ * actually drag in mock/browser mode, so a spec asserts against this counter. */
+let startDraggingCalls = 0;
+/** Last decision sent via `answer_perm` (SPEC §16): lets a Playwright spec assert
+ * A/D/Esc + the Allow/Deny/In-terminal buttons route the right decision, with no
+ * real hook to observe. */
+let lastPermDecision: string | null = null;
+/** Last `answer_ask` (askId, kind) routed through the mock (SPEC R-19.4): lets a
+ * spec assert Dismiss sends kind:"dismissed" from both the ask window and the
+ * popup mirror, with no real MCP call to observe. */
+let lastAnswerAsk: { askId: string; kind: string } | null = null;
 
 /** Test-only: records a `hideCurrentWindow()` call (SPEC R-18.1). Exported so
  * `ipc-client.ts` can call it from the mock branch of `hideCurrentWindow`. */
 export function hideCurrentWindowMock(): void {
   hideCurrentWindowCalls += 1;
+}
+
+/** Test-only: records a `startDragging()` call (SPEC R-25.1). Exported so
+ * `ipc-client.ts` can call it from the mock branch of `startDragging`. */
+export function startDraggingMock(): void {
+  startDraggingCalls += 1;
 }
 
 function clearAskAndMaybeRestore(askId: string): void {
@@ -477,7 +809,29 @@ export async function invoke<K extends keyof Commands>(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return snapshot() as any;
     case 'answer_ask': {
+      lastAnswerAsk = { askId: a.askId as string, kind: a.kind as string };
       clearAskAndMaybeRestore(a.askId as string);
+      emit();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
+    }
+    case 'answer_perm': {
+      lastPermDecision = a.decision as string;
+      const perm = perms.find((p) => p.id === a.permId);
+      perms = perms.filter((p) => p.id !== a.permId);
+      // Clearing the perm drops the attention override, same as an ask.
+      if (perm?.sessionId) {
+        const stillPending =
+          perms.some((p) => p.sessionId === perm.sessionId) || asks.some((k) => k.sessionId === perm.sessionId);
+        if (!stillPending) {
+          const s = sessions.find((sess) => sess.id === perm.sessionId);
+          if (s && s.status === 'attention') {
+            s.status = s.preAskStatus ?? 'idle';
+            s.statusChangedAt = Date.now();
+            s.preAskStatus = undefined;
+          }
+        }
+      }
       emit();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
@@ -492,6 +846,14 @@ export async function invoke<K extends keyof Commands>(
       const key = a.key as keyof SettingsState;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (settings as any)[key] = a.value;
+      // R-25.2 "Unpin while in lamp mode → expand to list + revert to v1.0
+      // tray-anchored behavior" (mirrors `should_force_list_on_unpin` in
+      // `src-tauri/src/windows.rs`): the collapse button only shows while
+      // pinned, so unpinning (e.g. via the lamp's right-click menu) is the
+      // path back out for a user who didn't expand first.
+      if (key === 'popupPinned' && a.value === false && settings.popupMode === 'lamp') {
+        settings.popupMode = 'list';
+      }
       emit();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
@@ -584,9 +946,16 @@ if (!isTauri()) {
     // which have no observable real-window effect in mock/browser mode.
     showAskWindowCallCount: () => showAskWindowCalls,
     hideCurrentWindowCallCount: () => hideCurrentWindowCalls,
+    // R-25.1: lamp drag-vs-click discrimination call count.
+    startDraggingCallCount: () => startDraggingCalls,
     // R-15.4: click-to-focus counters (no real terminal in mock mode).
     focusTerminalCallCount: () => focusTerminalCalls,
     lastFocusTerminalId: () => lastFocusTerminalId,
+    // R-16.2: last permission decision routed via `answer_perm`.
+    lastPermDecision: () => lastPermDecision,
+    // R-19.4: last (askId, kind) routed via `answer_ask` — asserts Dismiss
+    // sends kind:"dismissed" from the ask window and the popup mirror.
+    lastAnswerAsk: () => lastAnswerAsk,
   };
 }
 

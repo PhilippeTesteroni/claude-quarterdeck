@@ -1,14 +1,22 @@
 //! Window management: the frameless popup anchored to the tray with hide-on-blur
 //! / Esc (SPEC R-7.1), draggable + pin-on-top + true auto-height (SPEC R-14),
-//! and the always-on-top ask window that does not steal keyboard focus on
+//! the always-on-top ask window that does not steal keyboard focus on
 //! appear (SPEC R-8.3, `WS_EX_NOACTIVATE`-equivalent) and is itself draggable
-//! (SPEC R-18.2).
+//! (SPEC R-18.2), and the pinned popup's lamp mode: a fixed ~56x56 always-on-top
+//! traffic-light square with mode/position persistence (SPEC §25).
 //!
-//! Filled in by T3; extended for the v1.1 addendum (F1: §14, §18).
+//! Filled in by T3; extended for the v1.1 addendum (F1: §14, §18) and the v1.2
+//! lamp mode (F7: §25).
 
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, Rect, WebviewWindow, WindowEvent};
+use tauri::{
+    AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Rect, WebviewWindow,
+    WindowEvent,
+};
+
+use crate::settings::PopupMode;
 
 /// Label of the popup window declared in `tauri.conf.json`.
 pub const POPUP_LABEL: &str = "popup";
@@ -27,6 +35,18 @@ const ANCHOR_GAP_PX: i32 = 6;
 const POPUP_W: f64 = 360.0;
 const POPUP_MIN_H: f64 = 160.0;
 const POPUP_MAX_H: f64 = 560.0;
+
+/// Lamp mode's fixed square size, logical px (SPEC R-25.1 "~56x56 logical px").
+const LAMP_SIZE: f64 = 56.0;
+
+/// Minimum gap between `popupPos` persist writes while the user drags the
+/// pinned popup (SPEC R-25.2). A drag fires many `Moved` events per second;
+/// writing `settings.json` on every one would hammer disk for no benefit — only
+/// the settled position matters for restoring geometry across a restart, and a
+/// drag that ends within this gap of the last write still has its FINAL
+/// position captured by the very next `Moved` event once the gap has elapsed
+/// (a real drag keeps firing `Moved` for as long as the mouse keeps moving).
+const POPUP_POS_PERSIST_GAP: Duration = Duration::from_millis(250);
 
 /// The tray-icon rect the popup was last anchored to. Kept so a content-driven
 /// [`resize_popup_to_content`] can re-anchor the (possibly visible) popup
@@ -54,6 +74,27 @@ static POPUP_USER_MOVED: Mutex<bool> = Mutex::new(false);
 /// `set_position` would be mistaken for a user move and permanently disable
 /// tray-following.
 static PENDING_PROGRAMMATIC_MOVES: Mutex<u32> = Mutex::new(0);
+
+/// SPEC R-25.2: mirrors `settings.json`'s `popupMode`. Read by
+/// [`resize_popup_to_content`] (a lamp is a fixed square, not content-sized)
+/// and by the popup's `Moved` handler (position is only worth persisting while
+/// pinned, independent of mode, but kept alongside `POPUP_PINNED` since both
+/// gate the same window-geometry decisions).
+static POPUP_MODE: Mutex<PopupMode> = Mutex::new(PopupMode::List);
+
+/// Last time [`maybe_persist_popup_pos`] actually wrote to disk (SPEC R-25.2
+/// debounce, see [`POPUP_POS_PERSIST_GAP`]).
+static LAST_POPUP_POS_PERSIST: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn set_popup_mode_flag(mode: PopupMode) {
+    if let Ok(mut guard) = POPUP_MODE.lock() {
+        *guard = mode;
+    }
+}
+
+fn popup_mode() -> PopupMode {
+    POPUP_MODE.lock().map(|g| *g).unwrap_or_default()
+}
 
 fn remember_tray_rect(rect: Rect) {
     if let Ok(mut guard) = LAST_TRAY_RECT.lock() {
@@ -109,14 +150,57 @@ fn is_user_initiated_move(pending: &mut u32) -> bool {
     }
 }
 
-/// Called from the popup's `WindowEvent::Moved` handler.
-fn note_move_event() {
+/// Called from the popup's `WindowEvent::Moved` handler with the window (to
+/// read its scale factor for the logical-position persist) and the raw
+/// physical position the OS reported.
+fn note_move_event(popup: &WebviewWindow, position: PhysicalPosition<i32>) {
     let mut pending = PENDING_PROGRAMMATIC_MOVES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if is_user_initiated_move(&mut pending) {
-        drop(pending);
-        set_popup_user_moved(true);
+    let user_initiated = is_user_initiated_move(&mut pending);
+    drop(pending);
+    if !user_initiated {
+        return;
+    }
+    set_popup_user_moved(true);
+    // R-25.2: position is only worth persisting while pinned — an unpinned
+    // popup always re-anchors to the tray on open (R-14.2), so its position is
+    // never meaningful to restore across a restart.
+    if popup_pinned() {
+        maybe_persist_popup_pos(popup, position);
+    }
+}
+
+/// Debounced disk-persist of the popup's current logical position (SPEC
+/// R-25.2), called on every genuine user drag while pinned. See
+/// [`POPUP_POS_PERSIST_GAP`]/[`should_persist_popup_pos`] for the debounce.
+fn maybe_persist_popup_pos(popup: &WebviewWindow, position: PhysicalPosition<i32>) {
+    let now = Instant::now();
+    let should_persist = {
+        let mut guard = LAST_POPUP_POS_PERSIST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let persist = should_persist_popup_pos(*guard, now, POPUP_POS_PERSIST_GAP);
+        if persist {
+            *guard = Some(now);
+        }
+        persist
+    };
+    if !should_persist {
+        return;
+    }
+    let Ok(scale) = popup.scale_factor() else {
+        return;
+    };
+    let logical = position.to_logical::<f64>(scale);
+    let pos = crate::settings::PopupPos {
+        x: logical.x,
+        y: logical.y,
+    };
+    let value = crate::ipc::SettingValue::Text(pos.to_setting_string());
+    if let Err(err) = crate::settings::set_setting(&crate::settings::data_dir(), "popupPos", value)
+    {
+        tracing::warn!(error = %err, "failed to persist popup position (R-25.2)");
     }
 }
 
@@ -150,6 +234,57 @@ fn should_anchor_on_open(pinned: bool) -> bool {
 /// alone never touches the window's position).
 fn should_reanchor_on_resize(pinned: bool, user_moved: bool) -> bool {
     !pinned && !user_moved
+}
+
+/// SPEC R-25.1: a lamp is a fixed ~56x56 square, not content-sized — a
+/// content-driven resize report (from the list layout's measurement) must be
+/// ignored while collapsed, or it would fight the fixed size `set_popup_mode`
+/// just applied. Kept pure (mode as a plain arg) so it's unit-testable without
+/// a live window.
+fn should_skip_content_resize(mode: PopupMode) -> bool {
+    mode == PopupMode::Lamp
+}
+
+/// SPEC R-25.2 "Unpin while in lamp mode → expand to list + revert to v1.0
+/// tray-anchored behavior": whether an unpin should ALSO force the popup back
+/// to list mode. The collapse button that reaches lamp mode is only shown
+/// while pinned (R-25.2), so unpinning is the only way out of lamp mode that
+/// doesn't already go through an explicit expand click.
+pub fn should_force_list_on_unpin(pinned: bool, mode: PopupMode) -> bool {
+    !pinned && mode == PopupMode::Lamp
+}
+
+/// The (min, max) logical size band to apply for a given popup mode (SPEC
+/// R-25.1/R-25.2): a lamp is pinned to an exact 56x56 square; list restores the
+/// v1.0/R-14.3 360-wide, 160..=560-tall band (the actual height within that
+/// band is then set by the next content-driven [`resize_popup_to_content`]).
+/// Kept pure so the ordering logic in [`set_popup_mode`] is unit-testable
+/// without a live window.
+fn popup_size_band(mode: PopupMode) -> ((f64, f64), (f64, f64)) {
+    match mode {
+        PopupMode::Lamp => ((LAMP_SIZE, LAMP_SIZE), (LAMP_SIZE, LAMP_SIZE)),
+        PopupMode::List => ((POPUP_W, POPUP_MIN_H), (POPUP_W, POPUP_MAX_H)),
+    }
+}
+
+/// Whether the new MIN size must be applied before the new MAX (SPEC R-25.2
+/// lamp<->list transitions). Applying them in the wrong order can ask the OS
+/// for a transient `min > max` window state — shrinking (new max smaller than
+/// the current one) must lower min first; growing (new max larger) must raise
+/// max first. Kept pure so it's unit-testable without a live window.
+fn min_before_max(current_max_w: f64, new_max_w: f64) -> bool {
+    new_max_w <= current_max_w
+}
+
+/// SPEC R-25.2 debounce decision for [`maybe_persist_popup_pos`]: has enough
+/// time passed since the last `popupPos` disk write? Kept pure (plain
+/// `Instant`s, no static access) so it's unit-testable without a live window or
+/// real sleeping.
+fn should_persist_popup_pos(last: Option<Instant>, now: Instant, gap: Duration) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= gap,
+    }
 }
 
 fn popup_window(app: &AppHandle) -> Result<WebviewWindow, String> {
@@ -241,9 +376,11 @@ fn attach_popup_behavior(popup: &WebviewWindow) -> Result<(), String> {
         }
         // SPEC R-14.1/R-14.3: track user drags so a content-driven resize
         // knows whether to keep re-anchoring near the tray or leave the
-        // window where the user put it.
-        WindowEvent::Moved(_) => {
-            note_move_event();
+        // window where the user put it. SPEC R-25.2: a genuine user drag while
+        // pinned also persists the position (debounced) for a restart to
+        // restore.
+        WindowEvent::Moved(position) => {
+            note_move_event(&on_event, *position);
         }
         _ => {}
     });
@@ -253,10 +390,17 @@ fn attach_popup_behavior(popup: &WebviewWindow) -> Result<(), String> {
     // satisfies the AC without touching `ui/**` (T4-owned). T4's own
     // popup.ts may add the same handler directly for defense in depth; both
     // are idempotent (hiding an already-hidden window is a no-op).
+    //
+    // SPEC R-25.3 "Blur/Esc never hide the lamp (it is the point of
+    // pinning)": `window.__qdPopupMode` is a plain global `popup.ts` keeps in
+    // sync with `SettingsState.popupMode` on every render (there's no Rust
+    // state to read from inside this injected string, R-3.4's "logic in Rust"
+    // is honored by Rust owning the actual `popup_mode()` truth — this is only
+    // a display mirror of a decision already made server-side).
     popup
         .eval(
             "window.addEventListener('keydown', function (event) { \
-                if (event.key === 'Escape' && window.__TAURI__ && window.__TAURI__.window) { \
+                if (event.key === 'Escape' && window.__qdPopupMode !== 'lamp' && window.__TAURI__ && window.__TAURI__.window) { \
                     window.__TAURI__.window.getCurrentWindow().hide(); \
                 } \
             });",
@@ -276,6 +420,59 @@ pub fn set_popup_pinned(app: &AppHandle, pinned: bool) -> Result<(), String> {
     popup
         .set_always_on_top(pinned)
         .map_err(|err| err.to_string())
+}
+
+/// Applies the SPEC R-25.2 lamp/list mode switch: persists the flag (read by
+/// [`resize_popup_to_content`]) and re-applies the window's min/max size
+/// constraints before setting an exact size for lamp (a fixed 56x56 square,
+/// R-25.1) or leaving list's actual height to the next content-driven
+/// [`resize_popup_to_content`] call (the frontend re-renders and re-measures
+/// on the very same state push that carries this mode change).
+///
+/// Min/max are updated in the order [`min_before_max`] says is safe: the
+/// window's own `min <= max` invariant would otherwise be violated for one
+/// native call in between (Tauri/the OS clamps or rejects that transient
+/// state depending on the backend), so shrinking to the lamp lowers min
+/// first, growing back to the list raises max first.
+pub fn set_popup_mode(app: &AppHandle, mode: PopupMode) -> Result<(), String> {
+    let popup = popup_window(app)?;
+    // Tauri's `WebviewWindow` exposes only setters for min/max size, not a
+    // getter — track the previous band via our own mirrored `POPUP_MODE`
+    // static (read before overwriting it) instead of querying the live window.
+    let (_, (previous_max_w, _)) = popup_size_band(popup_mode());
+    set_popup_mode_flag(mode);
+
+    let ((min_w, min_h), (max_w, max_h)) = popup_size_band(mode);
+    let min = LogicalSize::new(min_w, min_h);
+    let max = LogicalSize::new(max_w, max_h);
+    if min_before_max(previous_max_w, max_w) {
+        popup.set_min_size(Some(min)).map_err(|e| e.to_string())?;
+        popup.set_max_size(Some(max)).map_err(|e| e.to_string())?;
+    } else {
+        popup.set_max_size(Some(max)).map_err(|e| e.to_string())?;
+        popup.set_min_size(Some(min)).map_err(|e| e.to_string())?;
+    }
+
+    if mode == PopupMode::Lamp {
+        // Fixed size, no content to measure — apply it immediately rather than
+        // waiting on a `resize_popup` report the (now-hidden) list layout will
+        // never send.
+        popup.set_size(min).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Restores a persisted popup position at startup (SPEC R-25.2), for a pinned
+/// (and possibly collapsed) popup that was manually positioned before the app
+/// last quit. Best-effort: swallows a missing window rather than failing
+/// startup over a cosmetic restore. Marks the position as user-moved so the
+/// first content-driven resize (R-14.3) grows in place instead of snapping
+/// back to the tray, matching what a live drag would have done.
+pub fn restore_popup_position(app: &AppHandle, pos: crate::settings::PopupPos) {
+    if let Ok(popup) = popup_window(app) {
+        let _ = popup.set_position(LogicalPosition::new(pos.x, pos.y));
+        set_popup_user_moved(true);
+    }
 }
 
 /// Positions the popup near the tray icon and shows/focuses it, or hides it
@@ -325,6 +522,12 @@ pub fn open_popup(app: &AppHandle) -> Result<(), String> {
 /// the `resize_popup` command (R-3.4: logic stays in Rust, the view just
 /// reports a number).
 pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), String> {
+    // R-25.1: a lamp is a fixed-size square; `set_popup_mode` already applied
+    // its exact size, so a stale/late content-height report from the (hidden)
+    // list layout must not fight it.
+    if should_skip_content_resize(popup_mode()) {
+        return Ok(());
+    }
     let popup = popup_window(app)?;
     let target_h = popup_target_height(content_px);
     let scale = popup.scale_factor().map_err(|err| err.to_string())?;
@@ -644,5 +847,95 @@ mod tests {
         assert!(!is_user_initiated_move(&mut pending));
         assert!(!is_user_initiated_move(&mut pending));
         assert!(is_user_initiated_move(&mut pending));
+    }
+
+    // --- SPEC §25 lamp mode ------------------------------------------------
+
+    #[test]
+    fn content_resize_is_skipped_only_in_lamp_mode() {
+        assert!(!should_skip_content_resize(PopupMode::List));
+        assert!(should_skip_content_resize(PopupMode::Lamp));
+    }
+
+    #[test]
+    fn unpin_forces_list_only_when_currently_in_lamp_mode() {
+        // SPEC R-25.2: unpinning while already in list mode is a no-op (there's
+        // nothing to expand); unpinning while collapsed forces list.
+        assert!(
+            !should_force_list_on_unpin(true, PopupMode::Lamp),
+            "still pinned: no-op"
+        );
+        assert!(
+            !should_force_list_on_unpin(false, PopupMode::List),
+            "already list: no-op"
+        );
+        assert!(
+            should_force_list_on_unpin(false, PopupMode::Lamp),
+            "unpinned + lamp: force list"
+        );
+    }
+
+    #[test]
+    fn popup_size_band_lamp_is_a_fixed_56_square() {
+        assert_eq!(
+            popup_size_band(PopupMode::Lamp),
+            ((LAMP_SIZE, LAMP_SIZE), (LAMP_SIZE, LAMP_SIZE))
+        );
+    }
+
+    #[test]
+    fn popup_size_band_list_matches_the_r14_3_band() {
+        assert_eq!(
+            popup_size_band(PopupMode::List),
+            ((POPUP_W, POPUP_MIN_H), (POPUP_W, POPUP_MAX_H))
+        );
+    }
+
+    #[test]
+    fn min_before_max_when_shrinking_to_the_lamp() {
+        // Current max is the list's 360; shrinking to the lamp's 56 must lower
+        // min first (raising max first while min is still 360 would ask for an
+        // invalid transient `min(360) > max(56)`).
+        assert!(min_before_max(POPUP_W, LAMP_SIZE));
+    }
+
+    #[test]
+    fn max_before_min_when_growing_back_to_the_list() {
+        // Current max is the lamp's 56; growing back to the list's 360 must
+        // raise max first (lowering min to 360 first while max is still 56
+        // would ask for the same invalid transient state).
+        assert!(!min_before_max(LAMP_SIZE, POPUP_W));
+    }
+
+    #[test]
+    fn min_before_max_is_safe_on_a_no_op_transition() {
+        // Same mode twice (e.g. a redundant `set_setting` echo): min<=max
+        // either way, so the order genuinely doesn't matter, but the function
+        // must still return a definite answer, not panic.
+        assert!(min_before_max(POPUP_W, POPUP_W));
+    }
+
+    #[test]
+    fn popup_pos_persist_is_debounced_but_always_fires_on_the_first_move() {
+        let t0 = Instant::now();
+        assert!(
+            should_persist_popup_pos(None, t0, POPUP_POS_PERSIST_GAP),
+            "no prior write: always persist"
+        );
+        assert!(
+            !should_persist_popup_pos(Some(t0), t0, POPUP_POS_PERSIST_GAP),
+            "immediately after a write: debounced"
+        );
+        let just_under = t0 + POPUP_POS_PERSIST_GAP - Duration::from_millis(1);
+        assert!(!should_persist_popup_pos(
+            Some(t0),
+            just_under,
+            POPUP_POS_PERSIST_GAP
+        ));
+        let at_gap = t0 + POPUP_POS_PERSIST_GAP;
+        assert!(
+            should_persist_popup_pos(Some(t0), at_gap, POPUP_POS_PERSIST_GAP),
+            "once the gap has fully elapsed, persist again"
+        );
     }
 }

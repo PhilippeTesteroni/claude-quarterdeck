@@ -7,8 +7,9 @@
 //! `~/.claude` is ever touched).
 
 use deck_core::hooks_config::{
-    self, create_backup, install_hooks, merge_hooks, strip_hooks, uninstall_hooks,
-    HooksConfigError, HOOK_EVENTS, HOOK_TIMEOUT_SECS, MARKER, NOTIFICATION_MATCHER,
+    self, create_backup, install_hooks, install_perm_hook, merge_hooks, strip_hooks,
+    uninstall_hooks, uninstall_perm_hook, HooksConfigError, HOOK_EVENTS, HOOK_TIMEOUT_SECS, MARKER,
+    NOTIFICATION_MATCHER, PERM_HOOK_EVENT, PERM_HOOK_TIMEOUT_SECS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -110,7 +111,7 @@ fn install_into_missing_file_creates_all_five_events() {
     let out = install_hooks(&path, CMD).expect("install");
     assert!(out.changed);
     assert_eq!(out.backup, None, "no backup when file did not exist");
-    assert_eq!(out.events_added.len(), 5);
+    assert_eq!(out.events_added.len(), HOOK_EVENTS.len());
 
     let root = read_json(&path);
     for event in HOOK_EVENTS {
@@ -165,7 +166,7 @@ fn install_preserves_foreign_hooks_and_adds_alongside() {
 
     let out = install_hooks(&path, CMD).expect("install");
     assert!(out.changed);
-    assert_eq!(out.events_added.len(), 5);
+    assert_eq!(out.events_added.len(), HOOK_EVENTS.len());
 
     let root = read_json(&path);
 
@@ -272,7 +273,7 @@ fn install_is_idempotent() {
 
     let first = install_hooks(&path, CMD).expect("first");
     assert!(first.changed);
-    assert_eq!(first.events_added.len(), 5);
+    assert_eq!(first.events_added.len(), HOOK_EVENTS.len());
 
     let second = install_hooks(&path, CMD).expect("second");
     assert!(!second.changed, "second install is a no-op");
@@ -324,7 +325,7 @@ fn uninstall_removes_only_ours_preserving_foreign() {
 
     let out = uninstall_hooks(&path, MARKER).expect("uninstall");
     assert!(out.changed);
-    assert_eq!(out.entries_removed, 5, "one per event");
+    assert_eq!(out.entries_removed, HOOK_EVENTS.len(), "one per event");
 
     let root = read_json(&path);
     // our entries gone everywhere
@@ -353,7 +354,7 @@ fn uninstall_prunes_events_that_become_empty() {
 
     let out = uninstall_hooks(&path, MARKER).expect("uninstall");
     assert!(out.changed);
-    assert_eq!(out.entries_removed, 5);
+    assert_eq!(out.entries_removed, HOOK_EVENTS.len());
 
     let root = read_json(&path);
     // hooks object emptied entirely -> removed, restoring a pristine object
@@ -428,7 +429,7 @@ fn merge_hooks_is_value_preserving() {
         "hooks": { "Stop": [ { "hooks": [ { "type": "command", "command": "keep-me" } ] } ] }
     });
     let added = merge_hooks(&mut root, CMD).expect("merge");
-    assert_eq!(added.len(), 5);
+    assert_eq!(added.len(), HOOK_EVENTS.len());
 
     // foreign top-level object untouched
     assert_eq!(root["customTopLevel"]["keep"], json!([1, 2, 3]));
@@ -468,6 +469,87 @@ fn strip_hooks_counts_and_prunes() {
     assert_eq!(root["hooks"]["Stop"].as_array().unwrap().len(), 1);
     // SessionEnd emptied -> pruned
     assert!(root["hooks"].get("SessionEnd").is_none());
+}
+
+// --- opt-in PermissionRequest hook (SPEC §16, R-16.1/R-16.4) ----------------
+
+#[test]
+fn install_perm_hook_adds_a_90s_entry_idempotently() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    // Standard hooks first, then the opt-in perm entry.
+    install_hooks(&path, CMD).expect("install");
+
+    let out = install_perm_hook(&path, CMD).expect("perm install");
+    assert!(out.changed);
+    assert_eq!(out.events_added, vec![PERM_HOOK_EVENT.to_string()]);
+
+    let root = read_json(&path);
+    assert!(has_our_entry(&root, PERM_HOOK_EVENT), "perm entry present");
+    let entry = &event_entries(&root, PERM_HOOK_EVENT)[0];
+    assert_eq!(
+        entry["hooks"][0]["timeout"],
+        json!(PERM_HOOK_TIMEOUT_SECS),
+        "perm hook timeout is 90s"
+    );
+    assert!(
+        entry.get("matcher").is_none(),
+        "no matcher on PermissionRequest"
+    );
+
+    // Idempotent.
+    let again = install_perm_hook(&path, CMD).expect("perm reinstall");
+    assert!(!again.changed, "second perm install is a no-op");
+    assert_eq!(count_our_entries(&read_json(&path), PERM_HOOK_EVENT), 1);
+}
+
+#[test]
+fn uninstall_perm_hook_removes_only_the_perm_entry() {
+    // R-16.4: toggling takeover off removes ONLY PermissionRequest; the five
+    // lifecycle hooks stay.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    install_hooks(&path, CMD).expect("install");
+    install_perm_hook(&path, CMD).expect("perm install");
+
+    let out = uninstall_perm_hook(&path, MARKER).expect("perm uninstall");
+    assert!(out.changed);
+    assert_eq!(out.entries_removed, 1);
+
+    let root = read_json(&path);
+    assert!(
+        root["hooks"].get(PERM_HOOK_EVENT).is_none(),
+        "perm event pruned"
+    );
+    for event in HOOK_EVENTS {
+        assert!(
+            has_our_entry(&root, event),
+            "lifecycle hook {event} survives"
+        );
+    }
+
+    // No-op the second time.
+    let again = uninstall_perm_hook(&path, MARKER).expect("perm uninstall again");
+    assert!(!again.changed);
+}
+
+#[test]
+fn full_uninstall_also_removes_the_perm_entry() {
+    // R-16.4 "Uninstall removes it with the rest."
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    install_hooks(&path, CMD).expect("install");
+    install_perm_hook(&path, CMD).expect("perm install");
+
+    let out = uninstall_hooks(&path, MARKER).expect("uninstall");
+    assert!(out.changed);
+    assert_eq!(
+        out.entries_removed,
+        HOOK_EVENTS.len() + 1,
+        "every lifecycle hook + the perm entry"
+    );
+    let root = read_json(&path);
+    assert!(root.get("hooks").is_none(), "everything ours pruned");
 }
 
 #[test]

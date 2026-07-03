@@ -4,9 +4,9 @@
  * through `ipc-client.ts` commands. No business logic lives here (R-3.4).
  */
 
-import { invoke, onState, usingMock } from './ipc-client';
-import type { AskAnswerKind, AskRow, SessionRow, SessionStatus, SettingsState, StateSnapshot } from './ipc-contract';
-import { footerText, formatDuration, truncate } from './format';
+import { invoke, onState, startDragging, usingMock } from './ipc-client';
+import type { AskAnswerKind, AskRow, PermDecision, PermRow, SessionRow, SessionStatus, SettingsState, StateSnapshot } from './ipc-contract';
+import { footerText, formatAge, formatDuration, truncate, worstStatus } from './format';
 import { clear, h } from './dom';
 import { installMockScenarioSwitcher } from './mock-switcher';
 
@@ -16,6 +16,11 @@ const elFooter = document.getElementById('qd-footer') as HTMLElement;
 const elSettings = document.getElementById('qd-settings') as HTMLElement;
 const elGear = document.getElementById('qd-gear') as HTMLButtonElement;
 const elPin = document.getElementById('qd-pin') as HTMLButtonElement;
+const elCollapse = document.getElementById('qd-collapse') as HTMLButtonElement;
+const elApp = document.getElementById('app') as HTMLElement;
+const elLamp = document.getElementById('qd-lamp') as HTMLButtonElement;
+const elLampDot = document.getElementById('qd-lamp-dot') as HTMLElement;
+const elLampBadge = document.getElementById('qd-lamp-badge') as HTMLElement;
 
 let latest: StateSnapshot | null = null;
 let receivedAtPerf = 0;
@@ -28,9 +33,10 @@ let uninstallBusy = false;
  * pair only highlights after this session's explicit click (R-10.2). */
 let lastLaunchChoice: boolean | null = null;
 
-// (session row time element, base sinceMs at time of snapshot) — updated by the
-// 1s ticker below without touching the rest of the DOM (keeps focus/menus).
-let timeTicks: Array<{ el: HTMLElement; base: number }> = [];
+// (session row time element, base sinceMs at time of snapshot, and the `~`
+// estimate prefix, R-22.4) — updated by the 1s ticker below without touching
+// the rest of the DOM (keeps focus/menus).
+let timeTicks: Array<{ el: HTMLElement; base: number; prefix: string }> = [];
 
 const WATCHLINE_ORDER: SessionStatus[] = ['attention', 'working', 'idle', 'dead'];
 const watchlineSegs = new Map<string, HTMLElement>();
@@ -158,15 +164,70 @@ function focusTerminal(sessionId: string): void {
   });
 }
 
-function renderSessionRow(row: SessionRow): HTMLElement {
-  const timeEl = h('span', { className: 'qd-row-time mono' }, [formatDuration(row.sinceMs)]);
-  timeTicks.push({ el: timeEl, base: row.sinceMs });
+function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
+  // R-22.4: a seeded (estimated) time renders with the inferred `~` convention
+  // (e.g. `~12m 40s`) until an exact hook event arrives (R-22.2 clears it).
+  const timePrefix = row.inferred ? '~' : '';
+  const timeEl = h('span', { className: `qd-row-time mono${row.inferred ? ' estimated' : ''}` }, [
+    timePrefix + formatDuration(row.sinceMs),
+  ]);
+  timeTicks.push({ el: timeEl, base: row.sinceMs, prefix: timePrefix });
+
+  // R-22.3: the tooltip shows total session age alongside the cwd when known.
+  let tooltip = row.ageMs != null ? `${row.cwd}\nsession ${formatAge(row.ageMs)}` : row.cwd;
+
+  // R-23.4: a second line under the time — `ctx {pct}% · {spend}`, mono/muted,
+  // amber ≥75% and red ≥90% context fill (with a "nearly full" tooltip line).
+  const ctx = showTokens ? row.ctxPercent : undefined;
+  const spend = showTokens ? row.spend : undefined;
+  let usageEl: HTMLElement | null = null;
+  if (ctx != null || (spend != null && spend !== '')) {
+    const parts: HTMLElement[] = [];
+    if (ctx != null) {
+      const level = ctx >= 90 ? ' crit' : ctx >= 75 ? ' warn' : '';
+      parts.push(h('span', { className: `qd-row-ctx${level}` }, [`ctx ${ctx}%`]));
+    }
+    if (spend != null && spend !== '') {
+      const prefix = row.spendApprox ? '≥' : '';
+      parts.push(h('span', { className: 'qd-row-spend' }, [`${prefix}${spend}`]));
+    }
+    // Join the parts with a middot separator.
+    const joined: Array<HTMLElement | string> = [];
+    parts.forEach((p, i) => {
+      if (i > 0) joined.push(' · ');
+      joined.push(p);
+    });
+    usageEl = h('span', { className: 'qd-row-usage mono' }, joined);
+    if (ctx != null && ctx >= 90) {
+      tooltip += '\ncontext nearly full — consider /compact or a fresh session';
+    }
+  }
+
+  // R-21.2 / R-23.3: a compact `⛭ N` badge while background subagents are
+  // running, with the combined subagent spend appended (`⛭ 3 · 2.1M`) when known.
+  const subagents = row.subagents ?? 0;
+  const subagentSpend = showTokens ? row.subagentSpend : undefined;
+  const badgeText =
+    subagentSpend != null && subagentSpend !== ''
+      ? `⛭ ${subagents} · ${subagentSpend}`
+      : `⛭ ${subagents}`;
+  const badge =
+    subagents > 0
+      ? h(
+          'span',
+          {
+            className: 'qd-row-subagents mono',
+            title: `${subagents} background ${subagents === 1 ? 'subagent' : 'subagents'} running`,
+          },
+          [badgeText],
+        )
+      : null;
 
   const el = h(
     'div',
     {
       className: 'qd-row',
-      title: row.cwd,
+      title: tooltip,
       // SPEC R-15.4: a row click focuses the terminal window hosting the
       // session (the former row-click no-op is gone).
       onclick: () => focusTerminal(row.id),
@@ -180,11 +241,12 @@ function renderSessionRow(row: SessionRow): HTMLElement {
       statusDot(row.status),
       h('div', { className: 'qd-row-main' }, [
         h('span', { className: 'qd-row-project' }, [row.project]),
-        row.inferred ? h('span', { className: 'qd-row-inferred', title: 'Inferred from a cold-start scan' }, ['~']) : null,
         h('span', { className: 'qd-row-title' }, [row.title]),
         row.branch ? h('span', { className: 'qd-row-branch mono' }, [row.branch]) : null,
+        badge,
       ]),
-      timeEl,
+      // R-23.4: the right block is a vertical stack (time on top, usage below).
+      h('div', { className: 'qd-row-right' }, [timeEl, usageEl]),
     ],
   );
   return el;
@@ -272,6 +334,8 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
       h('span', { style: 'color:var(--muted)' }, ['asks:']),
     ]),
     h('div', { className: 'qd-ask-row-question' }, [ask.question]),
+    // R-19.1: optional muted rationale under the question.
+    ...(ask.detail ? [h('div', { className: 'qd-ask-row-detail' }, [ask.detail])] : []),
     h('div', { className: 'qd-ask-row-actions' }, [
       ...options,
       input,
@@ -285,6 +349,33 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
         },
         ['Dismiss'],
       ),
+    ]),
+  ]);
+}
+
+/** SPEC §16 (R-16.2): a pending permission request mirrored as an amber row in
+ * the popup, with Allow / Deny / In terminal. Clicking the row (off a button)
+ * re-surfaces the ask window, same as the ask mirror. */
+const answeredPerms = new Set<string>();
+function renderPermMirrorRow(perm: PermRow): HTMLElement {
+  const decide = (decision: PermDecision): void => {
+    if (answeredPerms.has(perm.id)) return;
+    answeredPerms.add(perm.id);
+    void invoke('answer_perm', { permId: perm.id, decision }).catch(() => {
+      answeredPerms.delete(perm.id);
+    });
+  };
+  const agent = perm.project ?? (perm.context ? `Unknown agent (${truncate(perm.context, 32)})` : 'Unknown agent');
+  return h('div', { className: 'qd-ask-row qd-perm-row', onclick: reopenAskWindowUnlessInteractive }, [
+    h('div', { className: 'qd-ask-row-head' }, [
+      h('span', { className: 'qd-ask-row-agent' }, [agent]),
+      h('span', { style: 'color:var(--muted)' }, ['requests permission']),
+    ]),
+    h('div', { className: 'qd-ask-row-question qd-perm-row-tool' }, [`Run ${perm.toolName}?`]),
+    h('div', { className: 'qd-ask-row-actions' }, [
+      h('button', { className: 'qd-btn qd-btn-primary qd-perm-row-allow', type: 'button', onclick: () => decide('allow') }, ['Allow']),
+      h('button', { className: 'qd-btn qd-perm-row-deny', type: 'button', onclick: () => decide('deny') }, ['Deny']),
+      h('button', { className: 'qd-btn qd-ask-row-dismiss', type: 'button', title: 'Answer in the terminal instead', onclick: () => decide('defer') }, ['In terminal']),
     ]),
   ]);
 }
@@ -393,6 +484,21 @@ function renderOnboarding(settings: SettingsState, hooksInstalled: boolean): HTM
       h('span', { className: 'qd-onboarding-step-label' }, ['Let agents ask you questions (MCP)']),
       onboardingStepButton(settings.mcpEnabled ? 'Enabled' : 'Enable agent questions', () => void invoke('set_setting', { key: 'mcpEnabled', value: true }), settings.mcpEnabled, settings.mcpEnabled),
     ]),
+    // SPEC R-16.4 / R-25.4: default-on consent line for taking over Claude Code
+    // permission prompts into the deck (Allow/Deny without alt-tabbing).
+    h('div', { className: 'qd-onboarding-step qd-onboarding-takeover' }, [
+      h('span', { className: 'qd-onboarding-step-label' }, ['Take over permission prompts (Allow/Deny from the deck)']),
+      onboardingStepButton(
+        settings.takeoverPermissions ? 'On' : 'Off',
+        () => void invoke('set_setting', { key: 'takeoverPermissions', value: !settings.takeoverPermissions }),
+        settings.takeoverPermissions,
+      ),
+    ]),
+    h('p', { className: 'qd-onboarding-hint' }, [
+      'Claude Code will ask permission here instead of blocking the terminal — you can still answer “In terminal” any time.',
+    ]),
+    // R-25.4 closing tip line.
+    h('p', { className: 'qd-onboarding-tip' }, ['Pin the window (📌) and click ◱ to shrink it to a traffic light.']),
     h('div', { className: 'qd-onboarding-footer' }, [
       h('button', { className: 'qd-btn qd-btn-primary', type: 'button', onclick: finish }, ['Continue']),
     ]),
@@ -411,6 +517,24 @@ function renderPinState(pinned: boolean): void {
   elPin.classList.toggle('pinned', pinned);
   elPin.setAttribute('aria-pressed', String(pinned));
   elPin.title = pinned ? 'Unpin' : 'Pin on top';
+}
+
+/** SPEC R-25.2: the collapse-to-lamp button only shows while pinned (lamp mode
+ * is only reachable from a pinned popup). */
+function renderCollapseVisibility(pinned: boolean): void {
+  elCollapse.hidden = !pinned;
+}
+
+/** SPEC R-25.1/R-25.3: renders the lamp — worst-of aggregate color (mirrors
+ * the tray icon, R-2.6), an attention-count badge when > 0, and a hover
+ * tooltip carrying the same counts line as the popup footer. */
+function renderLamp(snap: StateSnapshot): void {
+  elLampDot.setAttribute('data-status', worstStatus(snap.counts));
+  const attention = snap.counts.attention;
+  elLampBadge.hidden = attention <= 0;
+  elLampBadge.textContent = attention > 0 ? String(attention) : '';
+  const tip = footerText(snap.counts);
+  elLamp.title = tip.length > 0 ? tip : 'No sessions';
 }
 
 /** In-progress state of a mirrored ask-row free-text field, captured before a
@@ -465,8 +589,9 @@ function renderContent(snap: StateSnapshot): void {
   clear(elContent);
   timeTicks = [];
   const settings = snap.settings;
+  const perms = snap.perms ?? [];
   const onboardingActive = settings ? settings.onboardingDone === false : false;
-  const hasRows = snap.sessions.length > 0 || snap.asks.length > 0;
+  const hasRows = snap.sessions.length > 0 || snap.asks.length > 0 || perms.length > 0;
 
   // R-10.2: the one-time first-run onboarding card must NOT coexist with a
   // populated session list. Hooks install into the shared, machine-wide
@@ -503,13 +628,21 @@ function renderContent(snap: StateSnapshot): void {
   elFooter.style.display = '';
 
   const rows = h('div', { className: 'qd-rows' }, []);
+  // R-16.2: perms mirror above asks (they block a terminal; asks queue behind).
+  for (const perm of perms) {
+    rows.append(renderPermMirrorRow(perm));
+  }
   for (const ask of snap.asks) {
     rows.append(renderAskMirrorRow(ask));
   }
+  // R-23.5/R-23.6: token usage renders only when `showTokenStats` is on (the
+  // backend also omits the fields when off; gating here too keeps the toggle
+  // authoritative even against a stale row that still carries them).
+  const showTokens = settings?.showTokenStats !== false;
   // R-3.4/R-7.3: `snap.sessions` already arrives in the engine's canonical
   // R-7.3 order (`SessionStore::view`); render it as-is, never re-sort here.
   for (const row of snap.sessions) {
-    rows.append(renderSessionRow(row));
+    rows.append(renderSessionRow(row, showTokens));
   }
   elContent.append(rows);
   restoreAskInputs(preservedAsks);
@@ -521,7 +654,13 @@ function renderFooter(counts: StateSnapshot['counts']): void {
 }
 
 /** Keys of the boolean settings driven by a `toggleControl`. */
-type ToggleKey = 'notifyIdle' | 'notifyAttention' | 'notifyReminder' | 'launchAtLogin';
+type ToggleKey =
+  | 'notifyIdle'
+  | 'notifyAttention'
+  | 'notifyReminder'
+  | 'launchAtLogin'
+  | 'takeoverPermissions'
+  | 'showTokenStats';
 
 /** Optimistic per-toggle state while the user's clicks are outrunning the
  * backend. `value` is the latest value the user's clicks asked for; `inFlight`
@@ -600,6 +739,9 @@ function renderSettings(snap: StateSnapshot): void {
       launchAtLogin: false,
       onboardingDone: true,
       popupPinned: false,
+      takeoverPermissions: true,
+      showTokenStats: true,
+      popupMode: 'list',
       mcpEnabled: false,
       mcpCliAvailable: true,
       dataDir: '',
@@ -637,6 +779,17 @@ function renderSettings(snap: StateSnapshot): void {
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['General']),
         toggleControl('launchAtLogin', 'Launch Quarterdeck at login', settings.launchAtLogin),
+        // SPEC R-23.5: the token-stats toggle (default on).
+        toggleControl('showTokenStats', 'Show token usage on rows', settings.showTokenStats),
+      ]),
+      h('div', { className: 'qd-settings-section' }, [
+        h('p', { className: 'qd-settings-section-title' }, ['Permissions']),
+        h(
+          'p',
+          { className: 'qd-empty-health', style: 'color:var(--muted);margin:0 0 8px' },
+          ['Show Claude Code permission prompts here so you can Allow or Deny without switching to the terminal.'],
+        ),
+        toggleControl('takeoverPermissions', 'Take over permission prompts', settings.takeoverPermissions),
       ]),
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['Hooks']),
@@ -691,11 +844,33 @@ function renderSettings(snap: StateSnapshot): void {
 
 function renderAll(): void {
   if (!latest) return;
+
+  // R-25.3 "Blur/Esc never hide the lamp": the injected Esc-hide script in
+  // `windows.rs` (a plain string, no Rust state to read from) checks this
+  // global mirror before hiding — the actual mode decision still lives in
+  // Rust (R-3.4); this is only a display echo of it.
+  const popupMode = latest.settings?.popupMode ?? 'list';
+  (window as unknown as { __qdPopupMode?: string }).__qdPopupMode = popupMode;
+
+  const lampMode = popupMode === 'lamp';
+  elApp.classList.toggle('qd-app-lamp', lampMode);
+  if (lampMode) {
+    // The gear is hidden in lamp mode (no way to reach settings) — make sure a
+    // pane left open from before collapsing doesn't render on top of it.
+    if (settingsOpen) {
+      settingsOpen = false;
+      elSettings.classList.remove('open');
+    }
+    renderLamp(latest);
+    return; // R-25.1: a fixed-size square has nothing else to lay out/measure.
+  }
+
   renderWatchline(latest.counts);
   renderContent(latest);
   renderFooter(latest.counts);
   renderGearIssue(latest.hooksInstalled);
   renderPinState(latest.settings?.popupPinned ?? false);
+  renderCollapseVisibility(latest.settings?.popupPinned ?? false);
   if (settingsOpen) renderSettings(latest);
   syncPopupHeight();
 }
@@ -758,6 +933,91 @@ elPin.addEventListener('click', () => {
   void invoke('set_setting', { key: 'popupPinned', value: next });
 });
 
+// SPEC R-25.2: collapse to the lamp (only visible while pinned).
+elCollapse.addEventListener('click', () => {
+  void invoke('set_setting', { key: 'popupMode', value: 'lamp' });
+});
+
+function expandFromLamp(): void {
+  void invoke('set_setting', { key: 'popupMode', value: 'list' });
+}
+
+function unpinFromLamp(): void {
+  void invoke('set_setting', { key: 'popupPinned', value: false });
+}
+
+/** Pixels of pointer movement before a press-and-move on the lamp counts as a
+ * drag rather than a click (SPEC R-25.1 "drag vs click discrimination"). */
+const LAMP_DRAG_THRESHOLD_PX = 4;
+
+// SPEC R-25.1: the lamp is a single clickable element (a real <button>, so
+// Tauri's own `data-tauri-drag-region` mousedown handler never fires on it —
+// see the `startDragging` doc in `ipc-client.ts`). A plain click (no
+// meaningful movement) expands back to the list (R-25.2); movement past the
+// threshold starts a native window drag instead, covering "drag anywhere".
+elLamp.addEventListener('pointerdown', (ev: PointerEvent) => {
+  if (ev.button !== 0) return;
+  const startX = ev.clientX;
+  const startY = ev.clientY;
+  let dragging = false;
+  const onMove = (mv: PointerEvent): void => {
+    if (dragging) return;
+    if (Math.hypot(mv.clientX - startX, mv.clientY - startY) > LAMP_DRAG_THRESHOLD_PX) {
+      dragging = true;
+      cleanup();
+      startDragging();
+    }
+  };
+  const onUp = (): void => {
+    cleanup();
+    if (!dragging) expandFromLamp();
+  };
+  const cleanup = (): void => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+});
+
+// SPEC R-25.2 "unpin-from-lamp path": the header (and its pin button) is
+// hidden while collapsed, so a right-click menu is the way back out without
+// first expanding.
+elLamp.addEventListener('contextmenu', (ev: MouseEvent) => {
+  ev.preventDefault();
+  closeCtxMenu();
+  const menu = h('div', { className: 'qd-ctx-menu', style: `left:${ev.clientX}px;top:${ev.clientY}px` }, [
+    h(
+      'button',
+      {
+        className: 'qd-ctx-item',
+        type: 'button',
+        onclick: (e: Event) => {
+          e.stopPropagation();
+          unpinFromLamp();
+          closeCtxMenu();
+        },
+      },
+      ['Unpin'],
+    ),
+    h(
+      'button',
+      {
+        className: 'qd-ctx-item',
+        type: 'button',
+        onclick: (e: Event) => {
+          e.stopPropagation();
+          expandFromLamp();
+          closeCtxMenu();
+        },
+      },
+      ['Expand to list'],
+    ),
+  ]);
+  document.body.append(menu);
+  ctxMenuEl = menu;
+});
+
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
     if (settingsOpen) {
@@ -780,7 +1040,7 @@ setInterval(() => {
   if (ctxMenuEl) return; // don't yank a right-click menu out from under the user
   const elapsed = performance.now() - receivedAtPerf;
   for (const tick of timeTicks) {
-    tick.el.textContent = formatDuration(tick.base + elapsed);
+    tick.el.textContent = tick.prefix + formatDuration(tick.base + elapsed);
   }
 }, 1000);
 

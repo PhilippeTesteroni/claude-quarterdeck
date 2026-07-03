@@ -28,6 +28,31 @@ pub struct SessionRow {
     /// Milliseconds spent in the current status.
     pub since_ms: u64,
     pub cwd: String,
+    /// Active background subagents (SPEC R-21.2): the row shows a `⛭ N` badge
+    /// while > 0. Defaulted so an older snapshot without the field deserializes.
+    #[serde(default)]
+    pub subagents: u32,
+    /// Total session age in ms when an anchor is known (SPEC R-22.3): shown in
+    /// the row tooltip as "session 2h 14m". Omitted when unknown.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub age_ms: Option<u64>,
+    /// Context fill percent (SPEC R-23.2a/R-23.4): the row's second line shows
+    /// `ctx {ctxPercent}% · …`, amber ≥75, red ≥90. Omitted until a usage
+    /// record has been read (or when `showTokenStats` is off).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ctx_percent: Option<u32>,
+    /// Session spend, compact (SPEC R-23.2b/R-23.4): the `· {spend}` half of the
+    /// row's second line (e.g. `1.4M`). Omitted when zero/unavailable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub spend: Option<String>,
+    /// True when `spend` is a lower bound after a truncation/overflow rescan
+    /// (SPEC R-23.1) — the UI renders it as "≥".
+    #[serde(default)]
+    pub spend_approx: bool,
+    /// Combined subagent/sidechain spend, compact (SPEC R-23.3): the `· {spend}`
+    /// suffix on the `⛭ N` badge (`⛭ 3 · 2.1M`). Omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subagent_spend: Option<String>,
 }
 
 /// Session status (SPEC §2). Serializes lowercase to match the TS union.
@@ -52,7 +77,12 @@ pub struct AskRow {
     pub question: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub options: Option<Vec<String>>,
-    /// Epoch milliseconds when the ask times out, if a timeout was set.
+    /// Long rationale/body (R-19.1), rendered muted under the question. Absent
+    /// for asks that carried no `detail`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub detail: Option<String>,
+    /// Epoch milliseconds when the ask times out, if a timeout was set. Absent
+    /// for persistent asks (R-19.2) — the UI then shows no countdown.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub timeout_at: Option<u64>,
     /// The raw `context` (agent cwd) the MCP call carried, needed verbatim for
@@ -66,6 +96,40 @@ pub struct AskRow {
     /// expired with only a Dismiss action.
     #[serde(default)]
     pub orphaned: bool,
+    /// Epoch ms the ask was enqueued (arrival time). The shared ask/perm FIFO
+    /// (R-16.2): the ask window's primary slot goes to whichever of the front
+    /// ask / front perm has the smaller `queued_at`. Defaulted so an older
+    /// snapshot without the field still deserializes.
+    #[serde(default)]
+    pub queued_at: u64,
+}
+
+/// A pending permission request mirrored into the UI (SPEC §16, R-16.2). Shares
+/// the always-on-top ask window with [`AskRow`] but renders distinctly (amber)
+/// with Allow / Deny / In terminal actions. Mirror of `PermRow` in
+/// `ui/src/ipc-contract.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermRow {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project: Option<String>,
+    /// The tool Claude Code is asking permission to run (e.g. `Bash`), sanitized.
+    pub tool_name: String,
+    /// Compact pretty-printed tool input, sanitized (bidi-stripped) and capped
+    /// (R-16.1 2KB / R-16.5), rendered verbatim under the tool name.
+    pub tool_input: String,
+    /// Raw calling context (agent cwd) for an unmatched perm, shown verbatim
+    /// like the unmatched-ask label. Present only when unmatched.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub context: Option<String>,
+    /// Epoch ms the perm arrived — its position in the shared ask/perm FIFO
+    /// (R-16.2). Compared against a front ask's `queued_at`. Defaulted so an
+    /// older snapshot without the field still deserializes.
+    #[serde(default)]
+    pub queued_at: u64,
 }
 
 /// Per-status session counts shown in the footer.
@@ -92,6 +156,17 @@ pub struct SettingsState {
     /// Popup pin-on-top state (SPEC R-14.2), mirrored so the header pin
     /// toggle renders its persisted state on load.
     pub popup_pinned: bool,
+    /// Take over permission prompts (SPEC R-16.4), mirrored so the settings
+    /// toggle + onboarding consent line render their persisted state.
+    pub takeover_permissions: bool,
+    /// Show per-session token usage on rows (SPEC R-23.5), mirrored so the
+    /// settings toggle renders its persisted state and the UI can hide the row
+    /// usage line when off.
+    pub show_token_stats: bool,
+    /// Popup display mode (SPEC §25, R-25.2): `list` or `lamp`. Drives whether
+    /// the popup renders the full list or the compact traffic-light square, and
+    /// whether the header's collapse button / pin icon reflect lamp state.
+    pub popup_mode: crate::settings::PopupMode,
     /// Agent-questions (MCP) enabled, R-8.6.
     pub mcp_enabled: bool,
     /// R-8.6: whether the `claude` CLI is on PATH. When false, the settings pane
@@ -112,6 +187,11 @@ pub struct SettingsState {
 pub struct StateSnapshot {
     pub sessions: Vec<SessionRow>,
     pub asks: Vec<AskRow>,
+    /// Pending permission requests (SPEC §16), rendered in the same window as
+    /// asks. Defaulted so an older backend/test snapshot without the field still
+    /// deserializes.
+    #[serde(default)]
+    pub perms: Vec<PermRow>,
     pub hooks_installed: bool,
     pub counts: Counts,
     /// Populated by T7 composition; omitted only by an unwired backend, in which
@@ -128,6 +208,21 @@ pub enum AskAnswerKind {
     Text,
     Timeout,
     Dismissed,
+    /// R-19.5: the ask was cancelled by a `cancel_ask` tool call (from a
+    /// parallel tool call / another session) before the user answered.
+    Cancelled,
+}
+
+/// The deck-side decision for a pending permission request (SPEC §16, R-16.2).
+/// Serializes lowercase to match the TS union and the perm-answer file the hook
+/// polls. `Defer` = "In terminal" / R-16.3 auto-defer: no decision, the hook
+/// exits silently so the normal terminal dialog appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermDecision {
+    Allow,
+    Deny,
+    Defer,
 }
 
 /// The value carried by the `set_setting` command (TS union `boolean |
@@ -247,6 +342,54 @@ pub fn write_answer_file(
     let json = serde_json::to_vec_pretty(&record).map_err(|err| err.to_string())?;
     crate::settings::atomic_write(&dir.join(format!("{stem}.json")), &json)
         .map_err(|err| err.to_string())
+}
+
+/// Removes a pending perm by id once its decision has been persisted to disk.
+pub fn apply_remove_perm(state: &mut StateSnapshot, perm_id: &str) {
+    state.perms.retain(|perm| perm.id != perm_id);
+}
+
+/// The on-disk shape of a perm decision (SPEC R-16.1): the blocked
+/// `PermissionRequest` hook polls `<data>/perm-answers/<id>.json` for this.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PermAnswerRecord<'a> {
+    decision: PermDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+    answered_at_ms: u64,
+}
+
+/// Persists a perm decision to `<dir>/<permId>.json` atomically (SPEC R-16.1)
+/// for the blocked `PermissionRequest` hook to poll.
+pub fn write_perm_answer_file(
+    dir: &std::path::Path,
+    perm_id: &str,
+    decision: PermDecision,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let stem = safe_file_stem(perm_id)?;
+    let record = PermAnswerRecord {
+        decision,
+        reason: reason.map(str::trim).filter(|r| !r.is_empty()),
+        answered_at_ms: now_ms(),
+    };
+    let json = serde_json::to_vec_pretty(&record).map_err(|err| err.to_string())?;
+    crate::settings::atomic_write(&dir.join(format!("{stem}.json")), &json)
+        .map_err(|err| err.to_string())
+}
+
+/// Answers a pending permission request (`answer_perm` command, SPEC §16): the
+/// decision is persisted for the blocked hook to poll, and the deck-side state
+/// (pending-perm attention override, mirrored rows, ask window) is updated.
+#[tauri::command]
+pub fn answer_perm(
+    app: tauri::AppHandle,
+    perm_id: String,
+    decision: PermDecision,
+    reason: Option<String>,
+) -> Result<(), String> {
+    crate::answer_perm_command(&app, &perm_id, decision, reason.as_deref())
 }
 
 /// Returns the current snapshot (`get_state` command — also used by the
@@ -381,6 +524,12 @@ mod tests {
             inferred: false,
             since_ms: 0,
             cwd: "C:/repo".to_string(),
+            subagents: 0,
+            age_ms: None,
+            ctx_percent: None,
+            spend: None,
+            spend_approx: false,
+            subagent_spend: None,
         }
     }
 
@@ -441,9 +590,11 @@ mod tests {
                     project: None,
                     question: "Proceed?".to_string(),
                     options: None,
+                    detail: None,
                     timeout_at: None,
                     context: None,
                     orphaned: false,
+                    queued_at: 0,
                 },
                 AskRow {
                     id: "ask-2".to_string(),
@@ -451,9 +602,11 @@ mod tests {
                     project: None,
                     question: "Also proceed?".to_string(),
                     options: None,
+                    detail: None,
                     timeout_at: None,
                     context: None,
                     orphaned: false,
+                    queued_at: 0,
                 },
             ],
             ..Default::default()
@@ -516,6 +669,109 @@ mod tests {
     }
 
     #[test]
+    fn perm_decision_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&PermDecision::Allow).unwrap(),
+            "\"allow\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermDecision::Deny).unwrap(),
+            "\"deny\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermDecision::Defer).unwrap(),
+            "\"defer\""
+        );
+        // The command arg is deserialized from the TS union.
+        let d: PermDecision = serde_json::from_str("\"deny\"").unwrap();
+        assert_eq!(d, PermDecision::Deny);
+    }
+
+    #[test]
+    fn write_perm_answer_file_persists_decision_and_reason() {
+        // SPEC R-16.1: the hook polls this file. Deny carries the optional reason;
+        // an empty/whitespace reason is dropped so the hook emits a bare deny.
+        let dir = std::env::temp_dir().join(format!(
+            "quarterdeck-perm-answer-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_perm_answer_file(&dir, "perm-1", PermDecision::Deny, Some("too risky")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("perm-1.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["decision"], "deny");
+        assert_eq!(v["reason"], "too risky");
+        assert!(v["answeredAtMs"].as_u64().unwrap() > 0);
+
+        write_perm_answer_file(&dir, "perm-2", PermDecision::Allow, Some("   ")).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("perm-2.json")).unwrap())
+                .unwrap();
+        assert_eq!(v2["decision"], "allow");
+        assert!(v2.get("reason").is_none(), "blank reason omitted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_perm_answer_file_rejects_unsafe_ids() {
+        let dir = std::env::temp_dir().join("quarterdeck-perm-answer-unsafe");
+        assert!(write_perm_answer_file(&dir, "../escape", PermDecision::Defer, None).is_err());
+    }
+
+    #[test]
+    fn apply_remove_perm_drops_the_matching_perm() {
+        let mut state = StateSnapshot {
+            perms: vec![
+                PermRow {
+                    id: "p1".to_string(),
+                    session_id: Some("s1".to_string()),
+                    project: Some("quarterdeck".to_string()),
+                    tool_name: "Bash".to_string(),
+                    tool_input: "{}".to_string(),
+                    context: None,
+                    queued_at: 0,
+                },
+                PermRow {
+                    id: "p2".to_string(),
+                    session_id: None,
+                    project: None,
+                    tool_name: "Write".to_string(),
+                    tool_input: "{}".to_string(),
+                    context: Some("C:/x".to_string()),
+                    queued_at: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        apply_remove_perm(&mut state, "p1");
+        assert_eq!(state.perms.len(), 1);
+        assert_eq!(state.perms[0].id, "p2");
+    }
+
+    #[test]
+    fn perm_row_serializes_with_contract_field_names() {
+        // Guards the wire shape against `ui/src/ipc-contract.ts` PermRow drift.
+        let perm = PermRow {
+            id: "p1".to_string(),
+            session_id: Some("s1".to_string()),
+            project: Some("quarterdeck".to_string()),
+            tool_name: "Bash".to_string(),
+            tool_input: "{\"command\":\"ls\"}".to_string(),
+            context: None,
+            queued_at: 0,
+        };
+        let v = serde_json::to_value(&perm).unwrap();
+        assert_eq!(v["toolName"], "Bash");
+        assert_eq!(v["toolInput"], "{\"command\":\"ls\"}");
+        assert_eq!(v["sessionId"], "s1");
+        assert!(v.get("context").is_none(), "None context omitted");
+    }
+
+    #[test]
     fn write_answer_file_rejects_unsafe_ids() {
         let dir = std::env::temp_dir().join("quarterdeck-ipc-test-answers-unsafe");
         assert!(write_answer_file(&dir, "../escape", "x", AskAnswerKind::Text).is_err());
@@ -532,6 +788,9 @@ mod tests {
             launch_at_login: false,
             onboarding_done: true,
             popup_pinned: true,
+            takeover_permissions: true,
+            show_token_stats: true,
+            popup_mode: crate::settings::PopupMode::List,
             mcp_enabled: false,
             mcp_cli_available: true,
             mcp_command: None,
@@ -540,6 +799,30 @@ mod tests {
         };
         let value = serde_json::to_value(&settings).unwrap();
         assert_eq!(value["popupPinned"], true);
+    }
+
+    /// SPEC R-25.2: `popupMode` mirrors as a lowercase string matching the TS
+    /// union (`'list' | 'lamp'`) in `ui/src/ipc-contract.ts`.
+    #[test]
+    fn settings_state_serializes_popup_mode_as_lowercase_string() {
+        let settings = SettingsState {
+            notify_idle: true,
+            notify_attention: true,
+            notify_reminder: false,
+            launch_at_login: false,
+            onboarding_done: true,
+            popup_pinned: true,
+            takeover_permissions: true,
+            show_token_stats: true,
+            popup_mode: crate::settings::PopupMode::Lamp,
+            mcp_enabled: false,
+            mcp_cli_available: true,
+            mcp_command: None,
+            data_dir: "C:/data".to_string(),
+            version: "0.1.0".to_string(),
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["popupMode"], "lamp");
     }
 
     /// Guards the wire shape against accidental drift from

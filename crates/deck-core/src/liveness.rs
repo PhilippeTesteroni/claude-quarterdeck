@@ -19,13 +19,21 @@ pub struct LivenessInput {
     pub claude_pid: Option<u32>,
     /// Last-modified time of the session transcript, epoch millis, if known.
     pub transcript_mtime_ms: Option<u64>,
+    /// Live-registry `updatedAt` (epoch ms) for a registry-known session
+    /// (R-15.3), when present. A registry-discovered row can be PID-less AND
+    /// carry no transcript yet; the registry file's freshness is then the only
+    /// activity signal, so it must count for the R-6.2 staleness window instead
+    /// of the row being declared dead on the very next tick.
+    pub registry_updated_at_ms: Option<u64>,
 }
 
 /// Decide whether a session is dead.
 ///
 /// * With a PID (R-6.1): dead iff no live process has that PID, or its name no
 ///   longer matches `claude|node|bun` (PID reuse guard).
-/// * Without a PID (R-6.2): dead iff the transcript is stale > 6 h (or absent).
+/// * Without a PID (R-6.2 / R-15.3): dead iff the freshest activity signal —
+///   the transcript mtime and/or the live-registry `updatedAt` — is stale > 6 h,
+///   or no signal exists at all.
 #[must_use]
 pub fn is_dead(input: &LivenessInput, procs: &impl ProcessTable, now_ms: u64) -> bool {
     match input.claude_pid {
@@ -33,10 +41,24 @@ pub fn is_dead(input: &LivenessInput, procs: &impl ProcessTable, now_ms: u64) ->
             Some(name) => !is_claude_process(&name),
             None => true,
         },
-        None => match input.transcript_mtime_ms {
-            Some(mtime) => now_ms.saturating_sub(mtime) > LIVENESS_STALE_MS,
-            None => true,
-        },
+        None => {
+            // R-6.2 / R-15.3: a PID-less session stays alive while *some*
+            // activity signal is fresh. A registry-discovered row (R-15.3) may
+            // have no transcript yet — its registry `updatedAt` is the liveness
+            // anchor (the registry is re-polled every 10 s, and once the entry
+            // vanishes the shell clears this back to `None`, so the row then
+            // falls through to dead). Take the most recent of the two signals;
+            // dead iff that is stale > 6 h, or neither exists.
+            let freshest = input
+                .transcript_mtime_ms
+                .into_iter()
+                .chain(input.registry_updated_at_ms)
+                .max();
+            match freshest {
+                Some(activity) => now_ms.saturating_sub(activity) > LIVENESS_STALE_MS,
+                None => true,
+            }
+        }
     }
 }
 

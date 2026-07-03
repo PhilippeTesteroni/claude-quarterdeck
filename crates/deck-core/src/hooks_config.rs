@@ -31,14 +31,18 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The five Claude Code hook events Quarterdeck subscribes to (SPEC §4,
+/// The Claude Code hook events Quarterdeck subscribes to (SPEC §4, §21,
 /// `docs/hooks-facts.md`). Order is the natural session lifecycle; it is also
-/// the order entries are appended in a freshly created config.
-pub const HOOK_EVENTS: [&str; 5] = [
+/// the order entries are appended in a freshly created config. `SubagentStart`/
+/// `SubagentStop` (R-21.2) drive the per-session subagent badge; like the other
+/// lifecycle hooks they take no matcher and the standard 10 s timeout.
+pub const HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
     "Notification",
     "Stop",
+    "SubagentStart",
+    "SubagentStop",
     "SessionEnd",
 ];
 
@@ -48,6 +52,18 @@ pub const NOTIFICATION_MATCHER: &str = "permission_prompt|idle_prompt|elicitatio
 
 /// Per-hook timeout in seconds written into every entry (R-4.1).
 pub const HOOK_TIMEOUT_SECS: u64 = 10;
+
+/// The optional `PermissionRequest` hook event (SPEC §16, R-16.1). Installed
+/// only when the `takeoverPermissions` setting is on; its script polls for a
+/// deck-side decision (Allow/Deny) and falls through to the terminal dialog
+/// otherwise. Kept out of [`HOOK_EVENTS`] because it is opt-in and uses a much
+/// longer timeout than the fire-and-forget lifecycle hooks.
+pub const PERM_HOOK_EVENT: &str = "PermissionRequest";
+
+/// Per-hook timeout in seconds for the `PermissionRequest` entry (R-16.1: hook
+/// `timeout: 90`; the script itself stops polling at 85 s so it always exits
+/// before Claude Code force-kills it — i.e. it fails open, never wedged).
+pub const PERM_HOOK_TIMEOUT_SECS: u64 = 90;
 
 /// Substring that identifies an entry as ours. It always appears in the hook
 /// command because the script path lives under a `quarterdeck` directory
@@ -153,6 +169,108 @@ pub fn uninstall_hooks(
         events_added: Vec::new(),
         entries_removed,
     })
+}
+
+/// Install (or repair) ONLY the opt-in `PermissionRequest` hook entry (SPEC
+/// §16, R-16.1/R-16.4) into `settings_path`, using `command` as the hook
+/// command line. Called when hooks are installed with `takeoverPermissions` on,
+/// and when the setting is toggled back on. Idempotent: a no-op (`changed:
+/// false`) when the entry already exists. Same backup/atomic-write discipline as
+/// [`install_hooks`].
+pub fn install_perm_hook(
+    settings_path: &Path,
+    command: &str,
+) -> Result<HooksChange, HooksConfigError> {
+    let mut root = read_settings(settings_path)?;
+    if !merge_perm_hook(&mut root, command)? {
+        return Ok(HooksChange::default());
+    }
+    let backup = create_backup(settings_path, &now_backup_ts(), BACKUP_KEEP)?;
+    write_or_rollback_backup(settings_path, &root, backup.as_deref())?;
+    Ok(HooksChange {
+        changed: true,
+        backup,
+        events_added: vec![PERM_HOOK_EVENT.to_string()],
+        entries_removed: 0,
+    })
+}
+
+/// Remove ONLY the `PermissionRequest` hook entry (SPEC R-16.4 "Toggle off →
+/// installer removes ONLY the PermissionRequest hook entry"). Unlike
+/// [`uninstall_hooks`], the five lifecycle hooks are left in place. A missing /
+/// already-absent entry yields a no-op; an unparseable file refuses.
+pub fn uninstall_perm_hook(
+    settings_path: &Path,
+    marker: &str,
+) -> Result<HooksChange, HooksConfigError> {
+    let mut root = read_settings(settings_path)?;
+    let entries_removed = strip_hooks_for_event(&mut root, marker, PERM_HOOK_EVENT);
+    if entries_removed == 0 {
+        return Ok(HooksChange::default());
+    }
+    let backup = create_backup(settings_path, &now_backup_ts(), BACKUP_KEEP)?;
+    write_or_rollback_backup(settings_path, &root, backup.as_deref())?;
+    Ok(HooksChange {
+        changed: true,
+        backup,
+        events_added: Vec::new(),
+        entries_removed,
+    })
+}
+
+/// Add our `PermissionRequest` entry to an already-parsed settings `root`
+/// (timeout [`PERM_HOOK_TIMEOUT_SECS`], no matcher). Returns whether an entry
+/// was added (`false` when one carrying [`MARKER`] already exists — idempotent).
+pub fn merge_perm_hook(root: &mut Value, command: &str) -> Result<bool, HooksConfigError> {
+    let obj = root
+        .as_object_mut()
+        .ok_or(HooksConfigError::UnexpectedShape)?;
+    let hooks_val = obj
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks_obj = hooks_val
+        .as_object_mut()
+        .ok_or(HooksConfigError::UnexpectedShape)?;
+    let arr_val = hooks_obj
+        .entry(PERM_HOOK_EVENT.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let arr = arr_val
+        .as_array_mut()
+        .ok_or(HooksConfigError::UnexpectedShape)?;
+    if arr.iter().any(|e| entry_has_marker(e, MARKER)) {
+        return Ok(false);
+    }
+    arr.push(make_perm_entry(command));
+    Ok(true)
+}
+
+/// Remove every hook entry carrying `marker` from a SINGLE event array
+/// (`event`), pruning the array and the `hooks` object if they empty. Returns
+/// how many entries were removed. Backs [`uninstall_perm_hook`] so toggling
+/// `takeoverPermissions` off touches only that one event (R-16.4).
+pub fn strip_hooks_for_event(root: &mut Value, marker: &str, event: &str) -> usize {
+    let Some(obj) = root.as_object_mut() else {
+        return 0;
+    };
+    let Some(hooks_val) = obj.get_mut("hooks") else {
+        return 0;
+    };
+    let Some(hooks_obj) = hooks_val.as_object_mut() else {
+        return 0;
+    };
+    let Some(arr) = hooks_obj.get_mut(event).and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let before = arr.len();
+    arr.retain(|e| !entry_has_marker(e, marker));
+    let removed = before - arr.len();
+    if removed > 0 && arr.is_empty() {
+        hooks_obj.remove(event);
+    }
+    if removed > 0 && hooks_obj.is_empty() {
+        obj.remove("hooks");
+    }
+    removed
 }
 
 /// Atomically write `root` to `settings_path`; on failure, delete the backup we
@@ -288,6 +406,19 @@ fn make_entry(event: &str, command: &str) -> Value {
     if event == "Notification" {
         entry.insert("matcher".to_string(), json!(NOTIFICATION_MATCHER));
     }
+    entry.insert("hooks".to_string(), Value::Array(vec![hook]));
+    Value::Object(entry)
+}
+
+/// The opt-in `PermissionRequest` entry (R-16.1): same command, a 90 s timeout,
+/// no matcher (PermissionRequest carries no `notification_type` to filter on).
+fn make_perm_entry(command: &str) -> Value {
+    let hook = json!({
+        "type": "command",
+        "command": command,
+        "timeout": PERM_HOOK_TIMEOUT_SECS,
+    });
+    let mut entry = Map::new();
     entry.insert("hooks".to_string(), Value::Array(vec![hook]));
     Value::Object(entry)
 }

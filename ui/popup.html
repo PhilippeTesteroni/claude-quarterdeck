@@ -22,6 +22,16 @@
                 />
               </svg>
             </button>
+            <button
+              id="qd-collapse"
+              class="qd-collapse"
+              type="button"
+              aria-label="Shrink to a traffic light"
+              title="Shrink to a traffic light"
+              hidden
+            >
+              <span aria-hidden="true">◱</span>
+            </button>
             <button id="qd-gear" class="qd-gear" type="button" aria-label="Settings" title="Settings">
               <span class="qd-gear-dot" aria-hidden="true"></span>
               <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -45,6 +55,10 @@
       <section id="qd-content" class="qd-content"></section>
       <footer id="qd-footer" class="qd-footer"></footer>
       <div id="qd-settings" class="qd-settings" role="region" aria-label="Settings"></div>
+      <button id="qd-lamp" class="qd-lamp" type="button" aria-label="Expand to session list" hidden>
+        <span id="qd-lamp-dot" class="qd-lamp-dot" data-status="idle"></span>
+        <span id="qd-lamp-badge" class="qd-lamp-badge" hidden></span>
+      </button>
     </main>
     <script type="module" src="/src/popup.ts"></script>
   </body>

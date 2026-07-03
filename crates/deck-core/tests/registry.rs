@@ -66,6 +66,34 @@ fn registry_rename_refreshes_within_a_poll_and_clearing_falls_back() {
 }
 
 #[test]
+fn absent_session_clears_its_registry_name() {
+    // R-15.2 "Registry names refresh on every poll": a live row whose registry
+    // file vanished (the session is dropped from the poll while its process is
+    // still alive) must not keep displaying its last registry name — the name
+    // falls back down the precedence chain, symmetric with the busy-flag
+    // clearing. Even an EMPTY poll (the LAST registry file removed) must clear it.
+    let (mut store, _c) = store_at(1_000);
+    store.on_event(&prompt("s1", "prompt title", 1_000));
+    let mut e = entry("s1");
+    e.name = Some("Registry name".to_string());
+    store.apply_registry(&[e]);
+    assert_eq!(store.title_of("s1").as_deref(), Some("Registry name"));
+
+    // Next poll no longer reports s1 at all (empty registry). The name must clear.
+    assert!(
+        store.apply_registry(&[]),
+        "clearing a vanished session's registry name is a visible change"
+    );
+    assert_eq!(
+        store.title_of("s1").as_deref(),
+        Some("prompt title"),
+        "name falls back down the chain once the registry drops the session"
+    );
+    // Idempotent: a second empty poll reports no further change.
+    assert!(!store.apply_registry(&[]));
+}
+
+#[test]
 fn registry_pid_feeds_liveness() {
     // R-15.3: the registry pid feeds liveness directly. A session with no hook
     // pid gains one from the registry, and a dead process then marks it dead.

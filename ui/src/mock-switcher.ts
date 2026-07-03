@@ -7,7 +7,7 @@
 
 import { h } from './dom';
 
-const SCENARIOS = ['default', 'empty', 'nohooks', 'onboarding', 'cyrillic', 'ask-unknown', 'error'];
+const SCENARIOS = ['default', 'background-busy', 'empty', 'nohooks', 'onboarding', 'cyrillic', 'ask-unknown', 'error'];
 
 export function installMockScenarioSwitcher(): void {
   const params = new URLSearchParams(location.search);
