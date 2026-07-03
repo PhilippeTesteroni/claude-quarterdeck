@@ -157,3 +157,65 @@ Everything is local. No telemetry, no network calls except `127.0.0.1` MCP. READ
 ## 13. Non-goals v1 / v2 backlog
 
 Click-to-focus terminal (deliberately deferred); subagent rows (SubagentStart/Stop); Linux tray; history/analytics; sound customization; auto-update; signing/notarization; i18n; fine-grained `PermissionRequest`/`PermissionDenied` hooks; remote/mobile view.
+
+---
+
+# Spec v1.1 addendum (LOCKED 2026-07-03) — first-user feedback round
+
+Nine items from Philipp's live dogfooding + agent-side API feedback. Same rules: R-numbers are law, every item gets tests, nothing here weakens v1.0 requirements. Facts verified against official docs 2026-07-03 (PreToolUse/PermissionRequest decision contracts, MCP timeout model) — see docs/hooks-facts.md addendum.
+
+## 14. Window behavior (items 1, 2, 3)
+
+- **R-14.1 Movable popup.** The popup header is a drag region (`data-tauri-drag-region` or CSS `-webkit-app-region: drag`); interactive header controls (gear, pin) remain clickable. The window can be dragged anywhere on any monitor.
+- **R-14.2 Pin on top.** A pin toggle button in the header (icon, left of the gear): pinned → `always_on_top(true)`, hide-on-blur DISABLED (window stays until unpinned/Esc/tray click), visually indicated (filled pin, clay accent). Unpinned → v1.0 behavior (anchor to tray on open, hide on blur). Pin state persists in settings (`popupPinned`).
+- **R-14.3 True auto-height.** Popup height tracks content: `height = clamp(header + watchline + rows + footer, 160, 560)`; beyond 560 the list scrolls (v1.0 R-7.1 max preserved). The 460 floor is REMOVED (empty state may be compact). Height shrinks back when rows disappear (regression-tested: 50 rows → 0). When the user manually moved the window (R-14.1), height changes keep the TOP edge fixed (grow downward) and never re-anchor to the tray.
+
+## 15. Session names & focus (items 4, 5)
+
+- **R-15.1 Live session registry.** New core source: `~/.claude/sessions/*.json` (undocumented internal registry: `{pid, sessionId, cwd, name, status, kind, entrypoint, ...}`). Parsed DEFENSIVELY (any missing field tolerated; unreadable file skipped; format drift must never crash — quarantine-free, just log+skip). Polled every 10s alongside liveness AND read at cold start.
+- **R-15.2 Title precedence (replaces R-5.2 chain head).** `name` from the live registry (matched by sessionId) → `session_title` (SessionStart payload) → latest `UserPromptSubmit.prompt` (≤60 chars) → transcript fallback → `(no title)`. Registry names refresh on every poll (a /rename mid-session updates the row within ≤10s).
+- **R-15.3 Registry-driven discovery.** Cold-start discovery (R-5.4) now ALSO creates rows for registry entries whose transcript is missing/stale (status from registry `status` field mapped: busy→working, else idle, flagged inferred). Registry pid feeds liveness directly (no ancestor walk needed for registry-known sessions).
+- **R-15.4 Click-to-focus terminal (v1 deferral lifted).** Row click focuses the terminal window hosting that session, best-effort:
+  (a) On `SessionStart` the hook script captures `extra.ancestor = {pid, hwnd, exe}` — nearest ancestor process with a real top-level window (Win: `MainWindowHandle != 0` via CIM walk; mac: `TERM_PROGRAM` + pid).
+  (b) Focus (Win): validate hwnd still belongs to ancestor pid (`GetWindowThreadProcessId`), then `ShowWindow(SW_RESTORE)` + `SetForegroundWindow` via a spawned `powershell -NoProfile` P/Invoke snippet (no new native deps). Stale/missing hwnd → fallback: enumerate top-level windows, focus first whose title contains the project basename; none → inline toast-in-window "Couldn't find the terminal window".
+  (c) Focus (mac): `osascript` activate by bundle id derived from `TERM_PROGRAM` (Terminal/iTerm/VS Code map). Code-complete, compile-gated, not live-tested (no mac hardware).
+  (d) Windows Terminal TAB-level focus remains out of scope (README limitation).
+  Row click = focus; the former row-click no-op is gone. Right-click menu gains "Focus terminal" as first item.
+
+## 16. Permission requests in the deck (item 6)
+
+- **R-16.1 PermissionRequest hook.** Installer adds a `PermissionRequest` entry (same marker/backup rules as R-4.1) whose script: writes `{v:1, kind:"perm", tool_name, tool_input (truncated to 2KB), session_id, cwd, receivedAt}` to `<data>/perms/`, then polls `<data>/perm-answers/<id>.json` until answered or its deadline (hook `timeout: 90`, poll exits at 85s), and:
+  - answer allow → stdout `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`, exit 0
+  - answer deny → same with `"deny"` + the user's optional reason
+  - no answer by deadline / deck not running / any error → exit 0 with NO output (Claude Code falls through to the normal terminal dialog; the hook MUST be fail-open).
+- **R-16.2 Deck-side modal.** A pending perm renders in the SAME always-on-top ask window, visually distinct (amber left border vs clay for asks): title "<project> requests permission", body = tool name + compact pretty-printed input (truncated), buttons **Allow** / **Deny** / **In terminal** (explicitly answers "no decision" → hook exits silently → terminal dialog appears immediately). Keyboard: A / D / Esc(=In terminal). Perm pending forces session `attention` + alert toast (same class as R-9.2), and FIFO-queues with asks.
+- **R-16.3 Focus-aware auto-defer (ties into §17).** If the session's terminal window is foreground when the perm arrives, the deck AUTO-ANSWERS "no decision" within 300ms (user is already looking at the terminal; the dialog shows there with near-zero added latency) and shows nothing.
+- **R-16.4 Opt-in.** Settings toggle "Take over permission prompts" (default ON after onboarding consent; the onboarding card explains it). Toggle off → installer removes ONLY the PermissionRequest hook entry. Uninstall removes it with the rest.
+- **R-16.5 Safety.** The perm modal displays tool_name + input VERBATIM but sanitized (bidi strip per QA round 5, length caps); Allow never auto-repeats (no "always allow" in v1.1 — explicit non-goal).
+
+## 17. Focus-aware suppression (item 7)
+
+- **R-17.1** Every 2s (and immediately before showing the ask window or firing any toast) the shell samples the foreground window's root process chain (Win: `GetForegroundWindow` → pid → ancestor chain; mac: frontmost app pid via `osascript`, best-effort).
+- **R-17.2** If the foreground window belongs to the session's terminal (matches its `ancestor.pid`/hwnd from R-15.4a, or the registry pid's window), then for THAT session: the ask window does NOT auto-appear (ask stays queued + mirrored in popup; appears as soon as focus leaves), toasts (idle/attention/ask/perm) are suppressed, and perms auto-defer (R-16.3). Suppressed toasts refund the throttle slot (QA round-4 rule).
+- **R-17.3** The popup itself being foreground keeps v1.0 R-9.4 suppression semantics. Suppression never LOSES anything: asks/perms stay pending, statuses still update.
+
+## 18. Ask window UX (item 8)
+
+- **R-18.1 Close button.** The ask window gets an X (top-right): closes (hides) the WINDOW without dismissing pending asks — they remain queued + mirrored in the popup, badge intact; the window re-appears on the next new ask/perm (or via popup mirror click). This is distinct from per-ask "Dismiss" (which resolves that ask as dismissed). Esc = same as X when multiple pending; when exactly one pending, Esc also = X (never silently dismisses).
+- **R-18.2** Window title bar area is draggable (same mechanism as R-14.1).
+
+## 19. MCP API v1.1 (item 9)
+
+- **R-19.1 `detail` field.** `ask_user` gains optional `detail: string` (long rationale/body, rendered under the question in muted smaller type, scrollable if long, sanitized). Skill updated: question = short, detail = the reasoning.
+- **R-19.2 Persistent asks.** `timeout_seconds` becomes optional; **omitted/0 → persistent**: the ask lives until answered/dismissed/cancelled (no expiry sweep). Cap for explicit values raised 600 → 3600. UI: persistent asks show no countdown.
+- **R-19.3 Keepalive.** While ANY ask_user/perm call is blocked, the MCP server emits `notifications/progress` (with the request's progressToken, when the client sent one) every 30s — this resets Claude Code's 5-minute idle abort (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`); wall-clock `MCP_TOOL_TIMEOUT` is unset by default (~28h) so persistent asks survive. The skill documents: for very long autonomy also set per-server `timeout` in mcp config. The `claude mcp add` command emitted by R-8.6 is unchanged (no timeout arg needed by default).
+- **R-19.4 dismissed MUST resolve (bug fix).** Dismissing an ask resolves the blocked MCP call with `{answer:"", kind:"dismissed"}` immediately (regression test: dismiss via window button AND via popup mirror; assert the client receives kind=dismissed, not a transport timeout).
+- **R-19.5 update/cancel.** `ask_user` result gains `ask_id`. New tools:
+  - `update_ask(ask_id, question?, options?, detail?)` — mutates a PENDING ask in place (UI re-renders; queue position kept). Unknown/settled id → error result (not exception).
+  - `cancel_ask(ask_id)` — resolves the pending ask as `{kind:"cancelled"}` toward the original caller and removes it from UI.
+  Both are usable from parallel tool calls / a different session (skill documents the parallel-call pattern and warns the blocked call itself can't cancel itself).
+- **R-19.6 notify_user returns `{delivered: true, id}`** (id = toast/notification record id, logged in notifier-calls.jsonl fake mode too).
+
+## 20. v1.1 testing gates
+
+Everything in §11 stays green. New: unit tests for registry parsing (fixtures incl. malformed/missing fields), R-14.3 shrink regression, R-19.2/19.3/19.4/19.5 lifecycle tests (fake clock), perm hook script piped-stdin tests (answer/timeout/fail-open), Playwright specs for pin/drag-region presence/close-X/detail rendering/perm modal, e2e real-app: dismiss round-trip asserting kind=dismissed, persistent ask surviving >6min with keepalive (time-compressed via env knob where possible), and Part C live re-run incl. a REAL permission round-trip (claude asks to run a tool → deck Allow → tool runs; deck Deny → claude sees denial; timeout → terminal dialog appears).
