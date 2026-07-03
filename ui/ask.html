@@ -8,9 +8,16 @@
   </head>
   <body>
     <main id="app" class="qd-ask">
-      <header class="qd-header">
-        <span class="qd-wordmark">quarterdeck</span>
-        <span id="qd-ask-badge" class="qd-ask-badge" hidden></span>
+      <header class="qd-header" data-tauri-drag-region="deep">
+        <div class="qd-ask-header-left">
+          <span class="qd-wordmark">quarterdeck</span>
+          <span id="qd-ask-badge" class="qd-ask-badge" hidden></span>
+        </div>
+        <button id="qd-ask-close" class="qd-ask-close" type="button" aria-label="Close">
+          <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+          </svg>
+        </button>
       </header>
       <section id="qd-ask-content" class="qd-ask-content"></section>
     </main>

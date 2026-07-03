@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::events::{HookEvent, SpoolEvent};
+use crate::events::{Ancestor, HookEvent, SpoolEvent};
+use crate::registry::RegistryEntry;
 use crate::traits::{Clock, ProcessTable, ToastKind};
 use crate::{liveness, naming};
 
@@ -116,6 +117,8 @@ pub struct SessionView {
     pub inferred: bool,
     pub since_ms: u64,
     pub cwd: String,
+    /// Terminal-window ancestor for click-to-focus (R-15.4), when captured.
+    pub ancestor: Option<Ancestor>,
 }
 
 /// Per-status counts (engine-side mirror of `ipc::Counts`).
@@ -149,6 +152,13 @@ struct Session {
     started_at_ms: u64,
     session_title: Option<String>,
     latest_prompt: Option<String>,
+    /// Highest-precedence title: the live registry `name` matched by sessionId
+    /// (R-15.2), refreshed on every registry poll so a mid-session `/rename`
+    /// shows up within ≤10 s.
+    registry_name: Option<String>,
+    /// Terminal-window ancestor captured on `SessionStart` (R-15.4a), for
+    /// click-to-focus and foreground-suppression matching (R-17.2).
+    ancestor: Option<Ancestor>,
     /// Cached cold-start transcript title so we read the file at most once.
     transcript_title: Option<String>,
     display_title: String,
@@ -185,6 +195,8 @@ impl Session {
             started_at_ms: 0,
             session_title: None,
             latest_prompt: None,
+            registry_name: None,
+            ancestor: None,
             transcript_title: None,
             display_title: naming::NO_TITLE.to_string(),
             inferred: false,
@@ -259,7 +271,8 @@ impl Session {
         } else {
             None
         };
-        self.display_title = naming::title_from_sources(
+        self.display_title = naming::title_from_registry(
+            self.registry_name.as_deref(),
             self.session_title.as_deref(),
             self.latest_prompt.as_deref(),
             fallback.as_deref(),
@@ -472,6 +485,14 @@ impl SessionStore {
                 session.started_at_ms = ts;
                 if let Some(pid) = ev.claude_pid {
                     session.claude_pid = Some(pid);
+                }
+                // R-15.4a: remember the terminal-window ancestor for click-to-focus
+                // and foreground-suppression matching (only overwrite when the hook
+                // actually resolved one, so a resume without it keeps the prior).
+                if let Some(ancestor) = &ev.ancestor {
+                    if !ancestor.is_empty() {
+                        session.ancestor = Some(ancestor.clone());
+                    }
                 }
                 if let Some(t) = session_title {
                     session.session_title = Some(t.clone());
@@ -854,6 +875,96 @@ impl SessionStore {
         self.sessions.insert(id, s);
     }
 
+    // --- Live registry poll (§15) -----------------------------------------
+
+    /// Apply one live-registry entry (R-15.2/R-15.3) to its matching row (by
+    /// session id): refresh the registry `name` (highest-precedence title) and
+    /// feed the registry pid into liveness. No-op for an unknown session.
+    /// Returns whether anything the UI would show changed.
+    pub fn apply_registry_entry(&mut self, entry: &RegistryEntry) -> bool {
+        let Some(s) = self.sessions.get_mut(&entry.session_id) else {
+            return false;
+        };
+        let mut changed = false;
+        // Registry pid feeds liveness directly (R-15.3) — no ancestor walk
+        // needed for a registry-known session. `claude_pid` is what liveness
+        // reads; keep the newest non-zero pid the registry reports.
+        if let Some(pid) = entry.pid {
+            if s.claude_pid != Some(pid) {
+                s.claude_pid = Some(pid);
+            }
+        }
+        // R-15.2: the registry `name` refreshes on every poll. Only re-derive
+        // the title (which may touch the transcript for a fallback) when the
+        // name actually changed, so a /rename lands within one poll but a stable
+        // name doesn't churn.
+        let new_name = entry
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if s.registry_name.as_deref() != new_name {
+            s.registry_name = new_name.map(str::to_string);
+            let before = s.display_title.clone();
+            s.recompute_title();
+            changed |= s.display_title != before;
+        }
+        changed
+    }
+
+    /// Apply a whole registry poll's worth of entries (R-15.2/R-15.3). Returns
+    /// whether any row's displayed state changed.
+    pub fn apply_registry(&mut self, entries: &[RegistryEntry]) -> bool {
+        let mut changed = false;
+        for entry in entries {
+            changed |= self.apply_registry_entry(entry);
+        }
+        changed
+    }
+
+    /// The terminal-window ancestor captured for a session (R-15.4), for
+    /// click-to-focus. `None` when unknown or the session isn't tracked.
+    #[must_use]
+    pub fn ancestor_of(&self, session_id: &str) -> Option<Ancestor> {
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.ancestor.clone())
+    }
+
+    /// The project label (basename of cwd) for a session, if tracked (R-15.4
+    /// title-substring focus fallback + toast copy).
+    #[must_use]
+    pub fn project_of(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id).map(Session::project)
+    }
+
+    /// Per-session terminal PIDs used by foreground-suppression matching
+    /// (R-17.2): a session's terminal is whichever process owns its ancestor
+    /// window (`ancestor.pid`) or hosts it (the registry/`claude` pid). Sessions
+    /// with no known pid are omitted (nothing to match against the foreground).
+    #[must_use]
+    pub fn terminal_pids(&self) -> Vec<(String, Vec<u32>)> {
+        self.sessions
+            .values()
+            .filter_map(|s| {
+                let mut pids: Vec<u32> = Vec::new();
+                if let Some(pid) = s.ancestor.as_ref().and_then(|a| a.pid) {
+                    pids.push(pid);
+                }
+                if let Some(pid) = s.claude_pid {
+                    if !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+                if pids.is_empty() {
+                    None
+                } else {
+                    Some((s.id.clone(), pids))
+                }
+            })
+            .collect()
+    }
+
     // --- Projection for the UI / tray -------------------------------------
 
     /// Full snapshot for the UI, sorted per R-7.3 (attention → working → idle →
@@ -873,6 +984,7 @@ impl SessionStore {
                 inferred: s.inferred,
                 since_ms: now.saturating_sub(s.entered_at_ms),
                 cwd: s.cwd.clone().unwrap_or_default(),
+                ancestor: s.ancestor.clone(),
             })
             .collect();
         rows.sort_by(|a, b| {

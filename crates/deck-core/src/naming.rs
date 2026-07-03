@@ -111,6 +111,20 @@ pub fn truncate_graphemes(s: &str, max: usize) -> String {
     out
 }
 
+/// Pick the first non-empty candidate (trimmed), normalize it, or `(no title)`.
+/// The single primitive behind both [`title_from_sources`] (R-5.2) and
+/// [`title_from_registry`] (R-15.2): callers pass their precedence chain in
+/// order and the first candidate with content wins.
+#[must_use]
+pub fn pick_title<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> String {
+    for candidate in candidates {
+        if let Some(text) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+            return normalize_title(text);
+        }
+    }
+    NO_TITLE.to_string()
+}
+
 /// Apply the R-5.2 precedence to already-resolved sources.
 ///
 /// `session_title` → latest `UserPromptSubmit.prompt` → cold-start transcript
@@ -122,12 +136,27 @@ pub fn title_from_sources(
     latest_prompt: Option<&str>,
     transcript_fallback: Option<&str>,
 ) -> String {
-    for candidate in [session_title, latest_prompt, transcript_fallback] {
-        if let Some(text) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
-            return normalize_title(text);
-        }
-    }
-    NO_TITLE.to_string()
+    pick_title([session_title, latest_prompt, transcript_fallback])
+}
+
+/// Apply the R-15.2 precedence (which replaces R-5.2's chain head): the live
+/// registry `name` (matched by sessionId) → `session_title` → latest
+/// `UserPromptSubmit.prompt` → cold-start transcript fallback → `(no title)`.
+/// The registry name refreshes on every poll, so a `/rename` mid-session shows
+/// up within one poll.
+#[must_use]
+pub fn title_from_registry(
+    registry_name: Option<&str>,
+    session_title: Option<&str>,
+    latest_prompt: Option<&str>,
+    transcript_fallback: Option<&str>,
+) -> String {
+    pick_title([
+        registry_name,
+        session_title,
+        latest_prompt,
+        transcript_fallback,
+    ])
 }
 
 /// Full precedence including the guarded transcript read (R-5.2). Used where a

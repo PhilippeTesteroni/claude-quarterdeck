@@ -18,6 +18,8 @@
 //! [`ipc::StateSnapshot`] pushed over `deck://state`; the UI sends intent back
 //! through the commands registered below.
 
+pub mod focus;
+pub mod foreground;
 pub mod ipc;
 pub mod mcp_server;
 pub mod notify;
@@ -40,7 +42,7 @@ use tokio::sync::oneshot;
 use deck_core::ask::{AskStore, PendingAsk};
 use deck_core::engine::{Effect, SessionStore, SessionView, Status as EngineStatus};
 use deck_core::traits::{Notifier, ProcessTable, ToastKind};
-use deck_core::{discovery, events, hooks_config};
+use deck_core::{discovery, events, hooks_config, registry};
 
 use crate::ipc::{
     AppState, AskAnswerKind, AskRow, Counts, SessionRow, SessionStatus, SettingsState,
@@ -67,6 +69,10 @@ const LOOP_SLICE: Duration = Duration::from_millis(400);
 /// missed `SessionEnd` still clears its row promptly (R-2.5): a scan of a
 /// near-always-empty directory is a single cheap `read_dir`.
 const SPOOL_SWEEP: Duration = Duration::from_secs(1);
+/// Foreground-window sampling cadence for focus-aware suppression (R-17.1).
+/// Only actually samples while a suppressed ask is pending (see the engine
+/// loop), so it never spawns a sampler when there is nothing to un-suppress.
+const FOREGROUND_POLL: Duration = Duration::from_secs(2);
 
 static ASK_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -503,6 +509,7 @@ impl Shell {
             notify_reminder: settings.notify_reminder,
             launch_at_login: settings.launch_at_login,
             onboarding_done: settings.onboarding_done,
+            popup_pinned: settings.popup_pinned,
             mcp_enabled,
             mcp_cli_available: claude_cli_on_path(),
             mcp_command,
@@ -547,6 +554,96 @@ impl Shell {
             .unwrap_or(false)
     }
 
+    // --- focus-aware suppression (§17) ------------------------------------
+
+    /// The terminal PIDs for one session (ancestor pid ∪ registry/claude pid,
+    /// R-17.2). Empty when the session is unknown or has no known pid.
+    fn session_terminal_pids(&self, session_id: &str) -> Vec<u32> {
+        self.store
+            .lock()
+            .expect("store poisoned")
+            .terminal_pids()
+            .into_iter()
+            .find(|(id, _)| id == session_id)
+            .map(|(_, pids)| pids)
+            .unwrap_or_default()
+    }
+
+    /// R-17.2: is the given session's terminal window the foreground window?
+    /// Samples the foreground chain (R-17.1) and intersects with the session's
+    /// terminal pids. Unmatched asks (`None`) are never terminal-foreground —
+    /// there's no terminal to defer to. A fresh sample is taken here so callers
+    /// get the "immediately before showing / firing" check R-17.1 requires.
+    fn session_foreground(&self, session_id: Option<&str>) -> bool {
+        let Some(sid) = session_id else {
+            return false;
+        };
+        let terminal = self.session_terminal_pids(sid);
+        if terminal.is_empty() {
+            return false;
+        }
+        let fg = foreground::sample_foreground_pids();
+        foreground::session_is_foreground(&terminal, &fg)
+    }
+
+    /// R-17.2/R-17.1: surface the ask window for any pending ask whose session's
+    /// terminal is NOT the foreground window (or is unmatched), but only when the
+    /// window is currently hidden. Called after enqueue and on the 2s poll so a
+    /// suppressed (queued-but-hidden) ask appears the moment focus leaves its
+    /// terminal. Never yanks the window when every pending ask's terminal is
+    /// still foreground (R-17.2: the ask stays queued + mirrored in the popup).
+    fn maybe_surface_asks(&self) {
+        if self.asks_empty() {
+            return;
+        }
+        let ask_visible = self
+            .app
+            .get_webview_window(windows::ASK_LABEL)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false);
+        if ask_visible {
+            return;
+        }
+        // Sample the foreground once, then check every pending ask against it.
+        let fg = foreground::sample_foreground_pids();
+        let terminal_pids = self.store.lock().expect("store poisoned").terminal_pids();
+        let sessions: Vec<Option<String>> = self
+            .asks
+            .lock()
+            .expect("asks poisoned")
+            .iter()
+            .map(|a| a.session_id.clone())
+            .collect();
+        let ready = sessions.iter().any(|sid| match sid {
+            None => true, // unmatched ask: nothing to defer to.
+            Some(id) => {
+                let pids = terminal_pids
+                    .iter()
+                    .find(|(t, _)| t == id)
+                    .map(|(_, p)| p.as_slice())
+                    .unwrap_or(&[]);
+                !foreground::session_is_foreground(pids, &fg)
+            }
+        });
+        if ready {
+            run_on_main(&self.app, |app| {
+                if let Err(err) = windows::show_ask_window(app) {
+                    tracing::warn!(error = %err, "failed to surface ask window (R-17.2)");
+                }
+            });
+        }
+    }
+
+    /// Focus the terminal window hosting `session_id` (R-15.4). Looks up the
+    /// captured ancestor + project from the store, then best-effort focuses.
+    fn focus_terminal(&self, session_id: &str) -> Result<(), String> {
+        let (ancestor, project) = {
+            let store = self.store.lock().expect("store poisoned");
+            (store.ancestor_of(session_id), store.project_of(session_id))
+        };
+        focus::focus_terminal(ancestor, &project.unwrap_or_default())
+    }
+
     // --- toast firing ------------------------------------------------------
 
     /// Fire engine-emitted toast decisions, honoring the R-9.5 per-type toggles
@@ -558,6 +655,10 @@ impl Shell {
         }
         let settings = settings::load(&self.data_dir);
         let popup = self.popup_focused();
+        // R-17.1: sample the foreground chain once for this batch; a toast whose
+        // session terminal is the foreground window is suppressed (R-17.2).
+        let foreground = foreground::sample_foreground_pids();
+        let terminal_pids = self.store.lock().expect("store poisoned").terminal_pids();
         for effect in effects {
             let Effect::Toast(decision) = effect;
             let enabled = match decision.kind {
@@ -566,12 +667,20 @@ impl Shell {
                 ToastKind::Reminder => settings.notify_reminder,
                 ToastKind::Ask => true,
             };
-            // A toast actually shows only if its R-9.5 toggle is on AND the
-            // notifier didn't suppress it (R-9.4 popup-visible-and-focused
-            // suppression, applied inside `notify`, which returns whether a
-            // toast fired). Short-circuit so `notify` is not called when the
-            // toggle is off.
+            // R-17.2: suppress when the session's terminal is the foreground
+            // window (the user is already looking at it).
+            let terminal_foreground = terminal_pids
+                .iter()
+                .find(|(id, _)| *id == decision.session_id)
+                .map(|(_, pids)| foreground::session_is_foreground(pids, &foreground))
+                .unwrap_or(false);
+            // A toast actually shows only if its R-9.5 toggle is on, its session's
+            // terminal isn't foreground (R-17.2), AND the notifier didn't suppress
+            // it (R-9.4 popup-visible-and-focused suppression, applied inside
+            // `notify`, which returns whether a toast fired). Short-circuit so
+            // `notify` is not called when the toggle is off / terminal foreground.
             let shown = enabled
+                && !terminal_foreground
                 && self.notifier.notify(
                     decision.kind,
                     &decision.session_id,
@@ -582,11 +691,12 @@ impl Shell {
             if !shown {
                 // R-9.4/R-9.5: the engine already stamped this (session, kind)
                 // throttle slot when it emitted the decision, but no toast
-                // actually showed — either the R-9.5 per-type toggle is off, or
-                // the notifier suppressed it because the popup is visible AND
-                // focused (R-9.4). Release the slot so a later same-kind toast
-                // isn't dropped for up to 10 s (once the toggle is re-enabled or
-                // the popup loses focus/closes).
+                // actually showed — the R-9.5 per-type toggle is off, the
+                // session's terminal is the foreground window (R-17.2), or the
+                // notifier suppressed it because the popup is visible AND focused
+                // (R-9.4). Release the slot so a later same-kind toast isn't
+                // dropped for up to 10 s (R-17.2 "suppressed toasts refund the
+                // throttle slot"), once the toggle is re-enabled or focus leaves.
                 self.store.lock().expect("store poisoned").refund_toast(
                     &decision.session_id,
                     decision.kind,
@@ -676,24 +786,32 @@ impl Shell {
 
         self.push_state();
 
-        // Always-on-top ask window (never steals focus; R-8.3).
-        run_on_main(&self.app, |app| {
-            if let Err(err) = windows::show_ask_window(app) {
-                tracing::warn!(error = %err, "failed to show ask window");
-            }
-        });
-
-        // R-8.4: alert toast, exempt from throttle/suppression/toggles.
-        let toast_project = project
-            .or_else(|| req.context.as_deref().map(basename))
-            .unwrap_or_else(|| "Agent".to_string());
-        self.notifier.notify(
-            ToastKind::Ask,
-            &ask_id,
-            &toast_project,
-            &req.question,
-            self.popup_focused(),
-        );
+        // R-17.2: if the matched session's terminal is the foreground window,
+        // the ask window does NOT auto-appear (the ask stays queued + mirrored in
+        // the popup, surfacing as soon as focus leaves — see `maybe_surface_asks`
+        // + the 2s poll) and the alert toast is suppressed. Otherwise the
+        // always-on-top ask window comes up (never steals focus; R-8.3).
+        let terminal_foreground = self.session_foreground(session_id.as_deref());
+        if terminal_foreground {
+            tracing::debug!(ask_id = %ask_id, "ask suppressed: session terminal is foreground (R-17.2)");
+        } else {
+            run_on_main(&self.app, |app| {
+                if let Err(err) = windows::show_ask_window(app) {
+                    tracing::warn!(error = %err, "failed to show ask window");
+                }
+            });
+            // R-8.4: alert toast, exempt from throttle/toggles (but R-17.2 applies).
+            let toast_project = project
+                .or_else(|| req.context.as_deref().map(basename))
+                .unwrap_or_else(|| "Agent".to_string());
+            self.notifier.notify(
+                ToastKind::Ask,
+                &ask_id,
+                &toast_project,
+                &req.question,
+                self.popup_focused(),
+            );
+        }
 
         tracing::info!(ask_id = %ask_id, matched = session_id.is_some(), "ask submitted");
         rx
@@ -1031,6 +1149,26 @@ fn run_engine(shell: Arc<Shell>) {
         tracing::info!(inserted, "cold-start discovery complete");
     }
 
+    // Live-registry cold start (R-15.3): read `~/.claude/sessions/*.json`, add
+    // inferred rows for registry sessions whose transcript was missing/stale (so
+    // transcript discovery above didn't create them), and refresh names/pids on
+    // every already-known row (R-15.2). Registry discovery runs AFTER transcript
+    // discovery so it only fills the gaps.
+    if let Some(sessions_dir) = registry::sessions_dir_from_env() {
+        let entries = registry::read_registry(&sessions_dir);
+        let inserted = {
+            let mut store = shell.store.lock().expect("store poisoned");
+            let n = registry::merge_registry_into_store(&mut store, &entries, now_ms());
+            store.apply_registry(&entries);
+            n
+        };
+        tracing::info!(
+            inserted,
+            registry = entries.len(),
+            "registry cold start complete"
+        );
+    }
+
     shell.push_state();
 
     let watcher = match watcher::SpoolWatcher::spawn(&spool_dir, watcher::DEFAULT_DEBOUNCE) {
@@ -1069,6 +1207,7 @@ fn run_engine(shell: Arc<Shell>) {
 
     let mut last_tick = Instant::now();
     let mut last_sweep = Instant::now();
+    let mut last_foreground = Instant::now();
     loop {
         match watcher.paths.recv_timeout(LOOP_SLICE) {
             Ok(path) => {
@@ -1110,6 +1249,17 @@ fn run_engine(shell: Arc<Shell>) {
         if last_tick.elapsed() >= ENGINE_TICK {
             last_tick = Instant::now();
             run_tick(&shell);
+        }
+
+        // R-17.1/R-17.2: every 2s, re-surface any queued ask whose session's
+        // terminal is no longer the foreground window. Gated on there being a
+        // pending ask so the foreground sampler (a powershell spawn on Windows)
+        // never runs when there is nothing to un-suppress.
+        if last_foreground.elapsed() >= FOREGROUND_POLL {
+            last_foreground = Instant::now();
+            if !shell.asks_empty() {
+                shell.maybe_surface_asks();
+            }
         }
     }
 }
@@ -1175,6 +1325,19 @@ fn ingest_path(shell: &Arc<Shell>, quarantine_dir: &Path, path: &Path) -> bool {
 }
 
 fn run_tick(shell: &Arc<Shell>) {
+    // R-15.2/R-15.3: refresh names + pids from the live registry BEFORE liveness,
+    // so a registry-supplied pid feeds the liveness check on the same tick and a
+    // /rename shows up within ≤10 s.
+    if let Some(sessions_dir) = registry::sessions_dir_from_env() {
+        let entries = registry::read_registry(&sessions_dir);
+        if !entries.is_empty() {
+            shell
+                .store
+                .lock()
+                .expect("store poisoned")
+                .apply_registry(&entries);
+        }
+    }
     let procs = SysProcs::refreshed();
     let effects = {
         let mut store = shell.store.lock().expect("store poisoned");
@@ -1508,6 +1671,11 @@ fn remove_skill() {
 pub fn apply_setting_side_effect(app: &AppHandle<Wry>, key: &str, settings: &Settings) {
     match key {
         "launchAtLogin" => sync_autostart(app, settings.launch_at_login),
+        "popupPinned" => {
+            if let Err(err) = windows::set_popup_pinned(app, settings.popup_pinned) {
+                tracing::warn!(error = %err, "failed to sync popup pin state (R-14.2)");
+            }
+        }
         "mcpEnabled" => {
             let enabled = settings
                 .extra
@@ -1529,6 +1697,17 @@ pub fn install_hooks_command(app: &AppHandle<Wry>) -> Result<(), String> {
 /// Uninstall the hooks, invoked by the `uninstall_hooks` command (T7 seam).
 pub fn uninstall_hooks_command() -> Result<(), String> {
     perform_uninstall_hooks()
+}
+
+/// Focus the terminal window hosting `session_id` (R-15.4), invoked by the
+/// `focus_terminal` command (row click / context menu). Returns
+/// `focus::NOT_FOUND_MSG` when no window could be focused, which the UI shows as
+/// an inline notice (R-15.4b).
+pub fn focus_terminal_command(app: &AppHandle<Wry>, session_id: &str) -> Result<(), String> {
+    let shell = app
+        .try_state::<Arc<Shell>>()
+        .ok_or_else(|| "Quarterdeck is still starting up".to_string())?;
+    shell.focus_terminal(session_id)
 }
 
 /// Rebuild + push a state snapshot from the managed [`Shell`] (used by commands
@@ -1613,6 +1792,8 @@ pub fn run() {
             ipc::install_hooks,
             ipc::uninstall_hooks,
             ipc::resize_popup,
+            ipc::show_ask_window,
+            ipc::focus_terminal,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

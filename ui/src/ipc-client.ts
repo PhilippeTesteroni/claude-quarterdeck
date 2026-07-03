@@ -9,6 +9,7 @@
 
 import { invoke as tauriInvoke, isTauri } from '@tauri-apps/api/core';
 import { listen as tauriListen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Commands, StateSnapshot } from './ipc-contract';
 import { STATE_EVENT } from './ipc-contract';
 import * as mock from './tauri-mock';
@@ -60,4 +61,20 @@ export function onState(cb: (snapshot: StateSnapshot) => void): () => void {
     cancelled = true;
     unlisten?.();
   };
+}
+
+/**
+ * Hides the window this code is running in (SPEC R-18.1 ask-window close-X /
+ * Esc: "closes (hides) the WINDOW without dismissing pending asks"). A pure
+ * window operation, not application state, so it goes straight through the
+ * Tauri window API rather than a command (mirrors how the popup's own
+ * Esc-hide is wired in `src-tauri/src/windows.rs`). No-op in mock/browser
+ * mode aside from recording the call for Playwright specs to assert against.
+ */
+export function hideCurrentWindow(): void {
+  if (usingMock) {
+    mock.hideCurrentWindowMock();
+    return;
+  }
+  void getCurrentWindow().hide();
 }

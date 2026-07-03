@@ -69,6 +69,13 @@ export interface SettingsState {
   notifyReminder: boolean;
   launchAtLogin: boolean;
   onboardingDone: boolean;
+  /**
+   * Popup pin-on-top state (SPEC R-14.2): persisted so the header pin toggle
+   * reflects it across restarts. Pinned disables hide-on-blur and skips
+   * anchor-to-tray on open; toggling it is a `set_setting('popupPinned', …)`
+   * call, same mechanism as `mcpEnabled` (R-8.6).
+   */
+  popupPinned: boolean;
   /** Agent-questions (MCP) enabled, R-8.6. */
   mcpEnabled: boolean;
   /**
@@ -126,6 +133,20 @@ export interface Commands {
    * resizes/re-anchors the window (all sizing logic stays in Rust, R-3.4).
    */
   resize_popup: (args: { contentHeight: number }) => Promise<void>;
+  /**
+   * Brings the ask window forward without stealing focus (SPEC R-18.1 "(or
+   * via popup mirror click)"): clicking a mirrored ask row in the popup calls
+   * this to re-surface the ask window after it was closed via its own X
+   * button while asks are still pending. A no-op if already visible.
+   */
+  show_ask_window: () => Promise<void>;
+  /**
+   * Focuses the terminal window hosting a session (SPEC R-15.4): a row click or
+   * the "Focus terminal" context-menu item. Best-effort — rejects with
+   * "Couldn't find the terminal window" when no window could be focused, which
+   * the popup shows as an inline notice (R-15.4b).
+   */
+  focus_terminal: (args: { sessionId: string }) => Promise<void>;
 }
 
 export type CommandName = keyof Commands;

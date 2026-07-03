@@ -89,6 +89,9 @@ pub struct SettingsState {
     pub notify_reminder: bool,
     pub launch_at_login: bool,
     pub onboarding_done: bool,
+    /// Popup pin-on-top state (SPEC R-14.2), mirrored so the header pin
+    /// toggle renders its persisted state on load.
+    pub popup_pinned: bool,
     /// Agent-questions (MCP) enabled, R-8.6.
     pub mcp_enabled: bool,
     /// R-8.6: whether the `claude` CLI is on PATH. When false, the settings pane
@@ -327,6 +330,24 @@ pub fn resize_popup(app: tauri::AppHandle, content_height: f64) -> Result<(), St
     crate::windows::resize_popup_to_content(&app, content_height)
 }
 
+/// Brings the ask window forward without stealing focus (`show_ask_window`
+/// command, SPEC R-18.1 "(or via popup mirror click)"): a mirrored ask row in
+/// the popup can be clicked to re-surface the ask window after it was closed
+/// via its X button while asks are still pending. A no-op if already visible.
+#[tauri::command]
+pub fn show_ask_window(app: tauri::AppHandle) -> Result<(), String> {
+    crate::windows::show_ask_window(&app)
+}
+
+/// Focuses the terminal window hosting a session (`focus_terminal` command, SPEC
+/// R-15.4): a row click (or the "Focus terminal" context-menu item). Best-effort
+/// — returns an error string the UI shows as an inline notice ("Couldn't find
+/// the terminal window") when no window could be focused (R-15.4b).
+#[tauri::command]
+pub fn focus_terminal(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+    crate::focus_terminal_command(&app, &session_id)
+}
+
 fn set_hooks_installed(
     state: &tauri::State<AppState>,
     app: &tauri::AppHandle,
@@ -498,6 +519,27 @@ mod tests {
     fn write_answer_file_rejects_unsafe_ids() {
         let dir = std::env::temp_dir().join("quarterdeck-ipc-test-answers-unsafe");
         assert!(write_answer_file(&dir, "../escape", "x", AskAnswerKind::Text).is_err());
+    }
+
+    /// SPEC R-14.2: the pin state mirrors as `popupPinned` (camelCase),
+    /// matching `SettingsState` in `ui/src/ipc-contract.ts`.
+    #[test]
+    fn settings_state_serializes_popup_pinned_camel_case() {
+        let settings = SettingsState {
+            notify_idle: true,
+            notify_attention: true,
+            notify_reminder: false,
+            launch_at_login: false,
+            onboarding_done: true,
+            popup_pinned: true,
+            mcp_enabled: false,
+            mcp_cli_available: true,
+            mcp_command: None,
+            data_dir: "C:/data".to_string(),
+            version: "0.1.0".to_string(),
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["popupPinned"], true);
     }
 
     /// Guards the wire shape against accidental drift from

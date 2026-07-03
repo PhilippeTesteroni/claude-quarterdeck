@@ -18,13 +18,26 @@
 
 $ErrorActionPreference = 'Stop'
 
-function Get-ClaudeAncestorPid {
-    # Nearest ancestor of THIS process whose executable is claude/node/bun.
-    # Returns an int PID, or $null if none is found.
+function Get-SessionStartExtra {
+    # Walk THIS process's parent chain ONCE (a single Win32_Process snapshot) and
+    # resolve, from the same walk:
+    #   * claudePid  = nearest ancestor whose exe is claude/node/bun (R-4.3),
+    #   * ancestor   = nearest ancestor owning a real top-level window
+    #                  (MainWindowHandle != 0), as {pid, hwnd, exe} (R-15.4a) —
+    #                  the terminal window a row click should focus.
+    # Returns an ordered hashtable { claudePid; ancestor } (ancestor may be $null).
+    $result = [ordered]@{ claudePid = $null; ancestor = $null }
     try {
         $procs = @{}
         Get-CimInstance -ClassName Win32_Process -ErrorAction Stop |
             ForEach-Object { $procs[[int]$_.ProcessId] = $_ }
+
+        # Window handles by pid (Get-Process, best-effort — a process may be gone
+        # or inaccessible; those simply have no window entry).
+        $winByPid = @{}
+        Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            try { $winByPid[[int]$_.Id] = $_ } catch { }
+        }
 
         $walk = $PID
         for ($i = 0; $i -lt 40; $i++) {
@@ -37,14 +50,32 @@ function Get-ClaudeAncestorPid {
 
             $stem = ([string]$parent.Name) -replace '\.exe$', ''
             $stem = $stem.ToLowerInvariant()
-            if ($stem -eq 'claude' -or $stem -eq 'node' -or $stem -eq 'bun') {
-                return $parentId
+            if ($null -eq $result.claudePid -and
+                ($stem -eq 'claude' -or $stem -eq 'node' -or $stem -eq 'bun')) {
+                $result.claudePid = $parentId
             }
+
+            if ($null -eq $result.ancestor) {
+                $win = $winByPid[$parentId]
+                if ($null -ne $win) {
+                    $hwnd = 0
+                    try { $hwnd = [int64]$win.MainWindowHandle } catch { $hwnd = 0 }
+                    if ($hwnd -ne 0) {
+                        $result.ancestor = [ordered]@{
+                            pid  = $parentId
+                            hwnd = $hwnd
+                            exe  = [string]$parent.Name
+                        }
+                    }
+                }
+            }
+
+            if ($null -ne $result.claudePid -and $null -ne $result.ancestor) { break }
             $walk = $parentId
         }
     } catch {
     }
-    return $null
+    return $result
 }
 
 try {
@@ -93,10 +124,14 @@ try {
         'yyyy-MM-dd\THH:mm:ss.fff\Z',
         [System.Globalization.CultureInfo]::InvariantCulture)
 
-    # --- extra (claudePid only on SessionStart) ---
+    # --- extra (claudePid + terminal ancestor, only on SessionStart) ---
     $extra = [ordered]@{}
     if ($eventName -eq 'SessionStart') {
-        $extra['claudePid'] = Get-ClaudeAncestorPid
+        $ss = Get-SessionStartExtra
+        $extra['claudePid'] = $ss.claudePid
+        if ($null -ne $ss.ancestor) {
+            $extra['ancestor'] = $ss.ancestor
+        }
     }
 
     # --- envelope ---

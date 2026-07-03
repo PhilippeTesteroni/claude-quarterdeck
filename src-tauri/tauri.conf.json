@@ -23,7 +23,7 @@
         "height": 460,
         "minWidth": 360,
         "maxWidth": 360,
-        "minHeight": 460,
+        "minHeight": 160,
         "maxHeight": 560,
         "resizable": false,
         "closable": false,

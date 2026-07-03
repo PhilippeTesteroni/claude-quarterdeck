@@ -58,6 +58,11 @@ let sessions: InternalSession[] = [];
 let asks: InternalAsk[] = [];
 let hooksInstalled = true;
 let installShouldFail = false;
+/** When set (via `?scenario=focus-fail`), the next `focus_terminal` call rejects
+ * so a spec can exercise the inline "Couldn't find the terminal window" notice
+ * (SPEC R-15.4b). Declared here (not with the other window-op counters below) so
+ * it exists before `loadScenario` runs at module load. */
+let focusTerminalShouldFail = false;
 let settings: SettingsState = defaultSettings();
 let listeners: Array<(s: StateSnapshot) => void> = [];
 let askCounter = 0;
@@ -69,6 +74,7 @@ function defaultSettings(): SettingsState {
     notifyReminder: false,
     launchAtLogin: false,
     onboardingDone: true,
+    popupPinned: false,
     mcpEnabled: true,
     mcpCliAvailable: true,
     mcpCommand:
@@ -168,6 +174,27 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
     hooksInstalled: true,
     settings: defaultSettings(),
     sessions: [],
+    asks: [],
+  }),
+  // SPEC R-14.3 "true auto-height ... regression-tested: 50 rows → 0": a
+  // fleet large enough to push the popup content well past the 560 cap, so a
+  // Playwright spec can drive `remove_row` down to zero and assert the
+  // content-height report the UI sends via `resize_popup` shrinks back down
+  // instead of sticking at the grown size.
+  'many-sessions': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: Array.from({ length: 50 }, (_, i) =>
+      session({
+        id: `m${i}`,
+        project: `project-${i}`,
+        title: `Session number ${i}`,
+        status: 'idle',
+        inferred: false,
+        cwd: `C:/Users/phily/projects/project-${i}`,
+        since: secondsAgo(i),
+      }),
+    ),
     asks: [],
   }),
   nohooks: () => ({
@@ -327,6 +354,9 @@ function loadScenario(name: string): void {
   hooksInstalled = fixture.hooksInstalled;
   settings = fixture.settings;
   installShouldFail = name === 'error';
+  // SPEC R-15.4b: `?scenario=focus-fail` makes focus_terminal reject so a spec
+  // can assert the inline notice appears (the fixture itself is the default).
+  focusTerminalShouldFail = name === 'focus-fail';
   askCounter = asks.length;
 }
 
@@ -390,6 +420,36 @@ function emit(): void {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// --- Test-observable window-op counters (no real window in mock/browser
+// mode, R-14/R-18) ----------------------------------------------------------
+
+/** Last `contentHeight` reported via `resize_popup` (SPEC R-14.3 auto-height:
+ * lets a Playwright spec assert the reported height shrinks back down once
+ * rows disappear, without a real OS window to measure). */
+let lastResizeContentHeight: number | null = null;
+/** Count of `show_ask_window` invocations (SPEC R-18.1 "(or via popup mirror
+ * click)"): the popup's ask-mirror row click calls this to re-surface the ask
+ * window; there's no second real window in mock mode, so a call counter is
+ * the observable. */
+let showAskWindowCalls = 0;
+/** Records `focus_terminal` calls (SPEC R-15.4): the row click / context-menu
+ * "Focus terminal" invokes it; there's no real terminal in mock/browser mode,
+ * so a spec asserts against this counter (and the last session id). */
+let focusTerminalCalls = 0;
+let lastFocusTerminalId: string | null = null;
+/** Count of `hideCurrentWindow()` calls (SPEC R-18.1 close-X/Esc): the ask
+ * window's own X button / Esc key hide the window directly via the Tauri
+ * window API (see `ipc-client.ts`), bypassing `invoke` entirely — tracked
+ * here instead so a spec can assert the close action fired without
+ * dismissing the pending ask. */
+let hideCurrentWindowCalls = 0;
+
+/** Test-only: records a `hideCurrentWindow()` call (SPEC R-18.1). Exported so
+ * `ipc-client.ts` can call it from the mock branch of `hideCurrentWindow`. */
+export function hideCurrentWindowMock(): void {
+  hideCurrentWindowCalls += 1;
 }
 
 function clearAskAndMaybeRestore(askId: string): void {
@@ -457,7 +517,26 @@ export async function invoke<K extends keyof Commands>(
       return undefined as any;
     }
     case 'resize_popup':
-      // No window to size in mock/browser mode — accept and ignore.
+      // No window to size in mock/browser mode — record the reported content
+      // height (SPEC R-14.3) so a spec can assert it, and otherwise ignore.
+      lastResizeContentHeight = a.contentHeight as number;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
+    case 'show_ask_window':
+      // No second real window in mock/browser mode — record the call (SPEC
+      // R-18.1 "(or via popup mirror click)") so a spec can assert it fired.
+      showAskWindowCalls += 1;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
+    case 'focus_terminal':
+      // SPEC R-15.4: no real terminal in mock/browser mode — record the call so
+      // a spec can assert the row click fired it, and optionally reject to
+      // exercise the inline "Couldn't find the terminal window" notice (R-15.4b).
+      focusTerminalCalls += 1;
+      lastFocusTerminalId = a.sessionId as string;
+      if (focusTerminalShouldFail) {
+        throw new Error("Couldn't find the terminal window");
+      }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
     default:
@@ -482,6 +561,14 @@ export function _mockScenarioNames(): string[] {
   return Object.keys(SCENARIOS);
 }
 
+/** Test-only: clears every session row in one shot (SPEC R-14.3 "50 rows →
+ * 0" regression — bulk-removing via 50 individual `remove_row` calls would
+ * work identically but slow the spec down for no extra coverage). */
+export function _mockRemoveAllSessions(): void {
+  sessions = [];
+  emit();
+}
+
 // Test-only headless hooks for the Playwright e2e harness, attached only in mock
 // mode (no Tauri host). The suite uses `answerAsk` to drive an unrelated
 // `deck://state` push (answering a queued, non-primary ask) and prove a
@@ -490,6 +577,16 @@ if (!isTauri()) {
   (window as unknown as { __qdMock?: Record<string, unknown> }).__qdMock = {
     answerAsk: _mockAnswerAsk,
     scenarioNames: _mockScenarioNames,
+    removeAllSessions: _mockRemoveAllSessions,
+    // R-14.3: last content height the UI reported via `resize_popup`.
+    lastResizeContentHeight: () => lastResizeContentHeight,
+    // R-18.1: counters for the cross-window "reopen" and "close" actions,
+    // which have no observable real-window effect in mock/browser mode.
+    showAskWindowCallCount: () => showAskWindowCalls,
+    hideCurrentWindowCallCount: () => hideCurrentWindowCalls,
+    // R-15.4: click-to-focus counters (no real terminal in mock mode).
+    focusTerminalCallCount: () => focusTerminalCalls,
+    lastFocusTerminalId: () => lastFocusTerminalId,
   };
 }
 

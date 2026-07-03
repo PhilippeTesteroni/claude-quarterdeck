@@ -144,4 +144,88 @@ test.describe('ask window', () => {
     await expect(expiredRow.locator('.qd-ask-row-input')).toHaveCount(0);
     await expect(expiredRow.locator('.qd-ask-row-dismiss')).toHaveText('Dismiss');
   });
+
+  // SPEC R-18.2: the ask window's own title-bar area is draggable, the same
+  // mechanism as the popup header (R-14.1).
+  test('the ask window header is a drag region (R-18.2)', async ({ page }) => {
+    await gotoAsk(page, 'default');
+    await expect(page.locator('.qd-ask .qd-header')).toHaveAttribute('data-tauri-drag-region', 'deep');
+  });
+
+  // SPEC R-18.1: the X (top-right) hides the window WITHOUT dismissing any
+  // pending ask — distinct from per-ask "Dismiss", which resolves it. There's
+  // no second real window to observe hiding in mock/browser mode, so this
+  // asserts the actual required behavior: the ask list is untouched.
+  test('close-X hides without dismissing pending asks (R-18.1)', async ({ page }) => {
+    await gotoAsk(page, 'default');
+    await expect(page.locator('.qd-ask-question')).toContainText('Which approach for the watch line segments');
+    await expect(page.locator('#qd-ask-badge')).toHaveText('1 more waiting');
+
+    await page.locator('#qd-ask-close').click();
+
+    // Unlike Dismiss, the primary ask (and the queued one behind it) is
+    // completely unaffected.
+    await expect(page.locator('.qd-ask-question')).toContainText('Which approach for the watch line segments');
+    await expect(page.locator('#qd-ask-badge')).toHaveText('1 more waiting');
+    await expect(page.locator('.qd-ask-empty')).toHaveCount(0);
+
+    // The window-hide itself fired (SPEC: "closes (hides) the WINDOW").
+    const hideCalls = await page.evaluate(
+      () => (window as unknown as { __qdMock: { hideCurrentWindowCallCount(): number } }).__qdMock.hideCurrentWindowCallCount(),
+    );
+    expect(hideCalls).toBe(1);
+  });
+
+  // SPEC R-18.1: Esc is ALWAYS the same as the X — it never silently
+  // dismisses, whether one ask is pending or several.
+  test('Esc hides without dismissing, with one or several pending (R-18.1)', async ({ page }) => {
+    await gotoAsk(page, 'default');
+    await expect(page.locator('#qd-ask-badge')).toHaveText('1 more waiting');
+
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.qd-ask-question')).toContainText('Which approach for the watch line segments');
+    await expect(page.locator('#qd-ask-badge')).toHaveText('1 more waiting');
+
+    // Down to exactly one pending ask: Esc still hides, never dismisses.
+    await page.getByRole('button', { name: 'Dismiss' }).click();
+    await expect(page.locator('#qd-ask-badge')).toBeHidden();
+    await expect(page.locator('.qd-ask-question')).toContainText('Should the empty state link');
+
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.qd-ask-question')).toContainText('Should the empty state link');
+    await expect(page.locator('.qd-ask-empty')).toHaveCount(0);
+
+    const hideCalls = await page.evaluate(
+      () => (window as unknown as { __qdMock: { hideCurrentWindowCallCount(): number } }).__qdMock.hideCurrentWindowCallCount(),
+    );
+    expect(hideCalls).toBe(2);
+  });
+
+  // SPEC R-18.1 "(or via popup mirror click)": clicking a mirrored ask row in
+  // the popup re-surfaces the ask window.
+  test('clicking a popup mirror row re-surfaces the ask window (R-18.1)', async ({ page }) => {
+    await gotoPopup(page, 'default');
+
+    // Click the row's question text (not a button/input) for the first ask.
+    await page
+      .locator('.qd-ask-row', { hasText: 'CSS grid columns or flex-basis percentages' })
+      .locator('.qd-ask-row-question')
+      .click();
+
+    const showCalls = await page.evaluate(
+      () => (window as unknown as { __qdMock: { showAskWindowCallCount(): number } }).__qdMock.showAskWindowCallCount(),
+    );
+    expect(showCalls).toBe(1);
+
+    // Clicking an option button must NOT also trigger the reopen (it answers
+    // instead) — the row click handler ignores interactive descendants.
+    await page
+      .locator('.qd-ask-row', { hasText: 'CSS grid columns or flex-basis percentages' })
+      .getByRole('button', { name: 'CSS grid columns', exact: true })
+      .click();
+    const showCallsAfterAnswer = await page.evaluate(
+      () => (window as unknown as { __qdMock: { showAskWindowCallCount(): number } }).__qdMock.showAskWindowCallCount(),
+    );
+    expect(showCallsAfterAnswer).toBe(1);
+  });
 });

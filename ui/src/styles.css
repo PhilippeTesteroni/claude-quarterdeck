@@ -141,7 +141,14 @@ button {
   user-select: none;
 }
 
-.qd-gear {
+.qd-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.qd-gear,
+.qd-pin {
   position: relative;
   width: 24px;
   height: 24px;
@@ -155,14 +162,26 @@ button {
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.qd-gear:hover {
+.qd-gear:hover,
+.qd-pin:hover {
   background: var(--surface);
   color: var(--text);
 }
 
-.qd-gear svg {
+.qd-gear svg,
+.qd-pin svg {
   width: 15px;
   height: 15px;
+}
+
+/* Pin-on-top toggle (R-14.2): filled + clay accent while pinned. */
+.qd-pin.pinned {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.qd-pin.pinned svg path {
+  fill: currentColor;
 }
 
 .qd-gear .qd-gear-dot {
@@ -487,6 +506,9 @@ button {
   border-bottom: 1px solid var(--border);
   border-left: 2px solid var(--accent);
   background: color-mix(in srgb, var(--accent) 6%, transparent);
+  /* R-18.1 "(or via popup mirror click)": clicking the row (outside its
+     buttons/input) re-surfaces the ask window. */
+  cursor: pointer;
 }
 
 .qd-ask-row-head {
@@ -819,6 +841,13 @@ button {
   border-bottom: 1px solid var(--border);
 }
 
+.qd-ask-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .qd-ask-badge {
   font-size: 10.5px;
   color: var(--muted);
@@ -826,6 +855,31 @@ button {
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 2px 8px;
+}
+
+/* Close-X (R-18.1): hides the window without dismissing pending asks. */
+.qd-ask-close {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  border-radius: var(--radius-control);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.qd-ask-close:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.qd-ask-close svg {
+  width: 13px;
+  height: 13px;
 }
 
 .qd-ask-content {

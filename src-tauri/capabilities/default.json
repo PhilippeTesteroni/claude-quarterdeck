@@ -1,12 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Grants the popup and ask webviews the live state push (deck://state via core:event listen, SPEC R-3.4) and the hide-on-Esc window control (R-7.1). Without this, Tauri v2's default-deny ACL blocks event.listen so the frontend never live-updates and the first-run onboarding card never renders (R-10.2).",
+  "description": "Grants the popup and ask webviews the live state push (deck://state via core:event listen, SPEC R-3.4), the hide-on-Esc/close-X window control (R-7.1, R-18.1), and the draggable header/title-bar region (R-14.1, R-18.2). Without this, Tauri v2's default-deny ACL blocks event.listen so the frontend never live-updates and the first-run onboarding card never renders (R-10.2).",
   "windows": ["popup", "ask"],
   "permissions": [
     "core:default",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "core:window:allow-hide"
+    "core:window:allow-hide",
+    "core:window:allow-start-dragging"
   ]
 }

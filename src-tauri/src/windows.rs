@@ -1,8 +1,10 @@
 //! Window management: the frameless popup anchored to the tray with hide-on-blur
-//! / Esc (SPEC R-7.1), and the always-on-top ask window that does not steal
-//! keyboard focus on appear (SPEC R-8.3, `WS_EX_NOACTIVATE`-equivalent).
+//! / Esc (SPEC R-7.1), draggable + pin-on-top + true auto-height (SPEC R-14),
+//! and the always-on-top ask window that does not steal keyboard focus on
+//! appear (SPEC R-8.3, `WS_EX_NOACTIVATE`-equivalent) and is itself draggable
+//! (SPEC R-18.2).
 //!
-//! Filled in by T3.
+//! Filled in by T3; extended for the v1.1 addendum (F1: §14, §18).
 
 use std::sync::Mutex;
 
@@ -17,11 +19,13 @@ pub const ASK_LABEL: &str = "ask";
 /// popup (SPEC R-7.1 "anchored to tray icon").
 const ANCHOR_GAP_PX: i32 = 6;
 
-/// Popup logical width and the base/cap heights (SPEC R-7.1: "360×460
-/// (max-height 560 then scroll)"): it grows with content from 460 up to a
-/// 560 cap, beyond which the content area scrolls.
+/// Popup logical width and the min/cap heights (SPEC R-14.3: "true
+/// auto-height ... clamp(header + watchline + rows + footer, 160, 560)"): the
+/// v1.0 460 floor is removed — an empty popup may be as compact as 160 — and
+/// it still grows with content up to the 560 cap, beyond which the content
+/// area scrolls (R-7.1).
 const POPUP_W: f64 = 360.0;
-const POPUP_MIN_H: f64 = 460.0;
+const POPUP_MIN_H: f64 = 160.0;
 const POPUP_MAX_H: f64 = 560.0;
 
 /// The tray-icon rect the popup was last anchored to. Kept so a content-driven
@@ -29,6 +33,27 @@ const POPUP_MAX_H: f64 = 560.0;
 /// without waiting for a fresh tray click — otherwise growing the window would
 /// extend it over the taskbar/tray instead of away from it.
 static LAST_TRAY_RECT: Mutex<Option<Rect>> = Mutex::new(None);
+
+/// SPEC R-14.2 pin-on-top state, mirrored from `settings.json`'s
+/// `popupPinned` by [`set_popup_pinned`]. Read by the hide-on-blur handler and
+/// by [`toggle_popup`]/[`open_popup`] (a pinned popup does not re-anchor to
+/// the tray on open — it stays wherever the user left it).
+static POPUP_PINNED: Mutex<bool> = Mutex::new(false);
+
+/// SPEC R-14.1/R-14.3: whether the user has manually dragged the popup since
+/// it was last anchored to the tray. While true, a content-driven resize must
+/// keep the window's top edge fixed and never re-anchor to the tray — see
+/// [`should_reanchor_on_resize`]. Reset to `false` whenever the popup is
+/// freshly anchored (a fresh open re-establishes "not moved").
+static POPUP_USER_MOVED: Mutex<bool> = Mutex::new(false);
+
+/// Count of position changes `windows.rs` itself is about to make (via
+/// [`anchor_near_tray`]) that haven't yet been observed as a `Moved` window
+/// event. Lets the popup's `Moved` handler tell a genuine user drag (R-14.1)
+/// apart from our own re-anchoring, without which every programmatic
+/// `set_position` would be mistaken for a user move and permanently disable
+/// tray-following.
+static PENDING_PROGRAMMATIC_MOVES: Mutex<u32> = Mutex::new(0);
 
 fn remember_tray_rect(rect: Rect) {
     if let Ok(mut guard) = LAST_TRAY_RECT.lock() {
@@ -40,11 +65,91 @@ fn last_tray_rect() -> Option<Rect> {
     LAST_TRAY_RECT.lock().ok().and_then(|guard| *guard)
 }
 
-/// Pure clamp for the popup's grow-then-scroll band (SPEC R-7.1): content
-/// shorter than 460 keeps the base height; taller content grows up to 560,
+fn set_popup_pinned_flag(pinned: bool) {
+    if let Ok(mut guard) = POPUP_PINNED.lock() {
+        *guard = pinned;
+    }
+}
+
+fn popup_pinned() -> bool {
+    POPUP_PINNED.lock().map(|g| *g).unwrap_or(false)
+}
+
+fn set_popup_user_moved(moved: bool) {
+    if let Ok(mut guard) = POPUP_USER_MOVED.lock() {
+        *guard = moved;
+    }
+}
+
+fn popup_user_moved() -> bool {
+    POPUP_USER_MOVED.lock().map(|g| *g).unwrap_or(false)
+}
+
+/// Called immediately before every programmatic `set_position` on the popup
+/// (i.e. inside [`anchor_near_tray`]) so the next `Moved` event is attributed
+/// to us, not the user.
+fn note_programmatic_move() {
+    if let Ok(mut n) = PENDING_PROGRAMMATIC_MOVES.lock() {
+        *n += 1;
+    }
+}
+
+/// Pure decision for the popup's `Moved` window event: does it represent a
+/// genuine user drag (SPEC R-14.1), or one of our own anchor repositions?
+/// `pending` is the outstanding count of moves we ourselves initiated; a
+/// pending programmatic move is consumed (decremented) and reported as NOT a
+/// user move, otherwise the observed move is the user's own drag. Kept pure
+/// (no static access) so it's unit-testable without a live window.
+fn is_user_initiated_move(pending: &mut u32) -> bool {
+    if *pending > 0 {
+        *pending -= 1;
+        false
+    } else {
+        true
+    }
+}
+
+/// Called from the popup's `WindowEvent::Moved` handler.
+fn note_move_event() {
+    let mut pending = PENDING_PROGRAMMATIC_MOVES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if is_user_initiated_move(&mut pending) {
+        drop(pending);
+        set_popup_user_moved(true);
+    }
+}
+
+/// Pure clamp for the popup's grow-then-scroll band (SPEC R-14.3): content
+/// shorter than the 160 floor keeps that floor (the v1.0 460 floor is
+/// removed — an empty popup may be compact); taller content grows up to 560,
 /// beyond which the window stays at 560 and the content area scrolls.
 fn popup_target_height(content_px: f64) -> f64 {
     content_px.clamp(POPUP_MIN_H, POPUP_MAX_H)
+}
+
+/// SPEC R-14.2: whether the popup should hide when it loses focus. Pinned
+/// disables hide-on-blur entirely (the window stays until unpinned/Esc/tray
+/// click); unpinned keeps the v1.0 behavior. Pure so it's unit-testable
+/// without a live window.
+fn should_hide_on_blur(pinned: bool) -> bool {
+    !pinned
+}
+
+/// SPEC R-14.2: whether opening the popup (tray click / toast click) should
+/// re-anchor it near the tray. Pinned popups stay wherever the user left them
+/// ("Unpinned → v1.0 behavior: anchor to tray on open").
+fn should_anchor_on_open(pinned: bool) -> bool {
+    !pinned
+}
+
+/// SPEC R-14.3: whether a content-driven resize should re-anchor the popup
+/// (so it grows away from the tray edge). Skipped when pinned (never
+/// tray-anchored while pinned) or when the user has manually moved the
+/// window (growth then keeps the TOP edge fixed instead, since `set_size`
+/// alone never touches the window's position).
+fn should_reanchor_on_resize(pinned: bool, user_moved: bool) -> bool {
+    !pinned && !user_moved
 }
 
 fn popup_window(app: &AppHandle) -> Result<WebviewWindow, String> {
@@ -118,8 +223,11 @@ pub fn setup_popup_behavior(app: &AppHandle) -> Result<(), String> {
 fn attach_popup_behavior(popup: &WebviewWindow) -> Result<(), String> {
     let on_event = popup.clone();
     popup.on_window_event(move |event| match event {
+        // SPEC R-14.2: pinned disables hide-on-blur entirely.
         WindowEvent::Focused(false) => {
-            let _ = on_event.hide();
+            if should_hide_on_blur(popup_pinned()) {
+                let _ = on_event.hide();
+            }
         }
         // R-3.6: the popup is created once and only hidden/shown — never
         // destroyed. A native close (the OS window `closable: false` flag is
@@ -130,6 +238,12 @@ fn attach_popup_behavior(popup: &WebviewWindow) -> Result<(), String> {
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             let _ = on_event.hide();
+        }
+        // SPEC R-14.1/R-14.3: track user drags so a content-driven resize
+        // knows whether to keep re-anchoring near the tray or leave the
+        // window where the user put it.
+        WindowEvent::Moved(_) => {
+            note_move_event();
         }
         _ => {}
     });
@@ -150,8 +264,25 @@ fn attach_popup_behavior(popup: &WebviewWindow) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+/// Applies the SPEC R-14.2 pin-on-top toggle: persists the flag (read by the
+/// hide-on-blur handler and the open/resize anchoring above), sets/clears
+/// native always-on-top, and gives the caller a visual state to reflect
+/// (`ui/src/popup.ts` reads this back from `SettingsState.popupPinned`, R-3.4
+/// keeps the decision itself in Rust). Invoked by `apply_setting_side_effect`
+/// when the `popupPinned` setting changes.
+pub fn set_popup_pinned(app: &AppHandle, pinned: bool) -> Result<(), String> {
+    set_popup_pinned_flag(pinned);
+    let popup = popup_window(app)?;
+    popup
+        .set_always_on_top(pinned)
+        .map_err(|err| err.to_string())
+}
+
 /// Positions the popup near the tray icon and shows/focuses it, or hides it
-/// if it's already visible (SPEC R-7.1: click toggles).
+/// if it's already visible (SPEC R-7.1: click toggles). SPEC R-14.2: while
+/// pinned, opening does NOT re-anchor near the tray — the popup stays wherever
+/// the user left it; an explicit tray click still toggles visibility either
+/// way.
 pub fn toggle_popup(app: &AppHandle, tray_rect: Rect) -> Result<(), String> {
     remember_tray_rect(tray_rect);
     let popup = popup_window(app)?;
@@ -159,29 +290,40 @@ pub fn toggle_popup(app: &AppHandle, tray_rect: Rect) -> Result<(), String> {
     if visible {
         return popup.hide().map_err(|err| err.to_string());
     }
-    anchor_near_tray(&popup, tray_rect)?;
+    if should_anchor_on_open(popup_pinned()) {
+        anchor_near_tray(&popup, tray_rect)?;
+        set_popup_user_moved(false);
+    }
     popup.show().map_err(|err| err.to_string())?;
     popup.set_focus().map_err(|err| err.to_string())
 }
 
 /// Shows and focuses the popup near the tray icon (used by toast-click routing,
 /// SPEC R-9.6). Unlike [`toggle_popup`] it never hides an already-open popup —
-/// a toast click should always bring the deck forward.
+/// a toast click should always bring the deck forward. SPEC R-14.2: skips the
+/// re-anchor while pinned.
 pub fn open_popup(app: &AppHandle) -> Result<(), String> {
     let popup = popup_window(app)?;
-    if let Some(rect) = last_tray_rect() {
-        let _ = anchor_near_tray(&popup, rect);
+    if should_anchor_on_open(popup_pinned()) {
+        if let Some(rect) = last_tray_rect() {
+            let _ = anchor_near_tray(&popup, rect);
+            set_popup_user_moved(false);
+        }
     }
     popup.show().map_err(|err| err.to_string())?;
     popup.set_focus().map_err(|err| err.to_string())
 }
 
 /// Resizes the popup to fit `content_px` logical pixels of content, clamped to
-/// the 460..=560 band (SPEC R-7.1 grow-then-scroll). A visible popup is
-/// re-anchored so it grows away from the tray edge rather than over it. The
-/// frontend measures its own content height and drives this via the
-/// `resize_popup` command (R-3.4: logic stays in Rust, the view just reports a
-/// number).
+/// the 160..=560 band (SPEC R-14.3 true auto-height, grow-then-scroll floor
+/// lowered from the v1.0 460). A visible, unpinned, not-user-moved popup is
+/// re-anchored so it grows away from the tray edge rather than over it; once
+/// the user has manually dragged the window (R-14.1), or while pinned, the
+/// re-anchor is skipped — `set_size` alone never moves the window's top-left,
+/// so the top edge stays fixed and the window simply grows/shrinks downward
+/// (R-14.3). The frontend measures its own content height and drives this via
+/// the `resize_popup` command (R-3.4: logic stays in Rust, the view just
+/// reports a number).
 pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), String> {
     let popup = popup_window(app)?;
     let target_h = popup_target_height(content_px);
@@ -194,7 +336,9 @@ pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), S
     popup
         .set_size(LogicalSize::new(POPUP_W, target_h))
         .map_err(|err| err.to_string())?;
-    if popup.is_visible().unwrap_or(false) {
+    if popup.is_visible().unwrap_or(false)
+        && should_reanchor_on_resize(popup_pinned(), popup_user_moved())
+    {
         if let Some(rect) = last_tray_rect() {
             let _ = anchor_near_tray(&popup, rect);
         }
@@ -266,6 +410,9 @@ fn anchor_near_tray(popup: &WebviewWindow, tray_rect: Rect) -> Result<(), String
         ),
     );
 
+    // R-14.1/R-14.3: mark this reposition as ours before it fires, so the
+    // popup's `Moved` handler doesn't mistake it for a user drag.
+    note_programmatic_move();
     popup
         .set_position(PhysicalPosition::new(x, y))
         .map_err(|err| err.to_string())
@@ -406,11 +553,12 @@ mod tests {
 
     #[test]
     fn popup_height_grows_then_caps_at_560() {
-        // SPEC R-7.1 "360×460 (max-height 560 then scroll)".
+        // SPEC R-14.3 "true auto-height ... clamp(..., 160, 560)": the v1.0
+        // 460 floor is removed.
         assert_eq!(
-            popup_target_height(120.0),
+            popup_target_height(60.0),
             POPUP_MIN_H,
-            "short content → base 460"
+            "short/empty content → the 160 floor, not the removed 460 one"
         );
         assert_eq!(popup_target_height(500.0), 500.0, "grows with content");
         assert_eq!(
@@ -418,5 +566,83 @@ mod tests {
             POPUP_MAX_H,
             "capped at 560, then scrolls"
         );
+    }
+
+    #[test]
+    fn popup_height_shrinks_back_when_rows_disappear() {
+        // SPEC R-14.3 regression: "height shrinks back when rows disappear
+        // (regression-tested: 50 rows → 0)". 50 rows of content (well past the
+        // scroll cap) must clamp to 560, and once content collapses back to a
+        // near-empty popup the target height must shrink right back down to
+        // the (now-lower) 160 floor — never "stick" at the grown size.
+        let fifty_rows = 40.0 * 50.0 + 90.0; // ~header+watchline+footer + 50 rows
+        assert_eq!(
+            popup_target_height(fifty_rows),
+            POPUP_MAX_H,
+            "50 rows caps at 560"
+        );
+        let zero_rows = 90.0; // header + watchline + footer only, no rows
+        assert_eq!(
+            popup_target_height(zero_rows),
+            POPUP_MIN_H,
+            "back to 0 rows shrinks to the 160 floor, not stuck at 560"
+        );
+    }
+
+    #[test]
+    fn hide_on_blur_is_disabled_only_while_pinned() {
+        // SPEC R-14.2.
+        assert!(should_hide_on_blur(false), "unpinned keeps v1.0 behavior");
+        assert!(!should_hide_on_blur(true), "pinned disables hide-on-blur");
+    }
+
+    #[test]
+    fn anchor_on_open_is_skipped_only_while_pinned() {
+        // SPEC R-14.2 "Unpinned → v1.0 behavior (anchor to tray on open)".
+        assert!(should_anchor_on_open(false));
+        assert!(!should_anchor_on_open(true));
+    }
+
+    #[test]
+    fn reanchor_on_resize_requires_unpinned_and_not_user_moved() {
+        // SPEC R-14.3: re-anchoring on a content-driven resize only happens
+        // when the popup is neither pinned nor manually moved by the user;
+        // either condition alone is enough to skip it (grow-in-place instead).
+        assert!(should_reanchor_on_resize(false, false));
+        assert!(
+            !should_reanchor_on_resize(true, false),
+            "pinned skips re-anchor"
+        );
+        assert!(
+            !should_reanchor_on_resize(false, true),
+            "user-moved skips re-anchor (R-14.1 top-edge-fixed growth)"
+        );
+        assert!(!should_reanchor_on_resize(true, true));
+    }
+
+    #[test]
+    fn programmatic_moves_are_not_mistaken_for_a_user_drag() {
+        // SPEC R-14.1/R-14.3: `anchor_near_tray` marks its own reposition
+        // before it fires; the resulting `Moved` event must be consumed as
+        // "ours", not flagged as a user drag.
+        let mut pending = 0u32;
+        assert!(
+            is_user_initiated_move(&mut pending),
+            "with nothing pending, an observed move is the user's own drag"
+        );
+
+        pending = 1;
+        assert!(
+            !is_user_initiated_move(&mut pending),
+            "a pending programmatic move consumes the flag instead of flagging a user drag"
+        );
+        assert_eq!(pending, 0, "the pending count is decremented once consumed");
+
+        // A burst of N programmatic moves is consumed one at a time; only a
+        // move beyond that count is the user's.
+        pending = 2;
+        assert!(!is_user_initiated_move(&mut pending));
+        assert!(!is_user_initiated_move(&mut pending));
+        assert!(is_user_initiated_move(&mut pending));
     }
 }

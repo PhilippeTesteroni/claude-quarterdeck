@@ -18,4 +18,5 @@ pub mod events;
 pub mod hooks_config;
 pub mod liveness;
 pub mod naming;
+pub mod registry;
 pub mod traits;

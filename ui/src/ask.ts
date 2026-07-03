@@ -5,13 +5,14 @@
  * the user answer it via option buttons (keys 1-9), free text, or dismiss.
  */
 
-import { invoke, onState } from './ipc-client';
+import { hideCurrentWindow, invoke, onState } from './ipc-client';
 import type { AskAnswerKind, AskRow, SessionRow, StateSnapshot } from './ipc-contract';
 import { formatCountdown, truncate } from './format';
 import { clear, h } from './dom';
 
 const elContent = document.getElementById('qd-ask-content') as HTMLElement;
 const elBadge = document.getElementById('qd-ask-badge') as HTMLElement;
+const elClose = document.getElementById('qd-ask-close') as HTMLButtonElement;
 
 let latest: StateSnapshot | null = null;
 let countdownEl: HTMLElement | null = null;
@@ -225,7 +226,20 @@ onState((snap) => {
   render(snap);
 });
 
+// R-18.1: the X (top-right) closes (hides) the WINDOW without dismissing any
+// pending ask — they stay queued + mirrored in the popup, badge intact; the
+// window re-appears on the next new ask/perm (or via a popup mirror click).
+// This is distinct from per-ask "Dismiss", which resolves that ask.
+elClose.addEventListener('click', () => hideCurrentWindow());
+
 document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    // R-18.1: Esc is ALWAYS the same as the X button — it hides the window,
+    // it never silently dismisses a pending ask, whether one or many are
+    // queued.
+    hideCurrentWindow();
+    return;
+  }
   if (!latest || latest.asks.length === 0) return;
   if (document.activeElement === freeTextInput) return;
   const digit = Number(ev.key);

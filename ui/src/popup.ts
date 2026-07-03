@@ -15,6 +15,7 @@ const elContent = document.getElementById('qd-content') as HTMLElement;
 const elFooter = document.getElementById('qd-footer') as HTMLElement;
 const elSettings = document.getElementById('qd-settings') as HTMLElement;
 const elGear = document.getElementById('qd-gear') as HTMLButtonElement;
+const elPin = document.getElementById('qd-pin') as HTMLButtonElement;
 
 let latest: StateSnapshot | null = null;
 let receivedAtPerf = 0;
@@ -71,6 +72,20 @@ document.addEventListener('scroll', closeCtxMenu, true);
 function openCtxMenu(x: number, y: number, row: SessionRow): void {
   closeCtxMenu();
   const menu = h('div', { className: 'qd-ctx-menu', style: `left:${x}px;top:${y}px` }, [
+    // SPEC R-15.4: "Focus terminal" is the first context-menu item.
+    h(
+      'button',
+      {
+        className: 'qd-ctx-item',
+        type: 'button',
+        onclick: (ev: Event) => {
+          ev.stopPropagation();
+          focusTerminal(row.id);
+          closeCtxMenu();
+        },
+      },
+      ['Focus terminal'],
+    ),
     h(
       'button',
       {
@@ -107,6 +122,42 @@ function openCtxMenu(x: number, y: number, row: SessionRow): void {
   ctxMenuEl = menu;
 }
 
+/** SPEC R-15.4b: a transient inline notice shown in the popup when the terminal
+ * window couldn't be focused ("toast-in-window"). Auto-dismisses. */
+let focusNoticeEl: HTMLElement | null = null;
+let focusNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+function showFocusNotice(message: string): void {
+  focusNoticeEl?.remove();
+  if (focusNoticeTimer) clearTimeout(focusNoticeTimer);
+  const el = h(
+    'div',
+    {
+      className: 'qd-focus-notice',
+      style:
+        'position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:50;' +
+        'max-width:92%;padding:6px 12px;border-radius:6px;font-size:12px;' +
+        'background:var(--surface,#161b22);color:var(--text,#e6edf3);' +
+        'border:1px solid var(--border,#30363d);box-shadow:0 4px 14px rgba(0,0,0,.35);',
+    },
+    [message],
+  );
+  document.body.append(el);
+  focusNoticeEl = el;
+  focusNoticeTimer = setTimeout(() => {
+    el.remove();
+    if (focusNoticeEl === el) focusNoticeEl = null;
+  }, 2600);
+}
+
+/** SPEC R-15.4: focus the terminal hosting a session. On failure the shell
+ * rejects with "Couldn't find the terminal window", shown inline (R-15.4b). */
+function focusTerminal(sessionId: string): void {
+  void invoke('focus_terminal', { sessionId }).catch((err) => {
+    showFocusNotice(err instanceof Error ? err.message : String(err));
+  });
+}
+
 function renderSessionRow(row: SessionRow): HTMLElement {
   const timeEl = h('span', { className: 'qd-row-time mono' }, [formatDuration(row.sinceMs)]);
   timeTicks.push({ el: timeEl, base: row.sinceMs });
@@ -116,6 +167,9 @@ function renderSessionRow(row: SessionRow): HTMLElement {
     {
       className: 'qd-row',
       title: row.cwd,
+      // SPEC R-15.4: a row click focuses the terminal window hosting the
+      // session (the former row-click no-op is gone).
+      onclick: () => focusTerminal(row.id),
       oncontextmenu: (ev: Event) => {
         ev.preventDefault();
         const mouse = ev as MouseEvent;
@@ -149,6 +203,17 @@ function askAgentLabel(ask: AskRow): string {
  * silently discarding the user's first answer. Single-flight prevents it. */
 const answeredAsks = new Set<string>();
 
+/** SPEC R-18.1 "(or via popup mirror click)": clicking a mirrored ask row
+ * re-surfaces the ask window (a no-op if it's already visible) after it was
+ * closed via its own X while asks are still pending. Ignored when the click
+ * actually hit an interactive control (option/dismiss button, the free-text
+ * input) so those keep their own behavior. */
+function reopenAskWindowUnlessInteractive(ev: Event): void {
+  const target = ev.target as HTMLElement | null;
+  if (target?.closest('button, input')) return;
+  void invoke('show_ask_window', undefined).catch(() => undefined);
+}
+
 function renderAskMirrorRow(ask: AskRow): HTMLElement {
   const send = (answer: string, kind: AskAnswerKind): void => {
     if (answeredAsks.has(ask.id)) return;
@@ -162,7 +227,7 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
   // R-8.7: an ask recovered after a restart can never be answered — show it as
   // expired with only a Dismiss action, "never answered into the void".
   if (ask.orphaned) {
-    return h('div', { className: 'qd-ask-row qd-ask-row-expired' }, [
+    return h('div', { className: 'qd-ask-row qd-ask-row-expired', onclick: reopenAskWindowUnlessInteractive }, [
       h('div', { className: 'qd-ask-row-head' }, [
         h('span', { className: 'qd-ask-row-agent' }, [askAgentLabel(ask)]),
         h('span', { style: 'color:var(--muted)' }, ['· expired']),
@@ -201,7 +266,7 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
     ),
   );
 
-  return h('div', { className: 'qd-ask-row' }, [
+  return h('div', { className: 'qd-ask-row', onclick: reopenAskWindowUnlessInteractive }, [
     h('div', { className: 'qd-ask-row-head' }, [
       h('span', { className: 'qd-ask-row-agent' }, [askAgentLabel(ask)]),
       h('span', { style: 'color:var(--muted)' }, ['asks:']),
@@ -336,6 +401,16 @@ function renderOnboarding(settings: SettingsState, hooksInstalled: boolean): HTM
 
 function renderGearIssue(hooksInstalled: boolean): void {
   elGear.classList.toggle('has-issue', !hooksInstalled);
+}
+
+/** SPEC R-14.2: reflects the persisted pin state on the header icon (filled +
+ * clay accent when pinned). The click handler below sends the toggle; the
+ * shell is the one deciding always-on-top/hide-on-blur (R-3.4), this only
+ * mirrors what came back on the last snapshot. */
+function renderPinState(pinned: boolean): void {
+  elPin.classList.toggle('pinned', pinned);
+  elPin.setAttribute('aria-pressed', String(pinned));
+  elPin.title = pinned ? 'Unpin' : 'Pin on top';
 }
 
 /** In-progress state of a mirrored ask-row free-text field, captured before a
@@ -524,6 +599,7 @@ function renderSettings(snap: StateSnapshot): void {
       notifyReminder: false,
       launchAtLogin: false,
       onboardingDone: true,
+      popupPinned: false,
       mcpEnabled: false,
       mcpCliAvailable: true,
       dataDir: '',
@@ -619,21 +695,52 @@ function renderAll(): void {
   renderContent(latest);
   renderFooter(latest.counts);
   renderGearIssue(latest.hooksInstalled);
+  renderPinState(latest.settings?.popupPinned ?? false);
   if (settingsOpen) renderSettings(latest);
   syncPopupHeight();
 }
 
-/** R-7.1 grow-then-scroll: report the intrinsic content height so the shell can
- * size the window (clamped to 460..=560 in Rust). `.qd-content` scrolls
- * internally, so its `scrollHeight` is the full natural content height even
- * while the window constrains it. No-op in mock/browser mode and while the
- * settings overlay is open (it has its own scroll). */
+/** R-14.3 true auto-height: report the intrinsic content height so the shell
+ * can size the window (clamped to 160..=560 in Rust — the v1.0 460 floor is
+ * removed). Reported (and recorded by the mock, for Playwright's R-14.3
+ * shrink regression spec) even in mock/browser mode, since there's no window
+ * to size there but the number itself is still test-observable; skipped
+ * while the settings overlay is open (it has its own scroll). */
 function syncPopupHeight(): void {
-  if (usingMock || settingsOpen) return;
+  if (settingsOpen) return;
+  const appEl = document.getElementById('app') as HTMLElement | null;
   const header = document.querySelector('.qd-header') as HTMLElement | null;
+
+  // `#app` is normally stretched to fill the current window height (`height:
+  // 100%`, capped at `max-height: 560px`) — that's the actual OS window in
+  // the real app, or just the browser viewport in mock/browser mode. Either
+  // way, `.qd-content` (and, inside it, `.qd-empty`'s own centering flex box)
+  // is `flex: 1 1 auto`, so it STRETCHES to fill that already-stretched
+  // ancestor, making its `scrollHeight` report the ambient box size rather
+  // than its true intrinsic content size. That's invisible while content is
+  // GROWING past the box (scrollHeight still reports the larger real size),
+  // but it silently masks SHRINKING: once rows disappear the box is still
+  // whatever size it last was, and every flex-grow child just re-stretches to
+  // fill it — so the reported height would never shrink back down (R-14.3
+  // regression: "50 rows → 0"). Momentarily letting `#app` size to its own
+  // content removes that ambient stretch for every descendant, so
+  // `elContent.scrollHeight` reflects the *true* intrinsic content height;
+  // restoring right after is a same-tick style read+write, so it never
+  // paints an intermediate frame.
+  const prevHeight = appEl?.style.height ?? '';
+  const prevMaxHeight = appEl?.style.maxHeight ?? '';
+  if (appEl) {
+    appEl.style.height = 'auto';
+    appEl.style.maxHeight = 'none';
+  }
   const headerH = header?.offsetHeight ?? 0;
   const contentH = elContent.scrollHeight;
   const footerH = elFooter.style.display === 'none' ? 0 : elFooter.offsetHeight;
+  if (appEl) {
+    appEl.style.height = prevHeight;
+    appEl.style.maxHeight = prevMaxHeight;
+  }
+
   const total = headerH + contentH + footerH;
   void invoke('resize_popup', { contentHeight: total }).catch(() => undefined);
 }
@@ -642,6 +749,13 @@ elGear.addEventListener('click', () => {
   settingsOpen = !settingsOpen;
   if (settingsOpen && latest) renderSettings(latest);
   elSettings.classList.toggle('open', settingsOpen);
+});
+
+// SPEC R-14.2: toggles the persisted pin state; the shell applies
+// always-on-top + disables hide-on-blur (R-3.4 keeps that logic in Rust).
+elPin.addEventListener('click', () => {
+  const next = !(latest?.settings?.popupPinned ?? false);
+  void invoke('set_setting', { key: 'popupPinned', value: next });
 });
 
 document.addEventListener('keydown', (ev) => {

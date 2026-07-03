@@ -110,6 +110,11 @@ pub struct Settings {
     pub launch_at_login: bool,
     #[serde(default)]
     pub onboarding_done: bool,
+    /// Popup pin-on-top state (SPEC R-14.2): persists across restarts so a
+    /// pinned popup stays pinned. Defaults off (v1.0 anchor/hide-on-blur
+    /// behavior).
+    #[serde(default)]
+    pub popup_pinned: bool,
     /// Unknown top-level keys, preserved verbatim (SPEC R-10.1).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -123,6 +128,7 @@ impl Default for Settings {
             notify_reminder: false,
             launch_at_login: false,
             onboarding_done: false,
+            popup_pinned: false,
             extra: Map::new(),
         }
     }
@@ -156,6 +162,7 @@ impl Settings {
             notify_reminder: take_bool(&mut map, "notifyReminder", false),
             launch_at_login: take_bool(&mut map, "launchAtLogin", false),
             onboarding_done: take_bool(&mut map, "onboardingDone", false),
+            popup_pinned: take_bool(&mut map, "popupPinned", false),
             extra: map,
         })
     }
@@ -169,6 +176,7 @@ impl Settings {
             "notifyReminder" => self.notify_reminder = value.as_bool_lossy(),
             "launchAtLogin" => self.launch_at_login = value.as_bool_lossy(),
             "onboardingDone" => self.onboarding_done = value.as_bool_lossy(),
+            "popupPinned" => self.popup_pinned = value.as_bool_lossy(),
             other => {
                 self.extra.insert(other.to_string(), value.into());
             }
@@ -425,6 +433,20 @@ mod tests {
         assert!(settings.launch_at_login);
         settings.apply("notifyIdle", SettingValue::Bool(false));
         assert!(!settings.notify_idle);
+        settings.apply("popupPinned", SettingValue::Bool(true));
+        assert!(settings.popup_pinned);
+    }
+
+    #[test]
+    fn popup_pinned_defaults_off_and_persists() {
+        // SPEC R-14.2: pin state persists across restarts, default off (v1.0
+        // anchor/hide-on-blur behavior).
+        assert!(!Settings::default().popup_pinned);
+
+        let dir = unique_dir("popup-pinned");
+        let updated = set_setting(&dir, "popupPinned", SettingValue::Bool(true)).unwrap();
+        assert!(updated.popup_pinned);
+        assert!(load(&dir).popup_pinned, "pin state survives a reload");
     }
 
     #[test]
