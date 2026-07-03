@@ -217,9 +217,17 @@ $env:QUARTERDECK_CLAUDE_DIR = $smokeClaudeDir
 
    ```powershell
    $env:CLAUDE_CONFIG_DIR = $smokeClaudeDir   # same path as step 1
+   $env:QUARTERDECK_DATA_DIR = $smokeDataDir  # ALSO required — see note
    cd C:\path\to\some\scratch\project
    claude
    ```
+
+   > **Set `QUARTERDECK_DATA_DIR` for the `claude` process too, not just
+   > `CLAUDE_CONFIG_DIR`.** The installed hook script resolves its spool
+   > directory from `QUARTERDECK_DATA_DIR` (falling back to the real
+   > `%APPDATA%\quarterdeck`). If the claude terminal only sets
+   > `CLAUDE_CONFIG_DIR`, its hooks write into your *real* data dir and the
+   > isolated Quarterdeck instance never sees the session.
 
    - Submit any prompt. Expect: a new row appears in the popup titled from
      the prompt (R-5.2), status `working` while Claude is executing.
