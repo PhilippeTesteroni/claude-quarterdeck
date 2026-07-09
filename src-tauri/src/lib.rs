@@ -23,8 +23,10 @@ pub mod foreground;
 pub mod ipc;
 pub mod mcp_server;
 pub mod notify;
+pub mod session_names;
 pub mod settings;
 pub mod tray;
+pub mod util;
 pub mod watcher;
 pub mod windows;
 
@@ -54,6 +56,7 @@ use crate::ipc::{
 use crate::mcp_server::{AskAnswer, AskGateway, AskRequest, NotifyRequest, SubmittedAsk};
 use crate::notify::DesktopNotifier;
 use crate::settings::{PopupMode, Settings};
+use crate::util::CommandNoWindow;
 
 /// Rust-side liveness / recovery / prune cadence (R-3.6, R-6.1).
 const ENGINE_TICK: Duration = Duration::from_secs(10);
@@ -423,6 +426,9 @@ fn ask_to_row(ask: &ShellAsk) -> AskRow {
         project: ask.project.clone(),
         question: ask.question.clone(),
         options: ask.options.clone(),
+        // R-29.5: carry the multi-question form through to the UI so the ask
+        // window renders it and the popup mirror shows "N questions".
+        questions: ask.questions.clone(),
         detail: ask.detail.clone(),
         // R-19.2: a persistent ask has no expiry, so it carries no countdown.
         timeout_at: if ask.persistent {
@@ -448,6 +454,14 @@ fn ask_to_row(ask: &ShellAsk) -> AskRow {
 const PERM_INPUT_CAP: usize = 2048;
 /// Display cap for a tool name (defence in depth; real names are short).
 const PERM_TOOL_NAME_CAP: usize = 200;
+/// SPEC R-32.1: a pending perm's lifetime. The `PermissionRequest` hook that
+/// raised it polls `<data>/perm-answers/` with a 90 s timeout (R-16.1), so a
+/// deck decision made past this point can never reach the hook — it has already
+/// exited and Claude Code has fallen back to the terminal dialog. Past this
+/// deadline (`received_ms + PERM_DEADLINE_MS`) the perm is swept off the tick
+/// (mirror of `AskStore::sweep_expired`) and, until swept, the UI disables its
+/// Allow/Deny buttons so a stale answer is never routed into the void.
+const PERM_DEADLINE_MS: u64 = 90_000;
 
 /// SPEC R-16.2: the perm modal body is "tool name + compact pretty-printed input
 /// (truncated)". The hook serialises `tool_input` to a JSON string and caps it at
@@ -458,9 +472,11 @@ const PERM_TOOL_NAME_CAP: usize = 200;
 /// formatted it. When it does NOT parse — a `tool_input` that overflowed the hook's
 /// 2KB cap and was truncated mid-JSON — we keep the hook's text verbatim rather
 /// than invent structure from a fragment (the truncation-safety note from QA round
-/// 6); the ps1/python hooks pretty-print BEFORE truncating, so even that fragment
-/// stays indented up to the cut. Bidi-stripping and the display cap are applied by
-/// the caller AFTER this, per R-16.5.
+/// 6). On that fallback branch ONLY we still un-escape the printable-ASCII `\uXXXX`
+/// escapes PowerShell's `ConvertTo-Json` over-produces (`'`, `<`, `>`, `&`, …) so a
+/// truncated blob reads as text instead of `'`/`<` noise (§28); the parse
+/// path is untouched because serde already decodes those escapes natively. Bidi-
+/// stripping and the display cap are applied by the caller AFTER this, per R-16.5.
 fn pretty_tool_input(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -468,8 +484,50 @@ fn pretty_tool_input(raw: &str) -> String {
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| raw.to_string()),
-        Err(_) => raw.to_string(),
+        Err(_) => decode_printable_ascii_escapes(raw),
     }
+}
+
+/// PowerShell's `ConvertTo-Json` escapes the HTML-sensitive ASCII characters
+/// `'`, `<`, `>`, `&` (its default "escape-handling" set) as `\uXXXX` even though
+/// they are printable, which makes a raw perm blob read as noise (`It's`
+/// for `It's`). Used only on [`pretty_tool_input`]'s verbatim fallback — where the
+/// blob failed to parse and so can't be round-tripped through serde — to decode
+/// just those over-produced printable-ASCII escapes back to their literal char.
+/// Restricted to the printable ASCII range (`0x20..=0x7E`) so control characters
+/// and a fragment cut mid-escape (`…\u00`) are left untouched: we only un-escape
+/// what PowerShell needlessly escaped, never invent structure.
+fn decode_printable_ascii_escapes(raw: &str) -> String {
+    // Fast path: no escape marker at all (the common truncated-fragment case).
+    if !raw.contains("\\u") {
+        return raw.to_string();
+    }
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // A full `\uXXXX` escape is 6 bytes; decode only when all four hex digits
+        // are present (a truncated tail like `\u00` falls through verbatim). The
+        // hex digits are ASCII, so slicing `raw` at those offsets is char-safe.
+        if bytes[i] == b'\\'
+            && i + 6 <= bytes.len()
+            && bytes[i + 1] == b'u'
+            && bytes[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
+        {
+            let code = u32::from_str_radix(&raw[i + 2..i + 6], 16).unwrap();
+            if (0x20..=0x7E).contains(&code) {
+                out.push(code as u8 as char);
+                i += 6;
+                continue;
+            }
+        }
+        // Not a decodable escape: copy this char through intact (raw is UTF-8, so
+        // step by the scalar's byte length to keep multi-byte codepoints whole).
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Shell-side pending permission request (SPEC §16). Unlike an ask there is no
@@ -486,7 +544,15 @@ struct ShellPerm {
     /// Epoch ms the perm arrived — its position in the shared ask/perm FIFO
     /// (R-16.2). Compared against a front ask's `enqueued_ms` so the ask window's
     /// primary slot follows arrival order, not a blanket perm-over-ask priority.
+    /// Also the anchor for the R-32.1 deadline (`received_ms + PERM_DEADLINE_MS`).
     received_ms: u64,
+}
+
+impl ShellPerm {
+    /// SPEC R-32.1: epoch ms at which this perm expires (its hook has given up).
+    fn deadline_ms(&self) -> u64 {
+        self.received_ms.saturating_add(PERM_DEADLINE_MS)
+    }
 }
 
 fn perm_to_row(perm: &ShellPerm) -> PermRow {
@@ -498,7 +564,26 @@ fn perm_to_row(perm: &ShellPerm) -> PermRow {
         tool_input: perm.tool_input.clone(),
         context: perm.context.clone(),
         queued_at: perm.received_ms,
+        // R-32.1: the UI disables Allow/Deny once `now >= expires_at` (until the
+        // tick sweep removes the row entirely).
+        expires_at: Some(perm.deadline_ms()),
     }
+}
+
+/// SPEC R-32.1: remove and return every perm whose deadline has elapsed — the
+/// mirror of [`AskStore::sweep_expired`] for the shell-owned perm queue. Pure
+/// over `(perms, now)` so it is unit-tested without a live `Shell`.
+fn drain_expired_perms(perms: &mut Vec<ShellPerm>, now: u64) -> Vec<ShellPerm> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < perms.len() {
+        if now >= perms[i].deadline_ms() {
+            out.push(perms.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// On-disk shape of a perm request file (`<data>/perms/<id>.json`), written by
@@ -536,6 +621,10 @@ struct AskFileRecord {
     question: String,
     #[serde(default)]
     options: Option<Vec<String>>,
+    /// R-29.2: a recovered multi-question form still renders (as expired). Old
+    /// ask files predate this field, so it defaults to `None`.
+    #[serde(default)]
+    questions: Option<Vec<deck_core::ask::AskQuestion>>,
     #[serde(default)]
     detail: Option<String>,
     #[serde(default)]
@@ -692,6 +781,45 @@ impl Shell {
         let _ = self.app.emit(ipc::STATE_EVENT, &snapshot);
         if let Err(err) = tray::update(&self.tray, &snapshot.counts) {
             tracing::warn!(error = %err, "failed to update tray");
+        }
+    }
+
+    /// Set (or clear) a session's user title override (§27 R-27.4), persist the
+    /// map, and push a fresh snapshot so the renamed row surfaces at once. An
+    /// empty/whitespace `name` clears the override, restoring the normal title
+    /// chain. Sanitization (bidi-strip + 60-grapheme cap, R-27.7) happens inside
+    /// [`deck_core::engine::SessionStore::set_override_name`].
+    fn rename_session(&self, session_id: &str, name: &str) {
+        let trimmed = name.trim();
+        let value = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        {
+            let mut store = self.store.lock().expect("store poisoned");
+            store.set_override_name(session_id, value);
+        }
+        self.persist_session_names();
+        self.push_state();
+    }
+
+    /// Re-persist `<data>/session-names.json` when the engine's overrides map has
+    /// changed since the last call (R-27.3/R-27.6: rename + end-of-session prune).
+    /// A no-op when nothing changed. Serialized so the tick thread and a command
+    /// thread can't reorder two writes. Never call while holding `store`.
+    fn persist_session_names(&self) {
+        static PERSIST_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut store = self.store.lock().expect("store poisoned");
+            if !store.take_overrides_dirty() {
+                return;
+            }
+            store.overrides_snapshot()
+        };
+        if let Err(err) = session_names::save(&self.data_dir, &snapshot) {
+            tracing::warn!(error = %err, "failed to persist session-names.json");
         }
     }
 
@@ -1021,6 +1149,7 @@ impl Shell {
             "project": ask.project,
             "question": ask.question,
             "options": ask.options,
+            "questions": ask.questions,
             "detail": ask.detail,
             "context": ask.context,
             "persistent": ask.persistent,
@@ -1062,6 +1191,7 @@ impl Shell {
             project: project.clone(),
             question: req.question.clone(),
             options: req.options.clone(),
+            questions: req.questions.clone(),
             detail: req.detail.clone(),
             context: req.context.clone(),
             enqueued_ms: now_ms(),
@@ -1248,6 +1378,7 @@ impl Shell {
                 project: rec.project,
                 question: rec.question,
                 options: rec.options,
+                questions: rec.questions,
                 detail: rec.detail,
                 context: rec.context,
                 // Recovered from a previous run → older than anything enqueued
@@ -1328,7 +1459,11 @@ impl Shell {
             let mut store = self.store.lock().expect("store poisoned");
             if delivered {
                 match parsed.kind {
-                    AskAnswerKind::Option | AskAnswerKind::Text => store.note_ask_answered(sid),
+                    // R-29.2: a submitted form counts as answered, same as an
+                    // option/text answer (the agent received the user's decision).
+                    AskAnswerKind::Option | AskAnswerKind::Text | AskAnswerKind::Form => {
+                        store.note_ask_answered(sid)
+                    }
                     AskAnswerKind::Timeout
                     | AskAnswerKind::Dismissed
                     | AskAnswerKind::Cancelled => store.note_ask_cleared(sid),
@@ -1380,6 +1515,111 @@ impl Shell {
             run_on_main(&self.app, |app| {
                 let _ = windows::hide_ask_window(app);
             });
+        }
+    }
+
+    /// SPEC R-32.1: drop perms whose deadline (`received_ms + PERM_DEADLINE_MS`)
+    /// has elapsed — their `PermissionRequest` hook has already timed out, so no
+    /// deck decision could reach it. The mirror of [`Shell::sweep_expired_asks`]
+    /// for the shell-owned perm queue; runs on the same 10 s tick. Recomputes the
+    /// session status (R-2.4, via `note_ask_cleared`) and re-renders the shared
+    /// ask/perm window so the next queued item surfaces.
+    fn sweep_expired_perms(&self) {
+        let expired = {
+            let mut perms = self.perms.lock().expect("perms poisoned");
+            drain_expired_perms(&mut perms, now_ms())
+        };
+        if expired.is_empty() {
+            return;
+        }
+        for perm in &expired {
+            if let Some(sid) = &perm.session_id {
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .note_ask_cleared(sid);
+            }
+            tracing::info!(perm_id = %perm.id, "perm expired past its deadline (R-32.1)");
+        }
+        self.push_state();
+        if self.ask_window_idle() {
+            run_on_main(&self.app, |app| {
+                let _ = windows::hide_ask_window(app);
+            });
+        }
+    }
+
+    /// SPEC R-32.2: dismiss every pending ask + perm belonging to a session that
+    /// just ended (`SessionEnd`) or died (liveness) — the agent that raised them
+    /// is gone, so no answer could ever reach it. Cancels each ask via the reused
+    /// [`Shell::cancel_ask`] path (the blocked MCP caller unblocks with
+    /// `kind:"cancelled"`, and the ask window re-renders to the next queued item)
+    /// and drops the session's perms, re-rendering the shared window.
+    fn dismiss_gone_sessions(&self, session_ids: &[String]) {
+        let mut perms_dropped = false;
+        for sid in session_ids {
+            // Cancel each pending ask attributed to this session. `cancel_ask`
+            // itself re-renders (push_state) + hides the window when idle, so a
+            // freshly-surfaced next item is handled per-ask.
+            let ask_ids: Vec<String> = {
+                let asks = self.asks.lock().expect("asks poisoned");
+                asks.iter()
+                    .filter(|a| a.session_id.as_deref() == Some(sid.as_str()))
+                    .map(|a| a.id.clone())
+                    .collect()
+            };
+            for id in &ask_ids {
+                self.cancel_ask(id);
+            }
+            // Drop the session's pending perms (no blocked in-process caller to
+            // notify — the hook died with the agent; the perm-answer file, if any
+            // late one lands, is reaped by `sweep_stale_perm_answers`).
+            let dropped: Vec<ShellPerm> = {
+                let mut perms = self.perms.lock().expect("perms poisoned");
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < perms.len() {
+                    if perms[i].session_id.as_deref() == Some(sid.as_str()) {
+                        out.push(perms.remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                out
+            };
+            for perm in &dropped {
+                if let Some(psid) = &perm.session_id {
+                    self.store
+                        .lock()
+                        .expect("store poisoned")
+                        .note_ask_cleared(psid);
+                }
+                perms_dropped = true;
+                tracing::info!(perm_id = %perm.id, session_id = %sid, "perm dropped: session ended/died (R-32.2)");
+            }
+        }
+        // `cancel_ask` already refreshed the UI per ask; a perms-only drop still
+        // needs one push + a window-hide when nothing remains pending.
+        if perms_dropped {
+            self.push_state();
+            if self.ask_window_idle() {
+                run_on_main(&self.app, |app| {
+                    let _ = windows::hide_ask_window(app);
+                });
+            }
+        }
+    }
+
+    /// SPEC R-32.2: drain the engine's just-ended / just-dead session ids and
+    /// dismiss their pending asks + perms. Called on the tick and after each live
+    /// event burst so an externally-resolved ask/perm clears promptly.
+    fn reap_gone_sessions(&self) {
+        let gone = {
+            let mut store = self.store.lock().expect("store poisoned");
+            store.take_gone_sessions()
+        };
+        if !gone.is_empty() {
+            self.dismiss_gone_sessions(&gone);
         }
     }
 
@@ -1702,6 +1942,17 @@ fn run_engine(shell: Arc<Shell>) {
     let spool_dir = settings::spool_dir();
     let quarantine_dir = settings::spool_quarantine_dir();
 
+    // R-27.3: load persisted user title overrides into the engine BEFORE any row
+    // is materialized (by the replay/discovery below), so replayed and discovered
+    // sessions inherit their renamed name from the start.
+    {
+        let overrides = session_names::load(&shell.data_dir);
+        if !overrides.is_empty() {
+            let mut store = shell.store.lock().expect("store poisoned");
+            store.set_overrides(overrides);
+        }
+    }
+
     // Startup replay: apply spooled events WITHOUT firing toasts (avoids a
     // first-launch toast storm for events that occurred while we were down; the
     // rows/tray still reflect them). Live events below do fire toasts.
@@ -1819,6 +2070,10 @@ fn run_engine(shell: Arc<Shell>) {
                 }
                 if changed {
                     shell.push_state();
+                    // R-32.2: a `SessionEnd` in this burst leaves the agent's asks
+                    // /perms dangling — dismiss them now (the raising agent is gone)
+                    // rather than waiting for the next 10 s tick.
+                    shell.reap_gone_sessions();
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1837,6 +2092,9 @@ fn run_engine(shell: Arc<Shell>) {
             last_sweep = Instant::now();
             if sweep_spool(&shell, &spool_dir, &quarantine_dir) {
                 shell.push_state();
+                // R-32.2: a `SessionEnd` recovered by the safety-net sweep must
+                // also dismiss the gone agent's asks/perms.
+                shell.reap_gone_sessions();
             }
         }
 
@@ -1943,10 +2201,18 @@ fn run_tick(shell: &Arc<Shell>) {
     };
     shell.fire_effects(effects);
     shell.sweep_expired_asks();
+    // R-32.1: expire perms past their ~90 s deadline (their hook has given up).
+    shell.sweep_expired_perms();
+    // R-32.2: cancel asks + drop perms for sessions that ended or died this tick
+    // (SessionEnd / liveness `dead`) — the raising agent is gone.
+    shell.reap_gone_sessions();
     // §23: fold newly-appended transcript bytes into per-session token telemetry
     // (R-23.1), off the UI thread, before the snapshot is pushed below.
     shell.update_usage();
     enforce_disk_caps();
+    // R-27.6: re-persist session-names.json when an end-of-session prune (or a
+    // rename) dirtied the overrides map. No-op when nothing changed.
+    shell.persist_session_names();
     shell.push_state();
 }
 
@@ -2396,6 +2662,7 @@ fn setup_agent_questions(app: &AppHandle<Wry>, enable: bool) {
                     "--header",
                     &header,
                 ])
+                .no_console_window()
                 .output();
             match result {
                 Ok(out) if out.status.success() => tracing::info!("registered MCP with claude CLI"),
@@ -2410,6 +2677,7 @@ fn setup_agent_questions(app: &AppHandle<Wry>, enable: bool) {
     } else {
         let _ = std::process::Command::new("claude")
             .args(["mcp", "remove", "--scope", "user", "quarterdeck"])
+            .no_console_window()
             .output();
         // R-8.6 "Disable reverses both": also remove the copied skill.
         remove_skill();
@@ -2508,6 +2776,34 @@ pub fn focus_terminal_command(app: &AppHandle<Wry>, session_id: &str) -> Result<
     shell.focus_terminal(session_id)
 }
 
+/// Rename a session (§27 R-27.4), invoked by the `rename_session` command (the
+/// popup's double-click inline editor). An empty/whitespace name clears the
+/// override.
+pub fn rename_session_command(
+    app: &AppHandle<Wry>,
+    session_id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let shell = app
+        .try_state::<Arc<Shell>>()
+        .ok_or_else(|| "Quarterdeck is still starting up".to_string())?;
+    shell.rename_session(session_id, name);
+    Ok(())
+}
+
+/// Drop a session's user title override (§27 R-27.6), invoked when its row is
+/// removed (`remove_row`): a reused id must never inherit a stale name. A no-op
+/// (best-effort) before the shell is fully up.
+pub fn prune_session_override(app: &AppHandle<Wry>, session_id: &str) {
+    if let Some(shell) = app.try_state::<Arc<Shell>>() {
+        {
+            let mut store = shell.store.lock().expect("store poisoned");
+            store.set_override_name(session_id, None);
+        }
+        shell.persist_session_names();
+    }
+}
+
 /// Answer a pending permission request (`answer_perm` command, SPEC §16, T7
 /// seam): persists the decision for the blocked hook and updates deck state.
 pub fn answer_perm_command(
@@ -2599,6 +2895,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::get_state,
             ipc::remove_row,
+            ipc::rename_session,
             ipc::answer_ask,
             ipc::answer_perm,
             ipc::set_setting,
@@ -2987,6 +3284,40 @@ mod tests {
     }
 
     #[test]
+    fn pretty_tool_input_decodes_powershell_escapes_on_truncated_fallback() {
+        // §28: PowerShell's ConvertTo-Json over-escapes the HTML-sensitive ASCII
+        // chars ' < > & as \uXXXX even though they are printable. When such a blob
+        // overflows the 2KB cap and is cut mid-JSON (so serde can't parse it), the
+        // verbatim fallback must still un-escape those printable chars so the modal
+        // reads as text, not `&`/`<` noise.
+        let truncated =
+            "{\"question\":\"Ship it \\u0026 tag \\u003crelease\\u003e? It\\u0027s ready";
+        let out = pretty_tool_input(truncated);
+        assert!(
+            out.contains("Ship it & tag <release>? It's ready"),
+            "printable escapes decoded: {out:?}"
+        );
+        assert!(!out.contains("\\u"), "no raw escapes remain: {out:?}");
+
+        // A fragment cut mid-escape leaves the partial `\\u00` verbatim (only two
+        // hex digits present, so it is never decoded).
+        let partial = "{\"a\":\"x\\u00";
+        assert_eq!(pretty_tool_input(partial), partial);
+
+        // A non-printable escape (BEL, U+0007) is outside 0x20..=0x7E and is left
+        // verbatim: we only touch what PowerShell needlessly escaped.
+        let control = "{\"a\":\"x\\u0007";
+        assert_eq!(pretty_tool_input(control), control);
+
+        // The valid-input path is unaffected: serde decodes the escape to ' natively
+        // and re-emits indented JSON, so the decoder never runs on parseable input.
+        let valid = pretty_tool_input("{\"question\":\"It\\u0027s fine\"}");
+        let v: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        assert_eq!(v["question"], "It's fine");
+        assert!(valid.contains('\n'), "valid input pretty-printed: {valid:?}");
+    }
+
+    #[test]
     fn answer_file_parses_command_written_shape() {
         // Matches ipc::AnswerRecord (camelCase, extra fields ignored).
         let json = r#"{"id":"ask-1","answer":"Yes","kind":"option","answeredAtMs":1720000000000}"#;
@@ -3054,9 +3385,85 @@ mod tests {
     }
 
     #[test]
+    fn ask_file_record_deserializes_form_and_legacy() {
+        // SPEC §29 (R-29.2/R-29.6): a persisted form ask round-trips its
+        // `questions`, and an OLD ask file with no `questions` field still
+        // deserializes (field defaults to None) so a recovered legacy ask renders.
+        let form: AskFileRecord = serde_json::from_str(
+            r#"{"id":"ask-form","question":"Which environment?","questions":[
+                {"header":"Env","question":"Which environment?","multiSelect":false,"options":["prod","staging"]},
+                {"question":"Flags?","multiSelect":true,"options":["--fast"]}
+            ]}"#,
+        )
+        .unwrap();
+        let qs = form.questions.as_ref().expect("questions present");
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].header.as_deref(), Some("Env"));
+        assert!(!qs[0].multi_select);
+        assert!(qs[1].multi_select);
+        assert_eq!(qs[1].options, ["--fast"]);
+
+        let legacy: AskFileRecord =
+            serde_json::from_str(r#"{"id":"ask-old","question":"Tabs or spaces?"}"#).unwrap();
+        assert!(legacy.questions.is_none(), "old ask file → no form");
+    }
+
+    #[test]
     fn recover_ask_files_on_missing_dir_is_empty() {
         let tmp = unique_tmp("recover-missing");
         let recovered = recover_ask_files(&tmp.join("asks"), &tmp.join("spool-quarantine"));
         assert!(recovered.is_empty());
+    }
+
+    fn shell_perm(id: &str, session: Option<&str>, received_ms: u64) -> ShellPerm {
+        ShellPerm {
+            id: id.to_string(),
+            session_id: session.map(ToString::to_string),
+            project: None,
+            tool_name: "Bash".to_string(),
+            tool_input: "{}".to_string(),
+            context: None,
+            received_ms,
+        }
+    }
+
+    #[test]
+    fn perm_deadline_is_received_plus_ninety_seconds() {
+        // R-32.1: a perm's deadline anchors on its arrival time + the ~90 s hook
+        // timeout, and the projected PermRow carries it as `expires_at`.
+        let perm = shell_perm("p1", Some("s1"), 1_000_000);
+        assert_eq!(perm.deadline_ms(), 1_000_000 + PERM_DEADLINE_MS);
+        let row = perm_to_row(&perm);
+        assert_eq!(row.expires_at, Some(1_000_000 + PERM_DEADLINE_MS));
+        assert_eq!(row.queued_at, 1_000_000);
+    }
+
+    #[test]
+    fn drain_expired_perms_sweeps_only_past_deadline() {
+        // R-32.1: the perm-queue mirror of `AskStore::sweep_expired` — a perm past
+        // `received_ms + PERM_DEADLINE_MS` is removed; a fresher one stays. The
+        // deadline is exclusive of "just arrived" and inclusive at the boundary.
+        let mut perms = vec![
+            shell_perm("stale", Some("s1"), 1_000),
+            shell_perm("fresh", Some("s2"), 50_000),
+        ];
+
+        // Before either deadline: nothing swept.
+        assert!(drain_expired_perms(&mut perms, 1_000).is_empty());
+        assert_eq!(perms.len(), 2);
+
+        // Exactly at the stale perm's deadline (1_000 + 90_000): it is swept, the
+        // fresh one (deadline 140_000) survives.
+        let expired = drain_expired_perms(&mut perms, 1_000 + PERM_DEADLINE_MS);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "stale");
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].id, "fresh");
+
+        // Long past everything: the last one goes too.
+        let expired = drain_expired_perms(&mut perms, 1_000_000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "fresh");
+        assert!(perms.is_empty());
     }
 }

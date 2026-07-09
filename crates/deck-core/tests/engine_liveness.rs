@@ -236,3 +236,52 @@ fn dead_overrides_pending_ask() {
     s.poll_liveness(&procs, |_p| None);
     assert_eq!(s.status_of("a"), Some(Status::Dead));
 }
+
+#[test]
+fn liveness_dead_reports_the_session_as_gone_once() {
+    // R-32.2: a session the liveness poll turns `dead` is reported via
+    // `take_gone_sessions` so the shell can cancel its pending asks + drop its
+    // perms. It is reported exactly once — a still-dead row on later polls is
+    // skipped (its status is already `dead`), so the queue does not re-report it.
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start_full("a", "/p", None, Some(1), None, T0));
+    // A live session has nothing to report.
+    assert!(s.take_gone_sessions().is_empty());
+
+    let procs = FakeProcessTable::new(); // pid 1 gone
+    s.poll_liveness(&procs, |_p| None);
+    assert_eq!(s.status_of("a"), Some(Status::Dead));
+    assert_eq!(s.take_gone_sessions(), vec!["a".to_string()]);
+
+    // Already dead → not re-reported on the next poll.
+    s.poll_liveness(&procs, |_p| None);
+    assert!(s.take_gone_sessions().is_empty());
+}
+
+#[test]
+fn session_end_reports_the_session_as_gone() {
+    // R-32.2: a genuine `SessionEnd` reports the id (so the shell cancels the
+    // agent's pending asks with `kind:"cancelled"` and drops its perms), even
+    // though the row itself is removed immediately (R-2.5).
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start_full("a", "/p", None, Some(1), None, T0));
+    assert!(s.take_gone_sessions().is_empty());
+
+    s.on_event(&session_end("a", "clear", T0 + 5));
+    assert!(!s.contains("a"), "SessionEnd removes the row (R-2.5)");
+    assert_eq!(s.take_gone_sessions(), vec!["a".to_string()]);
+}
+
+#[test]
+fn stale_reordered_session_end_does_not_report_gone() {
+    // A `SessionEnd` older than the row's own `SessionStart` belongs to a
+    // previous incarnation of a reused id and is ignored (R-2.5) — it must NOT
+    // report the live session as gone (that would wrongly cancel its asks).
+    let (mut s, _c) = store_at(T0);
+    s.on_event(&session_start_full("a", "/p", None, Some(1), None, T0 + 100));
+    let _ = s.take_gone_sessions();
+    // End stamped BEFORE this incarnation's start → ignored.
+    s.on_event(&session_end("a", "clear", T0 + 50));
+    assert!(s.contains("a"), "stale reordered End is ignored");
+    assert!(s.take_gone_sessions().is_empty());
+}

@@ -76,13 +76,14 @@ function Invoke-QuarterdeckPerm {
     if ($Payload.PSObject.Properties.Name -contains 'tool_name') {
         $toolName = [string]$Payload.tool_name
     }
-    # tool_input serialized to indented (pretty-printed) JSON, then truncated to
-    # 2KB (R-16.1 cap / R-16.2 "pretty-printed input"). Pretty-printing BEFORE the
-    # cap keeps even an over-length input indented up to the cut (a truncated blob
-    # can't be safely re-formatted afterwards).
+    # tool_input serialized to compact JSON, then truncated to 2KB (R-16.1 cap).
+    # Compact (-Compress) packs far more real content under the 2KB cap than the
+    # indented form did, so the truncation now rarely lands mid-JSON; the deck
+    # re-indents the parsed blob for the modal (R-16.2 §28). A blob that still
+    # overflows is truncated and kept verbatim deck-side (never re-structured).
     $toolInput = ''
     if ($Payload.PSObject.Properties.Name -contains 'tool_input') {
-        try { $toolInput = $Payload.tool_input | ConvertTo-Json -Depth 20 } catch { $toolInput = '' }
+        try { $toolInput = $Payload.tool_input | ConvertTo-Json -Depth 20 -Compress } catch { $toolInput = '' }
     }
     if ($null -ne $toolInput -and $toolInput.Length -gt 2048) {
         $toolInput = $toolInput.Substring(0, 2048)

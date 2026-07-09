@@ -64,6 +64,10 @@ public static class QdFocus {{
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
@@ -87,8 +91,31 @@ $expectPid = [uint32]{pid}
 $needle = '{needle}'
 
 function Focus-Hwnd($h) {{
+  # Foreground-unlock: Windows only lets the current foreground thread call
+  # SetForegroundWindow, so briefly attach our input queue to it (via the
+  # foreground window's thread) and keep the ALT keydown/up as a fallback nudge.
+  $fg = [QdFocus]::GetForegroundWindow()
+  $curThread = [uint32]0
+  if ($fg -ne [IntPtr]::Zero) {{
+    $fgpid = [uint32]0
+    $curThread = [QdFocus]::GetWindowThreadProcessId($fg, [ref]$fgpid)
+  }}
+  $tpid = [uint32]0
+  $targetThread = [QdFocus]::GetWindowThreadProcessId($h, [ref]$tpid)
+  $attached = $false
+  if ($curThread -ne 0 -and $targetThread -ne 0 -and $curThread -ne $targetThread) {{
+    $attached = [QdFocus]::AttachThreadInput($curThread, $targetThread, $true)
+  }}
+  # ALT keydown/up fallback around the call (0x12 = VK_MENU, 0x2 = KEYEVENTF_KEYUP).
+  [QdFocus]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
   [QdFocus]::ShowWindow($h, $SW_RESTORE) | Out-Null
-  return [QdFocus]::SetForegroundWindow($h)
+  [QdFocus]::BringWindowToTop($h) | Out-Null
+  $ok = [QdFocus]::SetForegroundWindow($h)
+  [QdFocus]::keybd_event(0x12, 0, 0x2, [UIntPtr]::Zero)
+  if ($attached) {{
+    [QdFocus]::AttachThreadInput($curThread, $targetThread, $false) | Out-Null
+  }}
+  return $ok
 }}
 
 # 1) Validate the captured HWND still belongs to the expected pid, then focus it.
@@ -134,12 +161,15 @@ fn focus_windows(ancestor: Option<&Ancestor>, project: &str) -> Result<(), Strin
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    use crate::util::CommandNoWindow;
+
     let hwnd = ancestor.and_then(|a| a.hwnd);
     let pid = ancestor.and_then(|a| a.pid);
     let script = build_focus_script(hwnd, pid, project);
 
     let mut child = Command::new("powershell.exe")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"])
+        .no_console_window()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -212,6 +242,12 @@ mod tests {
         let s = build_focus_script(Some(197486), Some(12960), "my'proj");
         assert!(s.contains("SetForegroundWindow"));
         assert!(s.contains("GetWindowThreadProcessId"));
+        // Foreground-unlock dance (R-26.2): attach to the foreground thread,
+        // raise to top, and the ALT-key fallback around the focus call.
+        assert!(s.contains("GetForegroundWindow"));
+        assert!(s.contains("AttachThreadInput"));
+        assert!(s.contains("BringWindowToTop"));
+        assert!(s.contains("keybd_event"));
         assert!(s.contains("[IntPtr]197486"));
         assert!(s.contains("[uint32]12960"));
         // Single quote doubled for the PS literal.

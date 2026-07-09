@@ -100,6 +100,35 @@ test.describe('permission requests', () => {
     expect(decision).toBe('deny');
   });
 
+  // SPEC R-32.1: a perm past its ~90 s deadline (its hook has given up) renders
+  // "expired" with Allow/Deny DISABLED — a stale decision can no longer reach the
+  // hook. "In terminal" stays live, and the A/D shortcuts are inert.
+  test('an expired perm disables Allow/Deny and flags "expired"', async ({ page }) => {
+    await gotoAsk(page, 'perm-expired');
+
+    await expect(page.locator('.qd-perm')).toHaveCount(1);
+    await expect(page.locator('.qd-perm-tag')).toHaveText('expired');
+    await expect(page.locator('.qd-perm-allow')).toBeDisabled();
+    await expect(page.locator('.qd-perm-deny')).toBeDisabled();
+    // "In terminal" is still available to clear it locally.
+    await expect(page.locator('.qd-perm-defer')).toBeEnabled();
+
+    // The A/D keyboard shortcuts are inert past the deadline (no decision routed).
+    await page.keyboard.press('a');
+    await page.keyboard.press('d');
+    const decision = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastPermDecision(): string | null } }).__qdMock.lastPermDecision(),
+    );
+    expect(decision).toBeNull();
+
+    // Esc still maps to "In terminal" (defer), which remains enabled.
+    await page.keyboard.press('Escape');
+    const deferred = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastPermDecision(): string | null } }).__qdMock.lastPermDecision(),
+    );
+    expect(deferred).toBe('defer');
+  });
+
   // SPEC R-25.4: the onboarding card carries the "Take over permission prompts"
   // consent line (default on), and the settings pane exposes the toggle.
   test('onboarding shows the takeover consent line', async ({ page }) => {

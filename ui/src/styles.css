@@ -139,7 +139,7 @@ button {
 
 .qd-wordmark {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
   letter-spacing: 0.14em;
   font-variant-caps: small-caps;
   color: var(--accent);
@@ -578,6 +578,26 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+/* SPEC §27 R-27.5: the inline rename editor replacing the title span on
+   double-click. Sits in the same slot, reads like an editable field. */
+.qd-row-title-edit {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--accent, var(--border));
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin: -2px 0;
+  outline: none;
+}
+
+.qd-row-title-edit:focus {
+  border-color: var(--accent, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #58a6ff) 30%, transparent);
 }
 
 .qd-row-branch {
@@ -1161,6 +1181,74 @@ button {
   text-align: center;
   color: var(--muted);
   font-size: 12.5px;
+}
+
+/* --- Multi-question / multi-select form (SPEC §29, R-29.4) ---------------- */
+.qd-ask-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* One question block: header + question + options + free text. */
+.qd-ask-form-q {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qd-ask-q-header {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+/* Slightly smaller than the single-question headline: a form stacks several. */
+.qd-ask-form-question {
+  font-size: 13px;
+}
+
+/* A selected option (radio or checkbox) reads with the clay accent. */
+.qd-ask-option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* The leading radio/checkbox indicator inside an option button. */
+.qd-ask-form-mark {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg);
+}
+
+.qd-ask-form-mark.checkbox {
+  border-radius: 4px;
+}
+
+.qd-ask-option.selected .qd-ask-form-mark {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 2.5px var(--bg);
+}
+
+.qd-ask-form-text {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.qd-ask-form-error {
+  color: var(--status-red);
+  font-size: 11.5px;
 }
 
 /* --- Permission request modal (SPEC §16, R-16.2) ------------------------- */

@@ -12,6 +12,33 @@
 
 use crate::engine::SystemClock;
 use crate::traits::Clock;
+use serde::{Deserialize, Serialize};
+
+/// A single question inside a multi-question / multi-select `ask_user` form
+/// (SPEC §29, R-29.1/R-29.2) — the shape of Claude Code's native
+/// `AskUserQuestion`. Portable (no GUI/transport deps) so it lives on the
+/// engine-side [`PendingAsk`], the transport [`AskRequest`], and the persisted
+/// ask file alike, and every field is defaulted/optional so an older ask
+/// snapshot with no `questions` still deserializes (R-29.6). The transport
+/// (`mcp_server::parse_ask_request`) is responsible for bidi-stripping and
+/// grapheme-capping every string before one reaches here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskQuestion {
+    /// Optional short header/label rendered above the question (e.g. a category).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The question text (required, non-empty by construction).
+    pub question: String,
+    /// True → the user may pick several options (checkboxes); false → exactly
+    /// one (radio buttons). Defaulted so it may be omitted by the agent / an old
+    /// file.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// The offered choices. May be empty (a free-text-only sub-question).
+    #[serde(default)]
+    pub options: Vec<String>,
+}
 
 /// A pending agent question (SPEC §8). `R` is the shell's responder handle used
 /// to unblock the MCP `ask_user` call (e.g. a `oneshot::Sender`); `deck-core`
@@ -24,6 +51,13 @@ pub struct PendingAsk<R> {
     pub project: Option<String>,
     pub question: String,
     pub options: Option<Vec<String>>,
+    /// Multi-question / multi-select form (SPEC §29, R-29.2): when `Some` and
+    /// non-empty, the ask window renders a form of [`AskQuestion`] blocks instead
+    /// of the single-question options/free-text, and the answer comes back as a
+    /// `form`-kind JSON document. `None` → the legacy single-question ask. Carried
+    /// through `submit_ask` / the persisted ask file so a recovered form still
+    /// renders (expired).
+    pub questions: Option<Vec<AskQuestion>>,
     /// Long rationale/body rendered under the question (R-19.1), sanitized by
     /// the transport before it reaches here.
     pub detail: Option<String>,
@@ -172,6 +206,7 @@ mod tests {
             project: None,
             question: "q?".to_string(),
             options: None,
+            questions: None,
             detail: None,
             context: None,
             enqueued_ms: 0,
@@ -283,6 +318,31 @@ mod tests {
         assert_eq!(updated.detail.as_deref(), Some("the reasoning"));
 
         assert!(store.get_mut("missing").is_none());
+    }
+
+    #[test]
+    fn ask_question_defaults_when_fields_omitted() {
+        // R-29.6: an agent may send only `question`; header/multiSelect/options
+        // default so the item still deserializes (and an old ask file with no
+        // `questions` field leaves `PendingAsk.questions` at None).
+        let q: AskQuestion = serde_json::from_str(r#"{"question":"Pick a lane?"}"#).unwrap();
+        assert_eq!(q.question, "Pick a lane?");
+        assert_eq!(q.header, None);
+        assert!(!q.multi_select);
+        assert!(q.options.is_empty());
+
+        // Round-trips as camelCase `multiSelect` for the UI contract.
+        let full = AskQuestion {
+            header: Some("Env".to_string()),
+            question: "Which?".to_string(),
+            multi_select: true,
+            options: vec!["prod".to_string(), "staging".to_string()],
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["multiSelect"], true);
+        assert_eq!(v["header"], "Env");
+        let back: AskQuestion = serde_json::from_value(v).unwrap();
+        assert_eq!(back, full);
     }
 
     #[test]

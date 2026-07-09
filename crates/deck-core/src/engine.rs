@@ -173,6 +173,11 @@ struct Session {
     ancestor: Option<Ancestor>,
     /// Cached cold-start transcript title so we read the file at most once.
     transcript_title: Option<String>,
+    /// Highest-precedence title: a user-set override (R-27.1), typed by
+    /// double-clicking the row name. Seeded on session create from
+    /// [`SessionStore::overrides`] and wins over the registry `name` in
+    /// [`Session::recompute_title`]. `None`/blank falls back to the normal chain.
+    override_name: Option<String>,
     display_title: String,
     inferred: bool,
     branch: Option<String>,
@@ -219,6 +224,17 @@ struct Session {
     /// the "first-seen" fallback anchor for session age (R-22.3) when neither a
     /// registry `startedAt` nor a `SessionStart` receivedAt is known.
     created_ms: u64,
+    /// `working` was reached via a transcript-recovery promote in `poll_recovery`
+    /// (R-30.1 reverse gear), not a real hook. While set, `poll_recovery` keeps
+    /// the row `working` only as long as the transcript mtime keeps advancing,
+    /// and DEMOTES it back to `idle` on the first tick with no advance. Cleared by
+    /// [`Session::set_hook_status`] so any real hook event (SessionStart / prompt /
+    /// Stop / ask / dead) drops the reverse gear.
+    recovery_promoted: bool,
+    /// Transcript mtime (epoch ms) observed at the last recovery promote/hold —
+    /// the reference the next `poll_recovery` tick compares against to decide
+    /// whether the transcript advanced (R-30.1). Cleared with `recovery_promoted`.
+    last_transcript_mtime_ms: Option<u64>,
 }
 
 impl Session {
@@ -238,6 +254,7 @@ impl Session {
             registry_name: None,
             ancestor: None,
             transcript_title: None,
+            override_name: None,
             display_title: naming::NO_TITLE.to_string(),
             inferred: false,
             branch: None,
@@ -252,6 +269,8 @@ impl Session {
             active_subagents: 0,
             registry_started_ms: None,
             created_ms: now_ms,
+            recovery_promoted: false,
+            last_transcript_mtime_ms: None,
         }
     }
 
@@ -343,6 +362,10 @@ impl Session {
     /// Set the hook-derived status; returns `Some(new_effective)` iff the
     /// effective (shown) status changed as a result.
     fn set_hook_status(&mut self, new: Status, ts_ms: u64) -> Option<Status> {
+        // R-30.1: any real hook event (or a recovery demote) drops the reverse
+        // gear. `poll_recovery` re-sets these AFTER its own `set_hook_status` call.
+        self.recovery_promoted = false;
+        self.last_transcript_mtime_ms = None;
         let before = self.effective_status;
         self.hook_status = new;
         if new != Status::Dead {
@@ -394,7 +417,8 @@ impl Session {
         } else {
             None
         };
-        self.display_title = naming::title_from_registry(
+        self.display_title = naming::title_with_override(
+            self.override_name.as_deref(),
             self.registry_name.as_deref(),
             self.session_title.as_deref(),
             self.latest_prompt.as_deref(),
@@ -448,6 +472,24 @@ pub struct SessionStore {
     /// re-creates the row. Pruned to the spool freshness window so it stays
     /// bounded (a stale event beyond it is discarded on replay anyway, R-3.5).
     ended: HashMap<String, u64>,
+    /// User title overrides (R-27.1), keyed by session id — the persisted layer
+    /// behind `<data>/session-names.json`. Seeded at startup (`set_overrides`),
+    /// updated by `set_override_name`, and pruned when a session ends so a reused
+    /// id never inherits a stale name (R-27.6). A live [`Session`] mirrors its own
+    /// entry in `override_name`; this map is what a freshly (re)materialized row
+    /// reads to seed itself.
+    overrides: HashMap<String, String>,
+    /// Set whenever `overrides` is mutated by a rename or an end-of-session prune,
+    /// so the shell knows to re-persist `<data>/session-names.json` on its next
+    /// tick (R-27.3/R-27.6). Cleared by [`SessionStore::take_overrides_dirty`].
+    /// Not set by [`SessionStore::set_overrides`] (that IS the on-disk state).
+    overrides_dirty: bool,
+    /// Session ids that just ended (`SessionEnd`, R-2.5) or died (liveness turned
+    /// them `dead`, R-6) and whose pending asks/perms the shell must now dismiss
+    /// (R-32.2): the agent that raised them is gone and can never receive an
+    /// answer. Accumulated here and drained by [`SessionStore::take_gone_sessions`]
+    /// on the shell's tick, so `deck-core` stays free of the ask/perm channels.
+    gone_sessions: Vec<String>,
     clock: Box<dyn Clock + Send + Sync>,
 }
 
@@ -466,6 +508,9 @@ impl SessionStore {
         SessionStore {
             sessions: HashMap::new(),
             ended: HashMap::new(),
+            overrides: HashMap::new(),
+            overrides_dirty: false,
+            gone_sessions: Vec::new(),
             clock,
         }
     }
@@ -533,6 +578,79 @@ impl SessionStore {
             .map(|s| s.display_title.clone())
     }
 
+    // --- User title overrides (§27) ---------------------------------------
+
+    /// Seed the persisted user overrides at startup (R-27.3). Replaces the whole
+    /// map; does NOT mark it dirty (this IS the on-disk state). Any override for
+    /// an already-tracked session is applied to its live row too, so seeding after
+    /// a replay still wins.
+    pub fn set_overrides(&mut self, overrides: HashMap<String, String>) {
+        self.overrides = overrides;
+        for (id, name) in &self.overrides {
+            if let Some(s) = self.sessions.get_mut(id) {
+                s.override_name = Some(name.clone());
+                s.recompute_title();
+            }
+        }
+    }
+
+    /// Set (or clear, with a `None`/blank name) the user title override for a
+    /// session (R-27.2). Updates the persisted-overrides map AND the live row,
+    /// re-derives the title (so the finished-toast body also reflects a rename),
+    /// and marks the map dirty for re-persistence. The name rides
+    /// [`naming::normalize_title`] (bidi-strip + 60-grapheme cap, R-27.7); an
+    /// empty/whitespace name clears the override (R-27.4). Returns whether the
+    /// row's `display_title` changed.
+    pub fn set_override_name(&mut self, session_id: &str, name: Option<String>) -> bool {
+        let normalized = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(naming::normalize_title);
+        let map_changed = match &normalized {
+            Some(n) => self.overrides.insert(session_id.to_string(), n.clone()).as_deref() != Some(n.as_str()),
+            None => self.overrides.remove(session_id).is_some(),
+        };
+        if map_changed {
+            self.overrides_dirty = true;
+        }
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            s.override_name = normalized;
+            let before = s.display_title.clone();
+            s.recompute_title();
+            s.display_title != before
+        } else {
+            false
+        }
+    }
+
+    /// The current user override for a session, if any (tests/tools).
+    #[must_use]
+    pub fn override_name_of(&self, session_id: &str) -> Option<String> {
+        self.overrides.get(session_id).cloned()
+    }
+
+    /// A clone of the whole overrides map for persistence (R-27.3).
+    #[must_use]
+    pub fn overrides_snapshot(&self) -> HashMap<String, String> {
+        self.overrides.clone()
+    }
+
+    /// Whether the overrides map changed since the last call, clearing the flag
+    /// (R-27.3/R-27.6). The shell checks this each tick and re-persists when set.
+    pub fn take_overrides_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.overrides_dirty)
+    }
+
+    /// Drain the ids of sessions that ended (`SessionEnd`) or died (liveness)
+    /// since the last call (R-32.2). The shell dispatches each to cancel that
+    /// session's pending asks (`kind:"cancelled"`) and drop its pending perms —
+    /// the agent that raised them is gone, so no answer could ever reach it.
+    #[must_use]
+    pub fn take_gone_sessions(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.gone_sessions)
+    }
+
     // --- Core reducer ------------------------------------------------------
 
     /// Apply one parsed spool event, returning any toast decisions (R-9.1,
@@ -570,6 +688,15 @@ impl SessionStore {
                 }
             }
             self.sessions.remove(&ev.session_id);
+            // R-27.6: drop any user override for an ended session so a reused id
+            // can't inherit a stale name and the persisted file stays bounded.
+            // Flag it so the shell re-persists `<data>/session-names.json`.
+            if self.overrides.remove(&ev.session_id).is_some() {
+                self.overrides_dirty = true;
+            }
+            // R-32.2: the agent is gone — the shell must cancel its pending asks
+            // and drop its pending perms (nothing can answer them now).
+            self.gone_sessions.push(ev.session_id.clone());
             self.record_ended(ev.session_id.clone(), ts);
             return Vec::new();
         }
@@ -591,10 +718,15 @@ impl SessionStore {
             }
         }
 
-        let session = self
-            .sessions
-            .entry(ev.session_id.clone())
-            .or_insert_with(|| Session::new(ev.session_id.clone(), ts));
+        // R-27.1: a freshly (re)materialized row inherits any persisted user
+        // override for its id (computed before the mutable `entry` borrow; only
+        // consumed when the entry is actually vacant).
+        let seed_override = self.overrides.get(&ev.session_id).cloned();
+        let session = self.sessions.entry(ev.session_id.clone()).or_insert_with(|| {
+            let mut s = Session::new(ev.session_id.clone(), ts);
+            s.override_name = seed_override;
+            s
+        });
 
         // Common payload fields update whenever present (never blanked by absence).
         if let Some(cwd) = &ev.cwd {
@@ -930,6 +1062,17 @@ impl SessionStore {
                             s.attention_from_hook = false;
                             s.last_notification_ms = None;
                             s.set_hook_status(Status::Working, now);
+                            // R-30.1 reverse gear: arm the transcript-mtime watch
+                            // so a stalled recovered turn demotes back to idle.
+                            s.recovery_promoted = true;
+                            s.last_transcript_mtime_ms = Some(mtime);
+                            tracing::debug!(
+                                session_id = %s.id,
+                                entered_at = s.entered_at_ms,
+                                mtime,
+                                now,
+                                "transcript recovery promote"
+                            );
                         }
                     }
                 }
@@ -944,6 +1087,39 @@ impl SessionStore {
                     if let Some(mtime) = mtime_of(tp) {
                         if mtime >= anchor + RECOVERY_MIN_ADVANCE_MS {
                             s.set_hook_status(Status::Working, now);
+                            // R-30.1 reverse gear: arm the transcript-mtime watch
+                            // so a stalled recovered turn demotes back to idle.
+                            s.recovery_promoted = true;
+                            s.last_transcript_mtime_ms = Some(mtime);
+                            tracing::debug!(
+                                session_id = %s.id,
+                                entered_at = s.entered_at_ms,
+                                mtime,
+                                now,
+                                "transcript recovery promote"
+                            );
+                        }
+                    }
+                }
+                // R-30.1 reverse gear: a row promoted to `working` by recovery
+                // stays working only while the transcript mtime keeps advancing;
+                // the first tick with no advance (or a vanished transcript)
+                // demotes it back to `idle`.
+                Status::Working if s.recovery_promoted => {
+                    let mtime = s.transcript_path.as_deref().and_then(&mut mtime_of);
+                    match mtime {
+                        Some(m) if Some(m) != s.last_transcript_mtime_ms => {
+                            s.last_transcript_mtime_ms = Some(m);
+                        }
+                        _ => {
+                            s.set_hook_status(Status::Idle, now);
+                            tracing::debug!(
+                                session_id = %s.id,
+                                entered_at = s.entered_at_ms,
+                                mtime,
+                                now,
+                                "transcript recovery demote"
+                            );
                         }
                     }
                 }
@@ -961,6 +1137,12 @@ impl SessionStore {
         mut mtime_of: impl FnMut(&str) -> Option<u64>,
     ) -> Vec<Effect> {
         let now = self.clock.now_ms();
+        // R-32.2: ids that transition to `dead` on this poll, reported to the
+        // shell (via `gone_sessions`) so it dismisses their pending asks/perms.
+        // Collected in the loop and appended after it — the loop holds a mutable
+        // borrow of `self.sessions`, so `self.gone_sessions` can't be touched
+        // inside it.
+        let mut newly_dead = Vec::new();
         for s in self.sessions.values_mut() {
             if s.effective() == Status::Dead {
                 continue;
@@ -989,8 +1171,10 @@ impl SessionStore {
                 s.effective_status = Status::Dead;
                 s.entered_at_ms = now;
                 s.dead_since_ms = Some(now);
+                newly_dead.push(s.id.clone());
             }
         }
+        self.gone_sessions.extend(newly_dead);
         Vec::new()
     }
 
@@ -1075,13 +1259,19 @@ impl SessionStore {
         // precedence is applied by `seed_inferred_entered_at` at cold start.
         s.entered_at_ms = activity_ms;
         s.last_activity_ms = activity_ms;
-        s.display_title = if title.trim().is_empty() {
+        let base = if title.trim().is_empty() {
             naming::NO_TITLE.to_string()
         } else {
             title
         };
-        // Cache so we never re-read the transcript just for the title.
-        s.transcript_title = Some(s.display_title.clone());
+        // R-27.1: a discovered row also inherits a persisted user override, which
+        // wins over the transcript-derived title.
+        s.override_name = self.overrides.get(&id).cloned();
+        s.display_title =
+            naming::title_with_override(s.override_name.as_deref(), None, None, None, Some(&base));
+        // Cache the transcript-derived title (NOT the override) so we never re-read
+        // the file, and clearing the override falls back to it.
+        s.transcript_title = Some(base);
         self.sessions.insert(id, s);
     }
 

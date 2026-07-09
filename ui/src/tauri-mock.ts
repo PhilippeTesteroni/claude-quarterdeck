@@ -17,6 +17,7 @@ import { isTauri } from '@tauri-apps/api/core';
 
 import type {
   AskAnswerKind,
+  AskQuestion,
   AskRow,
   Commands,
   PermRow,
@@ -30,6 +31,10 @@ interface InternalSession {
   id: string;
   project: string;
   title: string;
+  /** R-27.1: the non-override title (registry/session/prompt-derived). An empty
+   * rename restores this; a non-empty rename overrides `title`. Defaults to the
+   * initial `title` the first time a rename touches the row. */
+  baseTitle?: string;
   branch?: string;
   status: SessionStatus;
   /** Status held before a pending ask forced `attention` (R-2.4 recompute-on-clear). */
@@ -58,6 +63,8 @@ interface InternalAsk {
   context?: string;
   question: string;
   options?: string[];
+  /** SPEC §29 (R-29.5): multi-question / multi-select form blocks. */
+  questions?: AskQuestion[];
   /** R-19.1: long-form rationale rendered muted under the question. */
   detail?: string;
   timeoutAt?: number;
@@ -75,6 +82,8 @@ interface InternalPerm {
   toolInput: string;
   /** Arrival time for the shared ask/perm FIFO (R-16.2). */
   createdAt?: number;
+  /** SPEC R-32.1: epoch ms the perm expires — past it the UI disables Allow/Deny. */
+  expiresAt?: number;
 }
 
 const params = new URLSearchParams(location.search);
@@ -539,6 +548,52 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
       },
     ],
   }),
+  // SPEC §29 (R-29.4): a multi-question / multi-select ask. The window renders a
+  // form (radio + checkbox blocks + Submit); the popup mirror shows "N questions
+  // — Answer in window". A second single-question ask queues behind it.
+  'ask-form': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Release cut',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(20),
+      }),
+    ],
+    asks: [
+      {
+        id: 'a1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        // Synthesized headline = the first question (as the shell produces it).
+        question: 'Which environment?',
+        questions: [
+          { header: 'Environment', question: 'Which environment?', options: ['prod', 'staging'] },
+          {
+            header: 'Flags',
+            question: 'Extra flags?',
+            multiSelect: true,
+            options: ['--fast', '--safe', '--verbose'],
+          },
+        ],
+        timeoutAt: Date.now() + 120_000,
+        createdAt: Date.now() - 3_000,
+      },
+      {
+        id: 'a2',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        question: 'Tag the release after merge?',
+        options: ['Yes', 'No'],
+        createdAt: Date.now() - 1_000,
+      },
+    ],
+  }),
   // SPEC §16 (R-16.2): a pending permission request rendered in the ask window
   // (amber) and mirrored in the popup, with an ask queued behind it. The perm
   // arrived BEFORE the ask (older `createdAt`), so under the shared ask/perm
@@ -613,6 +668,37 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
         toolName: 'Bash',
         toolInput: '{"command":"rm -rf ./dist && npm run build","timeout":120000}',
         createdAt: Date.now() - 2_000,
+      },
+    ],
+  }),
+  // SPEC R-32.1: a perm whose deadline has already passed renders with the
+  // "expired" tag and disabled Allow/Deny (the hook has given up); the shell's
+  // tick sweep will shortly remove it. "In terminal" stays live.
+  'perm-expired': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(95),
+      }),
+    ],
+    asks: [],
+    perms: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        toolName: 'Bash',
+        toolInput: '{"command":"rm -rf ./dist && npm run build","timeout":120000}',
+        createdAt: Date.now() - 95_000,
+        // Deadline already in the past → Allow/Deny disabled.
+        expiresAt: Date.now() - 5_000,
       },
     ],
   }),
@@ -700,6 +786,7 @@ function snapshot(): StateSnapshot {
     project: a.project,
     question: a.question,
     options: a.options,
+    questions: a.questions,
     detail: a.detail,
     timeoutAt: a.timeoutAt,
     context: a.context,
@@ -716,6 +803,8 @@ function snapshot(): StateSnapshot {
     context: p.context,
     // R-16.2: a perm with no explicit arrival is treated as just-now (newest).
     queuedAt: p.createdAt ?? Date.now(),
+    // R-32.1: mirror the shell's deadline so the UI can disable Allow/Deny.
+    expiresAt: p.expiresAt,
   }));
   const counts = {
     attention: sessions.filter((s) => s.status === 'attention').length,
@@ -742,6 +831,10 @@ function delay(ms: number): Promise<void> {
  * lets a Playwright spec assert the reported height shrinks back down once
  * rows disappear, without a real OS window to measure). */
 let lastResizeContentHeight: number | null = null;
+/** Count of `resize_popup` calls (SPEC R-31.2): lets a spec prove the settings
+ * open/close resize snaps in a single report under reduced motion vs. tweens
+ * across many frames when motion is allowed. */
+let resizePopupCalls = 0;
 /** Count of `show_ask_window` invocations (SPEC R-18.1 "(or via popup mirror
  * click)"): the popup's ask-mirror row click calls this to re-surface the ask
  * window; there's no second real window in mock mode, so a call counter is
@@ -771,6 +864,11 @@ let lastPermDecision: string | null = null;
  * spec assert Dismiss sends kind:"dismissed" from both the ask window and the
  * popup mirror, with no real MCP call to observe. */
 let lastAnswerAsk: { askId: string; kind: string } | null = null;
+/** Last `answer_ask` INCLUDING the answer payload (SPEC §29): the form spec
+ * asserts the submitted `{answers:[...]}` document + kind:"form". Kept separate
+ * from `lastAnswerAsk` so the existing R-19.4 specs' `{askId, kind}` shape is
+ * unchanged. */
+let lastAnswerAskFull: { askId: string; answer: string; kind: string } | null = null;
 
 /** Test-only: records a `hideCurrentWindow()` call (SPEC R-18.1). Exported so
  * `ipc-client.ts` can call it from the mock branch of `hideCurrentWindow`. */
@@ -810,6 +908,7 @@ export async function invoke<K extends keyof Commands>(
       return snapshot() as any;
     case 'answer_ask': {
       lastAnswerAsk = { askId: a.askId as string, kind: a.kind as string };
+      lastAnswerAskFull = { askId: a.askId as string, answer: a.answer as string, kind: a.kind as string };
       clearAskAndMaybeRestore(a.askId as string);
       emit();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -838,6 +937,20 @@ export async function invoke<K extends keyof Commands>(
     }
     case 'remove_row': {
       sessions = sessions.filter((s) => s.id !== a.sessionId);
+      emit();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
+    }
+    case 'rename_session': {
+      // SPEC §27 R-27.4: a user override wins over the normal title chain; an
+      // empty/whitespace name clears it (restoring `baseTitle`). The real
+      // backend also bidi-strips + caps at 60 graphemes; the mock just trims.
+      const s = sessions.find((x) => x.id === a.sessionId);
+      if (s) {
+        if (s.baseTitle === undefined) s.baseTitle = s.title;
+        const name = (a.name as string).trim();
+        s.title = name.length > 0 ? name : (s.baseTitle ?? s.title);
+      }
       emit();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
@@ -880,8 +993,10 @@ export async function invoke<K extends keyof Commands>(
     }
     case 'resize_popup':
       // No window to size in mock/browser mode — record the reported content
-      // height (SPEC R-14.3) so a spec can assert it, and otherwise ignore.
+      // height (SPEC R-14.3) and the call count (R-31.2) so a spec can assert
+      // them, and otherwise ignore.
       lastResizeContentHeight = a.contentHeight as number;
+      resizePopupCalls += 1;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
     case 'show_ask_window':
@@ -931,6 +1046,14 @@ export function _mockRemoveAllSessions(): void {
   emit();
 }
 
+/** Test-only: trims the fleet to its first `n` rows (SPEC R-31.2 — lets a spec
+ * drive the `many-sessions` fixture down to 2 / 8 rows and prove the settings
+ * pane stays a fixed 5-row height regardless of session count). */
+export function _mockKeepFirstSessions(n: number): void {
+  sessions = sessions.slice(0, n);
+  emit();
+}
+
 // Test-only headless hooks for the Playwright e2e harness, attached only in mock
 // mode (no Tauri host). The suite uses `answerAsk` to drive an unrelated
 // `deck://state` push (answering a queued, non-primary ask) and prove a
@@ -940,8 +1063,12 @@ if (!isTauri()) {
     answerAsk: _mockAnswerAsk,
     scenarioNames: _mockScenarioNames,
     removeAllSessions: _mockRemoveAllSessions,
+    // R-31.2: trims the fleet so a spec can size the settings pane at 2/8 rows.
+    keepFirstSessions: _mockKeepFirstSessions,
     // R-14.3: last content height the UI reported via `resize_popup`.
     lastResizeContentHeight: () => lastResizeContentHeight,
+    // R-31.2: total `resize_popup` calls (snap vs. animated tween).
+    resizePopupCallCount: () => resizePopupCalls,
     // R-18.1: counters for the cross-window "reopen" and "close" actions,
     // which have no observable real-window effect in mock/browser mode.
     showAskWindowCallCount: () => showAskWindowCalls,
@@ -956,6 +1083,9 @@ if (!isTauri()) {
     // R-19.4: last (askId, kind) routed via `answer_ask` — asserts Dismiss
     // sends kind:"dismissed" from the ask window and the popup mirror.
     lastAnswerAsk: () => lastAnswerAsk,
+    // R-29.4: last (askId, answer, kind) — asserts the form Submit sends the
+    // `{answers:[...]}` document under kind:"form".
+    lastAnswerAskFull: () => lastAnswerAskFull,
   };
 }
 

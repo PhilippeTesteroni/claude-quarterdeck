@@ -6,7 +6,7 @@
  */
 
 import { hideCurrentWindow, invoke, onState } from './ipc-client';
-import type { AskAnswerKind, AskRow, PermDecision, PermRow, SessionRow, StateSnapshot } from './ipc-contract';
+import type { AskAnswerKind, AskQuestion, AskRow, PermDecision, PermRow, SessionRow, StateSnapshot } from './ipc-contract';
 import { formatCountdown, truncate } from './format';
 import { clear, h } from './dom';
 
@@ -26,6 +26,21 @@ let primaryPerm: PermRow | null = null;
  * by an unrelated session's `deck://state` push) can restore the in-progress
  * free-text answer + focus instead of wiping it (R-8). */
 let renderedAskId: string | null = null;
+
+/** SPEC §29 (R-29.4): in-progress multi-question form answer, kept module-level
+ * so a `deck://state` re-push (from any session) can't wipe the user's
+ * selections / typed text mid-fill. Keyed by ask id; reset when a different ask
+ * becomes primary. `selected[qi]` holds the chosen option INDICES for question
+ * `qi` (radio = at most one, checkbox = any); `texts[qi]` is its free-text. */
+interface FormState {
+  askId: string;
+  selected: Set<number>[];
+  texts: string[];
+}
+let formState: FormState | null = null;
+/** Which form free-text field held focus/selection before a rebuild, so it can
+ * be restored (the form analog of the single-question `preserved` path). */
+let formTextFocus: { askId: string; qi: number; selStart: number | null; selEnd: number | null } | null = null;
 
 function findSession(sessions: SessionRow[], id?: string): SessionRow | undefined {
   if (!id) return undefined;
@@ -132,6 +147,122 @@ function renderFreeform(ask: AskRow): HTMLElement {
   return h('div', { className: 'qd-ask-freeform' }, [input, submit]);
 }
 
+/** SPEC §29 (R-29.4): render a multi-question / multi-select form. Each block is
+ * a header + question + option buttons (radio when `!multiSelect`, checkbox when
+ * `multiSelect`) plus an optional per-question free-text field; one Submit
+ * validates required single-selects and sends the whole form as a `form`-kind
+ * JSON answer `{answers:[{header,question,selected:[...],text?}, ...]}`. Selections
+ * + typed text live in module-level `formState` so they survive a re-render. */
+function renderForm(ask: AskRow, questions: AskQuestion[]): HTMLElement {
+  // Reset the working state whenever a different ask becomes primary; otherwise
+  // keep the user's in-progress selections/text across a re-render (R-29.4).
+  if (!formState || formState.askId !== ask.id) {
+    formState = {
+      askId: ask.id,
+      selected: questions.map(() => new Set<number>()),
+      texts: questions.map(() => ''),
+    };
+  }
+  const state = formState;
+  freeTextInput = null;
+
+  const errorEl = h('div', { className: 'qd-ask-form-error', hidden: true }, ['Please answer every required question.']);
+
+  const blocks = questions.map((q, qi) => {
+    const optionButtons: HTMLButtonElement[] = [];
+    const syncSelected = (): void => {
+      optionButtons.forEach((btn, oi) => btn.classList.toggle('selected', state.selected[qi].has(oi)));
+    };
+    (q.options ?? []).forEach((opt, oi) => {
+      const btn = h(
+        'button',
+        {
+          className: 'qd-btn qd-ask-option qd-ask-form-option',
+          type: 'button',
+          role: q.multiSelect ? 'checkbox' : 'radio',
+          onclick: () => {
+            const sel = state.selected[qi];
+            if (q.multiSelect) {
+              if (sel.has(oi)) sel.delete(oi);
+              else sel.add(oi);
+            } else {
+              // Radio: exactly one — replace any prior choice with this one.
+              sel.clear();
+              sel.add(oi);
+            }
+            errorEl.hidden = true;
+            syncSelected();
+          },
+        },
+        [
+          h('span', { className: `qd-ask-form-mark${q.multiSelect ? ' checkbox' : ''}` }, []),
+          h('span', { className: 'qd-ask-option-text' }, [opt]),
+        ],
+      ) as HTMLButtonElement;
+      optionButtons.push(btn);
+    });
+    syncSelected();
+
+    const textInput = h('input', {
+      className: 'qd-ask-form-text',
+      type: 'text',
+      'data-qi': String(qi),
+      placeholder: q.options && q.options.length > 0 ? 'Or type an answer…' : 'Type an answer…',
+      value: state.texts[qi],
+      oninput: (ev: Event) => {
+        state.texts[qi] = (ev.target as HTMLInputElement).value;
+      },
+    }) as HTMLInputElement;
+
+    return h('div', { className: 'qd-ask-form-q' }, [
+      q.header ? h('div', { className: 'qd-ask-q-header' }, [q.header]) : null,
+      h('div', { className: 'qd-ask-question qd-ask-form-question' }, [q.question]),
+      optionButtons.length > 0 ? h('div', { className: 'qd-ask-options' }, optionButtons) : null,
+      textInput,
+    ]);
+  });
+
+  const submit = h(
+    'button',
+    {
+      className: 'qd-btn qd-btn-primary',
+      type: 'button',
+      onclick: () => {
+        // R-29.4: a single-select question that offers options requires a choice.
+        const missing = questions.some(
+          (q, qi) => !q.multiSelect && (q.options?.length ?? 0) > 0 && state.selected[qi].size === 0,
+        );
+        if (missing) {
+          errorEl.hidden = false;
+          return;
+        }
+        const answers = questions.map((q, qi) => {
+          const selected = [...state.selected[qi]].sort((a, b) => a - b).map((i) => q.options[i]);
+          const text = state.texts[qi].trim();
+          const entry: { header?: string; question: string; selected: string[]; text?: string } = {
+            question: q.question,
+            selected,
+          };
+          if (q.header) entry.header = q.header;
+          if (text) entry.text = text;
+          return entry;
+        });
+        send(ask, JSON.stringify({ answers }), 'form');
+      },
+    },
+    ['Submit'],
+  );
+
+  return h('div', { className: 'qd-ask-form' }, [
+    ...blocks,
+    errorEl,
+    h('div', { className: 'qd-ask-actions' }, [
+      h('button', { className: 'qd-btn qd-btn-ghost', type: 'button', onclick: () => send(ask, '', 'dismissed') }, ['Dismiss']),
+      submit,
+    ]),
+  ]);
+}
+
 function renderAsk(ask: AskRow, sessions: SessionRow[]): void {
   clear(elContent);
   // R-8.7: an ask recovered after a restart can never be answered — show it as
@@ -154,6 +285,20 @@ function renderAsk(ask: AskRow, sessions: SessionRow[]): void {
     );
     return;
   }
+  // SPEC §29 (R-29.4): a multi-question / multi-select ask renders as a form
+  // (radio/checkbox blocks + Submit) instead of the single-question options +
+  // free-text. The form carries its own Dismiss, so no separate actions row.
+  if (ask.questions && ask.questions.length > 0) {
+    elContent.append(
+      renderIdentity(ask, sessions),
+      // The synthesized headline duplicates the first block, so skip it here and
+      // let the form's own per-question text carry the prompt.
+      ...(ask.detail ? [h('div', { className: 'qd-ask-detail' }, [ask.detail])] : []),
+      renderForm(ask, ask.questions),
+    );
+    return;
+  }
+  formState = null;
   elContent.append(
     renderIdentity(ask, sessions),
     h('div', { className: 'qd-ask-question' }, [ask.question]),
@@ -195,26 +340,41 @@ function renderPerm(perm: PermRow, sessions: SessionRow[]): void {
     perm.project ??
     (perm.context ? `Unknown agent (${truncate(perm.context, 42)})` : 'Unknown agent');
 
+  // R-32.1: past the deadline the perm's hook has already given up (a deck
+  // decision can no longer reach it), so Allow/Deny are disabled until the tick
+  // sweep removes the row. "In terminal" stays live so the user can still clear
+  // it locally. An identity tag flags the expired state.
+  const expired = perm.expiresAt !== undefined && Date.now() >= perm.expiresAt;
+
+  const identity = h('div', { className: 'qd-ask-identity qd-perm-identity' }, [
+    dot,
+    h('span', { className: 'qd-ask-identity-project' }, [label]),
+    h('span', { className: 'qd-perm-tag mono' }, [expired ? 'expired' : 'requests permission']),
+  ]);
+
+  const allow = h(
+    'button',
+    { className: 'qd-btn qd-btn-primary qd-perm-allow', type: 'button', onclick: () => sendPerm(perm, 'allow') },
+    ['Allow'],
+  ) as HTMLButtonElement;
+  const deny = h(
+    'button',
+    { className: 'qd-btn qd-perm-deny', type: 'button', onclick: () => sendPerm(perm, 'deny') },
+    ['Deny'],
+  ) as HTMLButtonElement;
+  if (expired) {
+    allow.disabled = true;
+    deny.disabled = true;
+  }
+
   elContent.append(
     h('div', { className: 'qd-perm' }, [
-      h('div', { className: 'qd-ask-identity qd-perm-identity' }, [
-        dot,
-        h('span', { className: 'qd-ask-identity-project' }, [label]),
-        h('span', { className: 'qd-perm-tag mono' }, ['requests permission']),
-      ]),
+      identity,
       h('div', { className: 'qd-ask-question qd-perm-tool' }, [`Run ${perm.toolName}?`]),
       h('pre', { className: 'qd-perm-input mono' }, [perm.toolInput || '(no input)']),
       h('div', { className: 'qd-ask-actions qd-perm-actions' }, [
-        h(
-          'button',
-          { className: 'qd-btn qd-btn-primary qd-perm-allow', type: 'button', onclick: () => sendPerm(perm, 'allow') },
-          ['Allow'],
-        ),
-        h(
-          'button',
-          { className: 'qd-btn qd-perm-deny', type: 'button', onclick: () => sendPerm(perm, 'deny') },
-          ['Deny'],
-        ),
+        allow,
+        deny,
         h(
           'button',
           { className: 'qd-btn qd-btn-ghost qd-perm-defer', type: 'button', onclick: () => sendPerm(perm, 'defer') },
@@ -250,6 +410,20 @@ function render(snap: StateSnapshot): void {
           focused: document.activeElement === freeTextInput,
           selStart: freeTextInput.selectionStart,
           selEnd: freeTextInput.selectionEnd,
+        }
+      : null;
+
+  // R-29.4: the form analog — remember which per-question free-text field was
+  // focused (its value already lives in `formState`) so an unrelated re-push
+  // doesn't drop the caret mid-answer.
+  const active = document.activeElement;
+  formTextFocus =
+    renderedAskId !== null && active instanceof HTMLInputElement && active.classList.contains('qd-ask-form-text')
+      ? {
+          askId: renderedAskId,
+          qi: Number(active.getAttribute('data-qi')),
+          selStart: active.selectionStart,
+          selEnd: active.selectionEnd,
         }
       : null;
 
@@ -289,6 +463,19 @@ function render(snap: StateSnapshot): void {
   renderAsk(primary, snap.sessions);
   renderedAskId = primary.id;
 
+  // R-29.4: restore form free-text focus when the SAME form ask is still primary.
+  if (formTextFocus && formTextFocus.askId === primary.id) {
+    const field = elContent.querySelector<HTMLInputElement>(`.qd-ask-form-text[data-qi="${formTextFocus.qi}"]`);
+    if (field) {
+      field.focus();
+      try {
+        field.setSelectionRange(formTextFocus.selStart ?? field.value.length, formTextFocus.selEnd ?? field.value.length);
+      } catch {
+        /* value already restored from formState; selection is best-effort. */
+      }
+    }
+  }
+
   // Only restore when the SAME ask is still on top (its question/options are
   // immutable, so the typed text still applies) and it has a free-text field.
   if (preserved && preserved.askId === primary.id && freeTextInput) {
@@ -321,11 +508,14 @@ document.addEventListener('keydown', (ev) => {
   // window's Esc-hides-the-window behavior for that item specifically.
   if (primaryPerm) {
     const key = ev.key.toLowerCase();
-    if (key === 'a') {
+    // R-32.1: past the deadline Allow/Deny are disabled (the hook has given up),
+    // so their A/D shortcuts are inert too; Esc = In terminal still clears it.
+    const permExpired = primaryPerm.expiresAt !== undefined && Date.now() >= primaryPerm.expiresAt;
+    if (key === 'a' && !permExpired) {
       sendPerm(primaryPerm, 'allow');
       return;
     }
-    if (key === 'd') {
+    if (key === 'd' && !permExpired) {
       sendPerm(primaryPerm, 'deny');
       return;
     }
@@ -346,9 +536,12 @@ document.addEventListener('keydown', (ev) => {
   }
   if (!latest || latest.asks.length === 0) return;
   if (document.activeElement === freeTextInput) return;
+  const primary = latest.asks[0];
+  // R-29.4: a multi-question form is answered via its buttons/Submit, never the
+  // 1-9 option shortcut (which maps to the single-question options).
+  if (primary.questions && primary.questions.length > 0) return;
   const digit = Number(ev.key);
   if (!Number.isInteger(digit) || digit < 1 || digit > 9) return;
-  const primary = latest.asks[0];
   const options = primary.options ?? [];
   const opt = options[digit - 1];
   if (opt !== undefined) {

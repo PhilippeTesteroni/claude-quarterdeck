@@ -25,7 +25,41 @@ const elLampBadge = document.getElementById('qd-lamp-badge') as HTMLElement;
 let latest: StateSnapshot | null = null;
 let receivedAtPerf = 0;
 let settingsOpen = false;
+/** Last content height reported to the shell via `resize_popup`. Seeds the
+ * settings open/close tween (so it animates from where the window actually is)
+ * and lets us skip redundant reports (R-14.3 / R-31.2). */
+let lastReportedHeight: number | null = null;
+/** Handle for an in-flight settings-resize tween, so a rapid re-toggle cancels
+ * the previous one instead of two rAF loops fighting over the height. */
+let resizeTweenRaf: number | null = null;
 let ctxMenuEl: HTMLElement | null = null;
+/** SPEC §27 R-27.5: the in-progress rename editor. When set, the matching
+ * session row renders an `<input>` instead of its title span, and the edit
+ * survives every `renderContent` rebuild (a background `deck://state` push must
+ * not wipe a name the user is typing) — the module-level guard is the analog of
+ * `captureAskInputs` for the single rename field. */
+interface RenameEdit {
+  id: string;
+  value: string;
+  focused: boolean;
+  selStart: number | null;
+  selEnd: number | null;
+}
+let renameEdit: RenameEdit | null = null;
+/** Set while `renderContent` tears down the DOM: removing the focused rename
+ * `<input>` fires a synchronous `blur`, which must NOT be mistaken for a user
+ * commit (that would close the editor on every background push — the exact thing
+ * R-27.5 says must survive). The real user-blur path never runs through the
+ * rebuild, so it still commits. */
+let suppressRenameBlur = false;
+/** Pending single-click-to-focus on a row title (R-15.4 vs R-27.5): a title
+ * click stops the row's immediate focus and schedules it after the double-click
+ * window so a rename double-click can cancel it, keeping `focus_terminal` from
+ * raising the terminal (and, unpinned, hiding the popup) mid-gesture. */
+let titleFocusTimer: number | null = null;
+/** The OS double-click threshold is ~500ms on Windows; 400ms disambiguates a
+ * rename double-click from a single focus click without a noticeable lag. */
+const TITLE_DBLCLICK_MS = 400;
 let installBusy = false;
 let installError: string | null = null;
 let uninstallBusy = false;
@@ -47,6 +81,19 @@ for (const status of WATCHLINE_ORDER) {
 }
 const watchlineNone = h('div', { className: 'qd-watchline-seg', 'data-status': 'none', style: 'flex-basis:0%' });
 elWatchline.append(watchlineNone);
+
+// R-31.2 fixed settings height: the settings overlay sizes the window to
+// `header + SETTINGS_ROW_COUNT × row + footer` so it's a stable pane regardless
+// of how many (or few) sessions sit behind it. Rows use a nominal constant
+// rather than a measured `.qd-row` on purpose — the empty state has no row to
+// measure, and a constant keeps the height byte-identical at 0/2/8 sessions.
+// The final window is still clamped to 160..560 in `windows.rs`.
+const SETTINGS_ROW_COUNT = 5;
+const SETTINGS_ROW_H = 36; // ≈ one single-line row: 13px/1.4 text + 16px pad + 1px border
+const SETTINGS_FOOTER_H = 30; // nominal footer allowance (it's covered by the overlay anyway)
+/** Duration of the settings open/close height tween, ms (snapped instantly
+ * under reduced motion — see `tweenPopupHeight`). */
+const SETTINGS_RESIZE_MS = 180;
 
 function renderWatchline(counts: StateSnapshot['counts']): void {
   const total = counts.attention + counts.working + counts.idle + counts.dead;
@@ -104,6 +151,33 @@ function openCtxMenu(x: number, y: number, row: SessionRow): void {
         },
       },
       ['Copy session id'],
+    ),
+    // SPEC §27 R-27.5/R-27.6: rename inline, or reset back to the derived name.
+    h(
+      'button',
+      {
+        className: 'qd-ctx-item',
+        type: 'button',
+        onclick: (ev: Event) => {
+          ev.stopPropagation();
+          closeCtxMenu();
+          beginRename(ev, row);
+        },
+      },
+      ['Rename'],
+    ),
+    h(
+      'button',
+      {
+        className: 'qd-ctx-item',
+        type: 'button',
+        onclick: (ev: Event) => {
+          ev.stopPropagation();
+          void invoke('rename_session', { sessionId: row.id, name: '' }).catch(() => undefined);
+          closeCtxMenu();
+        },
+      },
+      ['Reset name'],
     ),
     h(
       'button',
@@ -241,7 +315,7 @@ function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
       statusDot(row.status),
       h('div', { className: 'qd-row-main' }, [
         h('span', { className: 'qd-row-project' }, [row.project]),
-        h('span', { className: 'qd-row-title' }, [row.title]),
+        renameEdit?.id === row.id ? buildRenameInput(row) : renderRowTitle(row),
         row.branch ? h('span', { className: 'qd-row-branch mono' }, [row.branch]) : null,
         badge,
       ]),
@@ -250,6 +324,140 @@ function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
     ],
   );
   return el;
+}
+
+/** The normal (non-editing) row title span. SPEC §27 R-27.5: double-clicking it
+ * opens the inline rename editor. A double-click first emits two `click` events
+ * (detail 1 then 2) that bubble to the row before `dblclick` fires, so leaving
+ * the row's `focus_terminal` handler to run would raise the terminal and,
+ * unpinned, hide the popup on blur (R-7.1/R-14.2) mid-gesture — the user could
+ * never rename. We therefore `stopPropagation` on the title's own click and,
+ * to preserve click-to-focus on the title (R-15.4), re-schedule the focus after
+ * the double-click window; `beginRename` cancels it when the second click lands.
+ */
+function renderRowTitle(row: SessionRow): HTMLElement {
+  return h(
+    'span',
+    {
+      className: 'qd-row-title',
+      title: 'Double-click to rename',
+      onclick: (ev: Event) => {
+        ev.stopPropagation();
+        if (titleFocusTimer !== null) clearTimeout(titleFocusTimer);
+        titleFocusTimer = window.setTimeout(() => {
+          titleFocusTimer = null;
+          focusTerminal(row.id);
+        }, TITLE_DBLCLICK_MS);
+      },
+      ondblclick: (ev: Event) => beginRename(ev, row),
+    },
+    [row.title],
+  );
+}
+
+/** Build the inline rename `<input>` (SPEC §27 R-27.5): seeded with the current
+ * title, autofocused, committing on Enter/blur and cancelling on Escape. Every
+ * pointer gesture on it `stopPropagation`s so it never triggers the row's
+ * focus-terminal click. Text-node-only via `h()` — no injection surface. */
+function buildRenameInput(row: SessionRow): HTMLInputElement {
+  const seed = renameEdit?.id === row.id ? renameEdit.value : row.title;
+  const input = h('input', {
+    className: 'qd-row-title-edit',
+    type: 'text',
+    'data-rename-id': row.id,
+    onclick: (ev: Event) => ev.stopPropagation(),
+    ondblclick: (ev: Event) => ev.stopPropagation(),
+    oninput: () => {
+      if (renameEdit?.id === row.id) renameEdit.value = input.value;
+    },
+    onkeydown: (ev: Event) => {
+      const kev = ev as KeyboardEvent;
+      if (kev.key === 'Enter') {
+        kev.preventDefault();
+        commitRename(row.id, input.value);
+      } else if (kev.key === 'Escape') {
+        kev.preventDefault();
+        cancelRename();
+      }
+    },
+    onblur: () => {
+      if (suppressRenameBlur) return;
+      commitRename(row.id, input.value);
+    },
+  }) as HTMLInputElement;
+  // Set the property (not just the attribute) so the seed is the live value.
+  input.value = seed;
+  return input;
+}
+
+/** Enter the rename editor for a row (SPEC §27 R-27.5). */
+function beginRename(ev: Event, row: SessionRow): void {
+  ev.stopPropagation();
+  ev.preventDefault();
+  // Cancel the single-click focus the two preceding clicks scheduled so this
+  // rename gesture never raises the terminal (R-15.4 vs R-27.5).
+  if (titleFocusTimer !== null) {
+    clearTimeout(titleFocusTimer);
+    titleFocusTimer = null;
+  }
+  renameEdit = { id: row.id, value: row.title, focused: true, selStart: null, selEnd: null };
+  if (latest) renderContent(latest);
+}
+
+/** Commit a rename (Enter/blur): send the (possibly empty → clears) name and
+ * leave the editor. Single-flight via the `renameEdit` guard so a blur firing
+ * right after Enter doesn't double-submit. */
+function commitRename(id: string, raw: string): void {
+  if (renameEdit?.id !== id) return;
+  renameEdit = null;
+  void invoke('rename_session', { sessionId: id, name: raw.trim() }).catch(() => undefined);
+  if (latest) renderContent(latest);
+}
+
+/** Cancel a rename (Escape): discard the edit and restore the title span. */
+function cancelRename(): void {
+  if (!renameEdit) return;
+  renameEdit = null;
+  if (latest) renderContent(latest);
+}
+
+/** Capture the live rename-input value + focus/selection before an `elContent`
+ * rebuild so a background state push can't wipe an in-progress name (R-27.5,
+ * mirrors `captureAskInputs`). */
+function captureRenameInput(): void {
+  if (!renameEdit) return;
+  for (const el of elContent.querySelectorAll<HTMLInputElement>('.qd-row-title-edit')) {
+    if (el.getAttribute('data-rename-id') !== renameEdit.id) continue;
+    renameEdit.value = el.value;
+    renameEdit.focused = el === document.activeElement;
+    renameEdit.selStart = el.selectionStart;
+    renameEdit.selEnd = el.selectionEnd;
+    return;
+  }
+}
+
+/** Restore rename-input focus/selection after the rebuild. Clears the editor if
+ * its row vanished (the session ended) so it can't wedge. */
+function restoreRenameInput(): void {
+  if (!renameEdit) return;
+  for (const el of elContent.querySelectorAll<HTMLInputElement>('.qd-row-title-edit')) {
+    if (el.getAttribute('data-rename-id') !== renameEdit.id) continue;
+    el.value = renameEdit.value;
+    if (renameEdit.focused) {
+      el.focus();
+      try {
+        // A fresh open (null selection) selects all so a retype replaces cleanly.
+        const start = renameEdit.selStart ?? 0;
+        const end = renameEdit.selEnd ?? renameEdit.value.length;
+        el.setSelectionRange(start, end);
+      } catch {
+        /* setSelectionRange can throw on some states; value is already restored. */
+      }
+    }
+    return;
+  }
+  // The editing row is gone (session ended) — drop the editor.
+  renameEdit = null;
 }
 
 function askAgentLabel(ask: AskRow): string {
@@ -297,6 +505,37 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
       h('div', { className: 'qd-ask-row-question' }, [ask.question]),
       h('div', { className: 'qd-ask-row-actions' }, [
         h('span', { className: 'qd-ask-row-expired-note' }, ['Expired while Quarterdeck was closed.']),
+        h(
+          'button',
+          { className: 'qd-ask-row-dismiss', type: 'button', title: 'Dismiss', onclick: () => send('', 'dismissed') },
+          ['Dismiss'],
+        ),
+      ]),
+    ]);
+  }
+
+  // SPEC §29 (R-29.5): a multi-question form is too large to answer inline in the
+  // popup — show a compact "N questions — Answer in window" summary that
+  // re-surfaces the ask window instead of the option buttons / free-text input.
+  // (No `.qd-ask-row-input` here, so `captureAskInputs` skips form rows.)
+  if (ask.questions && ask.questions.length > 0) {
+    const n = ask.questions.length;
+    return h('div', { className: 'qd-ask-row qd-ask-row-form', onclick: reopenAskWindowUnlessInteractive }, [
+      h('div', { className: 'qd-ask-row-head' }, [
+        h('span', { className: 'qd-ask-row-agent' }, [askAgentLabel(ask)]),
+        h('span', { style: 'color:var(--muted)' }, [`asks · ${n} question${n === 1 ? '' : 's'}`]),
+      ]),
+      h('div', { className: 'qd-ask-row-question' }, [ask.question]),
+      h('div', { className: 'qd-ask-row-actions' }, [
+        h(
+          'button',
+          {
+            className: 'qd-btn qd-ask-row-opt',
+            type: 'button',
+            onclick: () => void invoke('show_ask_window', undefined).catch(() => undefined),
+          },
+          ['Answer in window'],
+        ),
         h(
           'button',
           { className: 'qd-ask-row-dismiss', type: 'button', title: 'Dismiss', onclick: () => send('', 'dismissed') },
@@ -366,15 +605,24 @@ function renderPermMirrorRow(perm: PermRow): HTMLElement {
     });
   };
   const agent = perm.project ?? (perm.context ? `Unknown agent (${truncate(perm.context, 32)})` : 'Unknown agent');
+  // R-32.1: mirror the ask window — past the deadline Allow/Deny are disabled
+  // (the hook has given up); "In terminal" stays live.
+  const expired = perm.expiresAt !== undefined && Date.now() >= perm.expiresAt;
+  const allow = h('button', { className: 'qd-btn qd-btn-primary qd-perm-row-allow', type: 'button', onclick: () => decide('allow') }, ['Allow']) as HTMLButtonElement;
+  const deny = h('button', { className: 'qd-btn qd-perm-row-deny', type: 'button', onclick: () => decide('deny') }, ['Deny']) as HTMLButtonElement;
+  if (expired) {
+    allow.disabled = true;
+    deny.disabled = true;
+  }
   return h('div', { className: 'qd-ask-row qd-perm-row', onclick: reopenAskWindowUnlessInteractive }, [
     h('div', { className: 'qd-ask-row-head' }, [
       h('span', { className: 'qd-ask-row-agent' }, [agent]),
-      h('span', { style: 'color:var(--muted)' }, ['requests permission']),
+      h('span', { style: 'color:var(--muted)' }, [expired ? 'expired' : 'requests permission']),
     ]),
     h('div', { className: 'qd-ask-row-question qd-perm-row-tool' }, [`Run ${perm.toolName}?`]),
     h('div', { className: 'qd-ask-row-actions' }, [
-      h('button', { className: 'qd-btn qd-btn-primary qd-perm-row-allow', type: 'button', onclick: () => decide('allow') }, ['Allow']),
-      h('button', { className: 'qd-btn qd-perm-row-deny', type: 'button', onclick: () => decide('deny') }, ['Deny']),
+      allow,
+      deny,
       h('button', { className: 'qd-btn qd-ask-row-dismiss', type: 'button', title: 'Answer in the terminal instead', onclick: () => decide('defer') }, ['In terminal']),
     ]),
   ]);
@@ -586,7 +834,12 @@ function restoreAskInputs(preserved: Map<string, PreservedAskInput>): void {
 
 function renderContent(snap: StateSnapshot): void {
   const preservedAsks = captureAskInputs();
+  captureRenameInput();
+  // Removing the focused rename input below fires a synchronous blur; guard it
+  // so the teardown doesn't commit the edit (R-27.5 editor-survives-rebuild).
+  suppressRenameBlur = true;
   clear(elContent);
+  suppressRenameBlur = false;
   timeTicks = [];
   const settings = snap.settings;
   const perms = snap.perms ?? [];
@@ -646,6 +899,7 @@ function renderContent(snap: StateSnapshot): void {
   }
   elContent.append(rows);
   restoreAskInputs(preservedAsks);
+  restoreRenameInput();
 }
 
 function renderFooter(counts: StateSnapshot['counts']): void {
@@ -761,8 +1015,7 @@ function renderSettings(snap: StateSnapshot): void {
           type: 'button',
           'aria-label': 'Back',
           onclick: () => {
-            settingsOpen = false;
-            elSettings.classList.remove('open');
+            setSettingsOpen(false);
           },
         },
         ['←'],
@@ -856,7 +1109,12 @@ function renderAll(): void {
   elApp.classList.toggle('qd-app-lamp', lampMode);
   if (lampMode) {
     // The gear is hidden in lamp mode (no way to reach settings) — make sure a
-    // pane left open from before collapsing doesn't render on top of it.
+    // pane left open from before collapsing doesn't render on top of it, and a
+    // settings resize tween mid-flight doesn't keep resizing the fixed square.
+    if (resizeTweenRaf !== null) {
+      cancelAnimationFrame(resizeTweenRaf);
+      resizeTweenRaf = null;
+    }
     if (settingsOpen) {
       settingsOpen = false;
       elSettings.classList.remove('open');
@@ -880,9 +1138,25 @@ function renderAll(): void {
  * removed). Reported (and recorded by the mock, for Playwright's R-14.3
  * shrink regression spec) even in mock/browser mode, since there's no window
  * to size there but the number itself is still test-observable; skipped
- * while the settings overlay is open (it has its own scroll). */
+ * while the settings overlay is open (R-31.2 sizes the window to a fixed
+ * 5-row height instead) or while a settings tween is still in flight. */
 function syncPopupHeight(): void {
   if (settingsOpen) return;
+  // Don't fight an in-flight settings-close tween: it lands on the correct
+  // auto-height itself, and the next snapshot resumes normal sizing.
+  if (resizeTweenRaf !== null) return;
+  reportPopupHeight(measureAutoHeight());
+}
+
+/** Reports `contentHeight` to the shell and records it so the next tween can
+ * start from the height the window is actually at. */
+function reportPopupHeight(total: number): void {
+  lastReportedHeight = total;
+  void invoke('resize_popup', { contentHeight: total }).catch(() => undefined);
+}
+
+/** The intrinsic auto-height: `header + true content height + footer`. */
+function measureAutoHeight(): number {
   const appEl = document.getElementById('app') as HTMLElement | null;
   const header = document.querySelector('.qd-header') as HTMLElement | null;
 
@@ -916,14 +1190,56 @@ function syncPopupHeight(): void {
     appEl.style.maxHeight = prevMaxHeight;
   }
 
-  const total = headerH + contentH + footerH;
-  void invoke('resize_popup', { contentHeight: total }).catch(() => undefined);
+  return headerH + contentH + footerH;
+}
+
+/** R-31.2 fixed settings height: `header + 5 rows + footer`. The header is
+ * measured (its height is stable across scenarios); the rows and footer are
+ * nominal constants so the pane is byte-identical at 0/2/8 sessions. */
+function settingsFixedHeight(): number {
+  const header = document.querySelector('.qd-header') as HTMLElement | null;
+  const headerH = header?.offsetHeight ?? 0;
+  return headerH + SETTINGS_ROW_COUNT * SETTINGS_ROW_H + SETTINGS_FOOTER_H;
+}
+
+/** Opens/closes the settings overlay and animates the window between its list
+ * auto-height and the fixed 5-row settings height (R-31.2). Kept in one place
+ * so the gear, the Back button, and Esc all drive the same resize. */
+function setSettingsOpen(open: boolean): void {
+  if (settingsOpen === open) return;
+  settingsOpen = open;
+  if (open && latest) renderSettings(latest);
+  elSettings.classList.toggle('open', open);
+  tweenPopupHeight(open ? settingsFixedHeight() : measureAutoHeight());
+}
+
+/** Animates the reported window height from its current value to `target` by
+ * driving `resize_popup` once per frame (R-31.2). Snaps instantly under
+ * reduced motion, on the first-ever report, or a negligible delta. */
+function tweenPopupHeight(target: number): void {
+  if (resizeTweenRaf !== null) {
+    cancelAnimationFrame(resizeTweenRaf);
+    resizeTweenRaf = null;
+  }
+  const from = lastReportedHeight;
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce || from === null || Math.abs(target - from) < 1) {
+    reportPopupHeight(target);
+    return;
+  }
+  const start = performance.now();
+  const step = (now: number): void => {
+    const t = Math.min(1, (now - start) / SETTINGS_RESIZE_MS);
+    // easeInOutQuad
+    const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+    reportPopupHeight(Math.round(from + (target - from) * eased));
+    resizeTweenRaf = t < 1 ? requestAnimationFrame(step) : null;
+  };
+  resizeTweenRaf = requestAnimationFrame(step);
 }
 
 elGear.addEventListener('click', () => {
-  settingsOpen = !settingsOpen;
-  if (settingsOpen && latest) renderSettings(latest);
-  elSettings.classList.toggle('open', settingsOpen);
+  setSettingsOpen(!settingsOpen);
 });
 
 // SPEC R-14.2: toggles the persisted pin state; the shell applies
@@ -1021,8 +1337,7 @@ elLamp.addEventListener('contextmenu', (ev: MouseEvent) => {
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') {
     if (settingsOpen) {
-      settingsOpen = false;
-      elSettings.classList.remove('open');
+      setSettingsOpen(false);
     } else if (!usingMock) {
       // Real app: Esc hides the popup window (R-7.1). Left to the shell via a
       // window-level listener in a Tauri build; nothing to do in mock mode.

@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { gotoPopup } from '../helpers/popup';
 
 // SPEC R-7.4 settings pane (notification toggles, autostart, hooks
@@ -98,6 +98,92 @@ test.describe('settings pane', () => {
     await expect(page.locator('.qd-banner-error')).toHaveText(
       'Could not read ~/.claude/settings.json: unexpected token at line 12. Fix the JSON and try again.',
     );
+  });
+});
+
+// SPEC R-31.2 "fixed settings height": opening settings sizes the window to a
+// stable `header + 5 rows + footer` height instead of latching whatever the
+// list happened to be, animated (rAF tween driving `resize_popup`) and snapped
+// under reduced motion. There's no real OS window in mock/browser mode, but the
+// mock records every reported content height + the resize call count, so the
+// pane height and snap-vs-tween behavior are both observable.
+test.describe('settings fixed 5-row height (R-31.2)', () => {
+  type Hooks = {
+    lastResizeContentHeight(): number | null;
+    resizePopupCallCount(): number;
+    removeAllSessions(): void;
+    keepFirstSessions(n: number): void;
+  };
+  const lastResize = (page: Page): Promise<number | null> =>
+    page.evaluate(() => (window as unknown as { __qdMock: Hooks }).__qdMock.lastResizeContentHeight());
+  const resizeCalls = (page: Page): Promise<number> =>
+    page.evaluate(() => (window as unknown as { __qdMock: Hooks }).__qdMock.resizePopupCallCount());
+  const keepSessions = (page: Page, n: number): Promise<void> =>
+    page.evaluate((k) => {
+      const m = (window as unknown as { __qdMock: Hooks }).__qdMock;
+      if (k === 0) m.removeAllSessions();
+      else m.keepFirstSessions(k);
+    }, n);
+
+  test('a fixed 5-row pane at 0/2/8 sessions, snapped in a single report under reduced motion', async ({ page }) => {
+      await page.emulateMedia({ reducedMotion: 'reduce' });
+
+      // --- 0 sessions (empty state, no row to measure) ---
+      await gotoPopup(page, 'empty');
+      await expect(page.locator('.qd-empty-title')).toBeVisible();
+      const emptyAuto = await lastResize(page);
+      const before0 = await resizeCalls(page);
+
+      await page.locator('#qd-gear').click();
+      await expect(page.locator('#qd-settings')).toHaveClass(/open/);
+      const h0 = await lastResize(page);
+
+      // Reduced motion => exactly one resize report (a snap, no tween frames).
+      expect((await resizeCalls(page)) - before0).toBe(1);
+      // The pane expands to 5 rows, well past the compact empty auto-height.
+      expect(h0 ?? 0).toBeGreaterThan(emptyAuto ?? 0);
+
+      // --- 2 sessions ---
+      await gotoPopup(page, 'many-sessions');
+      await keepSessions(page, 2);
+      await expect(page.locator('.qd-row')).toHaveCount(2);
+      await page.locator('#qd-gear').click();
+      await expect(page.locator('#qd-settings')).toHaveClass(/open/);
+      const h2 = await lastResize(page);
+
+      // --- 8 sessions ---
+      await gotoPopup(page, 'many-sessions');
+      await keepSessions(page, 8);
+      await expect(page.locator('.qd-row')).toHaveCount(8);
+      await page.locator('#qd-gear').click();
+      await expect(page.locator('#qd-settings')).toHaveClass(/open/);
+      const h8 = await lastResize(page);
+
+      // The fixed 5-row height is identical regardless of how many sessions sit
+      // behind the overlay — the whole point of R-31.2.
+      expect(h2).toBe(h0);
+      expect(h8).toBe(h0);
+  });
+
+  test('animates the open/close resize across frames, then restores the list height', async ({ page }) => {
+    // Default project = motion allowed (no reducedMotion), so the resize tweens.
+    await gotoPopup(page, 'many-sessions');
+    await keepSessions(page, 8);
+    await expect(page.locator('.qd-row')).toHaveCount(8);
+    const listAuto = await lastResize(page);
+
+    const beforeOpen = await resizeCalls(page);
+    await page.locator('#qd-gear').click();
+    await expect(page.locator('#qd-settings')).toHaveClass(/open/);
+    // The tween drives `resize_popup` once per animation frame => several reports.
+    await expect.poll(async () => (await resizeCalls(page)) - beforeOpen).toBeGreaterThan(1);
+    // It settles at the fixed 5-row height, shorter than the 8-row list.
+    await expect.poll(() => lastResize(page)).toBeLessThan(listAuto ?? Number.POSITIVE_INFINITY);
+
+    // Closing restores the list auto-height (content behind the overlay is unchanged).
+    await page.locator('.qd-back').click();
+    await expect(page.locator('#qd-settings')).not.toHaveClass(/open/);
+    await expect.poll(() => lastResize(page)).toBe(listAuto);
   });
 });
 

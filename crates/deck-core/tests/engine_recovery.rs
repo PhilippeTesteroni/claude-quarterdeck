@@ -129,6 +129,45 @@ fn idle_without_transcript_never_promotes() {
 }
 
 #[test]
+fn recovery_promoted_working_demotes_to_idle_when_transcript_goes_quiescent() {
+    // R-30.3 reverse gear: a row promoted idle→working by a transcript advance
+    // must fall back to idle on the first later tick where the transcript mtime
+    // does NOT advance — the recovered turn finished without a Stop hook, so the
+    // reverse gear is the only thing that unsticks it.
+    let notif = T0;
+    let (mut s, c) = attention_session("/t/a.jsonl", notif);
+    s.on_event(&stop("a", notif + 500)); // idle at notif+500
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+    // Promote: transcript 3s past idle-entry → working.
+    c.set(notif + 10_000);
+    s.poll_recovery(|_p| Some(notif + 3_000));
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+    // Quiescent tick: transcript mtime unchanged → demote back to idle.
+    c.set(notif + 20_000);
+    s.poll_recovery(|_p| Some(notif + 3_000));
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+}
+
+#[test]
+fn recovery_promoted_working_stays_working_while_transcript_advances() {
+    // Reverse gear only demotes on a stall: as long as the transcript mtime keeps
+    // advancing the recovered turn is genuinely alive and stays `working`.
+    let notif = T0;
+    let (mut s, c) = attention_session("/t/a.jsonl", notif);
+    s.on_event(&stop("a", notif + 500)); // idle at notif+500
+    c.set(notif + 10_000);
+    s.poll_recovery(|_p| Some(notif + 3_000)); // promote
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+    c.set(notif + 20_000);
+    s.poll_recovery(|_p| Some(notif + 6_000)); // advanced → hold working
+    assert_eq!(s.status_of("a"), Some(Status::Working));
+    // Now it stalls at the new mtime → demote.
+    c.set(notif + 30_000);
+    s.poll_recovery(|_p| Some(notif + 6_000));
+    assert_eq!(s.status_of("a"), Some(Status::Idle));
+}
+
+#[test]
 fn recovery_is_noop_for_working_and_idle_sessions() {
     let (mut s, c) = store_at(T0);
     s.on_event(&session_start_full(

@@ -92,8 +92,11 @@ fn sample_windows() -> Vec<u32> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    use crate::util::CommandNoWindow;
+
     let child = Command::new("powershell.exe")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"])
+        .no_console_window()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

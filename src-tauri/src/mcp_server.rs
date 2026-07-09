@@ -56,7 +56,8 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::ipc::AskAnswerKind;
-use deck_core::naming::strip_bidi_controls;
+use deck_core::ask::AskQuestion;
+use deck_core::naming::{strip_bidi_controls, truncate_graphemes};
 
 /// The single MCP endpoint path (streamable HTTP transport).
 pub const MCP_PATH: &str = "/mcp";
@@ -66,6 +67,20 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Cap for an explicit `timeout_seconds` (R-19.2: raised 600 → 3600). Omitted/0
 /// means persistent (no expiry), handled separately.
 const MAX_TIMEOUT_SECONDS: u64 = 3600;
+
+// SPEC §29 (R-29.6): central caps for a multi-question form, enforced in
+// `parse_ask_request` (the flat single-question path has none). Grapheme-based
+// so a multibyte header/question/option is never severed mid-cluster.
+/// Max questions in one form.
+const MAX_QUESTIONS: usize = 8;
+/// Max options offered per question.
+const MAX_OPTIONS_PER_QUESTION: usize = 12;
+/// Grapheme cap on a per-question header.
+const MAX_HEADER_CHARS: usize = 60;
+/// Grapheme cap on a question's text.
+const MAX_QUESTION_CHARS: usize = 200;
+/// Grapheme cap on a single option's text.
+const MAX_OPTION_CHARS: usize = 100;
 /// Keepalive cadence (R-19.3): while an `ask_user` call is blocked and the
 /// client sent a `progressToken`, the server emits `notifications/progress`
 /// this often to reset Claude Code's idle abort. Overridable (ms) via
@@ -91,6 +106,12 @@ fn keepalive_interval() -> Duration {
 pub struct AskRequest {
     pub question: String,
     pub options: Option<Vec<String>>,
+    /// Multi-question / multi-select form (SPEC §29, R-29.1): when `Some`, the
+    /// agent sent a `questions[]` array (each already bidi-stripped + capped by
+    /// [`parse_ask_request`]); `question`/`options` then carry a synthesized
+    /// single-question fallback for legacy display paths. `None` → a plain
+    /// single-question ask.
+    pub questions: Option<Vec<AskQuestion>>,
     /// Long rationale/body (R-19.1), already bidi-stripped by the transport.
     pub detail: Option<String>,
     pub context: Option<String>,
@@ -157,6 +178,15 @@ impl AskAnswer {
         Self {
             answer: String::new(),
             kind: AskAnswerKind::Cancelled,
+        }
+    }
+    /// The user submitted a multi-question / multi-select form (SPEC §29,
+    /// R-29.3): `answer` is the `{"answers":[...]}` JSON document.
+    #[cfg(test)]
+    pub fn form(answer: impl Into<String>) -> Self {
+        Self {
+            answer: answer.into(),
+            kind: AskAnswerKind::Form,
         }
     }
 }
@@ -548,29 +578,52 @@ async fn call_tool(state: &AppState, id: Value, params: Value) -> Value {
 /// code points (Trojan-Source / RLO; see `deck_core::naming::strip_bidi_controls`,
 /// R-5.3 / R-8).
 fn parse_ask_request(id: &Value, args: &Value) -> Result<AskRequest, Value> {
-    let question = strip_bidi_controls(
+    // R-29.1: a valid non-empty `questions[]` array switches to the multi-question
+    // form path; `question`/`options` are then ignored for input (but a fallback
+    // is synthesized from the first item for legacy display / matching). Otherwise
+    // the legacy single-question path runs. Reject only when NEITHER a valid
+    // `question` nor any valid `questions[]` survives sanitization.
+    let questions = parse_questions(args);
+
+    let raw_question = strip_bidi_controls(
         args.get("question")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim(),
     );
-    if question.is_empty() {
-        return Err(rpc_error(
-            id.clone(),
-            -32602,
-            "ask_user requires a non-empty `question`",
-        ));
-    }
 
-    let options = args
-        .get("options")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(strip_bidi_controls))
-                .collect::<Vec<_>>()
-        })
-        .filter(|v| !v.is_empty());
+    // The single-question `question`/`options` fields: in the form path they are
+    // synthesized from the first form item so downstream (toast, popup mirror,
+    // session matching) still has a headline; in the legacy path they are the
+    // agent's own values.
+    let (question, options) = match &questions {
+        Some(qs) => {
+            let first = &qs[0];
+            let synthesized = truncate_graphemes(&first.question, MAX_QUESTION_CHARS);
+            let opts = (!first.options.is_empty()).then(|| first.options.clone());
+            (synthesized, opts)
+        }
+        None => {
+            if raw_question.is_empty() {
+                return Err(rpc_error(
+                    id.clone(),
+                    -32602,
+                    "ask_user requires a non-empty `question` (or a non-empty `questions` array)",
+                ));
+            }
+            let opts = args
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(strip_bidi_controls))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|v| !v.is_empty());
+            (raw_question, opts)
+        }
+    };
+
     let detail = args
         .get("detail")
         .and_then(Value::as_str)
@@ -593,10 +646,68 @@ fn parse_ask_request(id: &Value, args: &Value) -> Result<AskRequest, Value> {
     Ok(AskRequest {
         question,
         options,
+        questions,
         detail,
         context,
         timeout_seconds,
     })
+}
+
+/// Parse + sanitize the optional `questions[]` array (SPEC §29, R-29.1/R-29.6).
+/// Each item is `{header?, question, multiSelect?, options[]}`: every string is
+/// bidi-stripped and grapheme-capped, empty options are dropped, and the whole
+/// form is bounded (≤[`MAX_QUESTIONS`] questions, ≤[`MAX_OPTIONS_PER_QUESTION`]
+/// options each). A question item whose `question` text is empty after
+/// sanitization is dropped. Returns `None` when `questions` is absent, not an
+/// array, or nothing valid survives — the caller then falls back to the legacy
+/// single-question path.
+fn parse_questions(args: &Value) -> Option<Vec<AskQuestion>> {
+    let arr = args.get("questions").and_then(Value::as_array)?;
+    let mut out = Vec::new();
+    for item in arr {
+        if out.len() >= MAX_QUESTIONS {
+            break;
+        }
+        let question = strip_bidi_controls(
+            item.get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim(),
+        );
+        if question.is_empty() {
+            continue;
+        }
+        let question = truncate_graphemes(&question, MAX_QUESTION_CHARS);
+        let header = item
+            .get("header")
+            .and_then(Value::as_str)
+            .map(|s| strip_bidi_controls(s.trim()))
+            .filter(|s| !s.is_empty())
+            .map(|s| truncate_graphemes(&s, MAX_HEADER_CHARS));
+        let multi_select = item
+            .get("multiSelect")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let options = item
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| truncate_graphemes(&strip_bidi_controls(s.trim()), MAX_OPTION_CHARS))
+                    .filter(|s| !s.is_empty())
+                    .take(MAX_OPTIONS_PER_QUESTION)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push(AskQuestion {
+            header,
+            question,
+            multi_select,
+            options,
+        });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Non-streaming `ask_user`: blocks on the ask and returns a single JSON result.
@@ -640,8 +751,11 @@ fn ask_user_sse(state: &AppState, id: Value, args: &Value, token: Value) -> Resp
     let interval = state.keepalive;
 
     let (tx_ev, rx_ev) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(8);
+    // R-32.4: `drive_ask` dismisses the ask if the client disconnects mid-wait,
+    // so it needs the gateway handle.
+    let gateway = state.gateway.clone();
     tokio::spawn(async move {
-        let final_msg = drive_ask(rx, timeout, interval, &id, &ask_id, &token, &tx_ev).await;
+        let final_msg = drive_ask(rx, timeout, interval, &id, &ask_id, &token, &tx_ev, &gateway).await;
         let _ = tx_ev
             .send(Ok(Event::default().data(final_msg.to_string())))
             .await;
@@ -655,6 +769,7 @@ fn ask_user_sse(state: &AppState, id: Value, args: &Value, token: Value) -> Resp
 /// The select loop shared by the SSE path: pump `notifications/progress` on the
 /// keepalive tick until the ask resolves (or its explicit timeout elapses), then
 /// return the final JSON-RPC response value.
+#[allow(clippy::too_many_arguments)]
 async fn drive_ask(
     rx: oneshot::Receiver<AskAnswer>,
     timeout: Option<u64>,
@@ -663,6 +778,7 @@ async fn drive_ask(
     ask_id: &str,
     token: &Value,
     tx_ev: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    gateway: &Arc<dyn AskGateway>,
 ) -> Value {
     tokio::pin!(rx);
     let deadline = timeout.map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
@@ -700,8 +816,13 @@ async fn drive_ask(
                         "message": "waiting for the human to answer",
                     }
                 });
-                // If the receiver is gone (client disconnected) stop pumping.
+                // If the receiver is gone (client disconnected) stop pumping. The
+                // agent's SSE connection died mid-wait, so it can never receive an
+                // answer — R-32.4: dismiss the ask now (removes the pending row +
+                // re-renders the FIFO) instead of leaving it lingering until its
+                // timeout. The returned value is moot: the closed stream drops it.
                 if tx_ev.send(Ok(Event::default().data(note.to_string()))).await.is_err() {
+                    gateway.cancel_ask(ask_id);
                     return rpc_result(id.clone(), ask_answer_content(ask_id, &AskAnswer::timeout()));
                 }
             }
@@ -876,17 +997,30 @@ fn tools_list_result() -> Value {
         "tools": [
             {
                 "name": "ask_user",
-                "description": "Ask the human operating this machine a question and BLOCK until they answer. Use during long autonomous runs when you hit a decision only a human can make. Pass your current working directory as `context` so Quarterdeck attributes the question to your session. Keep `question` short; put the reasoning/body in `detail`. Prefer `options` for multiple-choice decisions. Omit `timeout_seconds` (or pass 0) to wait indefinitely (persistent). Returns {answer, kind, ask_id} where kind is option|text|timeout|dismissed|cancelled; on timeout/dismissal, proceed on your best judgment. Keep the returned `ask_id` if a parallel task may need to update_ask/cancel_ask it.",
+                "description": "Ask the human operating this machine a question and BLOCK until they answer. Use during long autonomous runs when you hit a decision only a human can make. Pass your current working directory as `context` so Quarterdeck attributes the question to your session. Provide EITHER a single `question` (+ optional `options`) OR a `questions` array for a multi-question / multi-select form; when `questions` is present, `question`/`options` are ignored. Keep `question` short; put the reasoning/body in `detail`. Prefer `options` for multiple-choice decisions. Omit `timeout_seconds` (or pass 0) to wait indefinitely (persistent). Returns {answer, kind, ask_id} where kind is option|text|timeout|dismissed|cancelled|form; a form answer is a JSON string {\"answers\":[{header,question,selected:[...],text?}, ...]}. On timeout/dismissal, proceed on your best judgment. Keep the returned `ask_id` if a parallel task may need to update_ask/cancel_ask it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "question": { "type": "string", "description": "The question to put to the user. One short, specific decision." },
-                        "options": { "type": "array", "items": { "type": "string" }, "description": "Optional multiple-choice answers; the user may still type a free-text reply." },
+                        "question": { "type": "string", "description": "The question to put to the user. One short, specific decision. Use this (with `options`) for a single question; omit it when sending `questions`." },
+                        "options": { "type": "array", "items": { "type": "string" }, "description": "Optional multiple-choice answers for the single-question form; the user may still type a free-text reply." },
+                        "questions": {
+                            "type": "array",
+                            "description": "Multi-question / multi-select form (max 8 questions). When present, `question`/`options` are ignored. Each item is one question block.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "header": { "type": "string", "description": "Optional short label/category shown above the question." },
+                                    "question": { "type": "string", "description": "The question text for this block (required)." },
+                                    "multiSelect": { "type": "boolean", "description": "true → the user may pick several options (checkboxes); false/omitted → exactly one (radio)." },
+                                    "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for this question (max 12); the user may still add free text." }
+                                },
+                                "required": ["question"]
+                            }
+                        },
                         "detail": { "type": "string", "description": "Optional long-form rationale/body shown under the question in muted, smaller type. Put the context the user needs to decide here, not in `question`." },
                         "context": { "type": "string", "description": "Your current working directory (cwd), used to attribute the question to the right session." },
                         "timeout_seconds": { "type": "number", "maximum": 3600, "description": "Seconds to wait before giving up (max 3600). Omit or pass 0 to wait indefinitely (persistent)." }
-                    },
-                    "required": ["question"]
+                    }
                 }
             },
             {
@@ -1603,6 +1737,161 @@ mod tests {
 
         std::env::remove_var("QUARTERDECK_DATA_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- §29 multi-question / multi-select form ----------------------------
+
+    #[test]
+    fn parse_ask_request_legacy_single_question_is_unchanged() {
+        // R-29.1 back-compat: a single-question caller with no `questions` gets
+        // exactly the old AskRequest (questions == None), options preserved.
+        let args = json!({
+            "question": "Deploy now?",
+            "options": ["yes", "no"],
+            "context": "C:/proj",
+        });
+        let req = parse_ask_request(&json!(1), &args).expect("valid legacy ask");
+        assert_eq!(req.question, "Deploy now?");
+        assert_eq!(req.options.as_deref().unwrap(), &["yes", "no"]);
+        assert!(req.questions.is_none(), "no form for a legacy ask");
+    }
+
+    #[test]
+    fn parse_ask_request_parses_questions_and_synthesizes_fallback() {
+        // R-29.1: a valid `questions[]` switches to the form path; `question`
+        // is synthesized from the first item (its options become the fallback
+        // `options`), and `multiSelect` defaults to false when omitted.
+        let args = json!({
+            "question": "ignored when questions present",
+            "options": ["ignored"],
+            "questions": [
+                { "header": "Env", "question": "Which environment?", "options": ["prod", "staging"] },
+                { "question": "Extra flags?", "multiSelect": true, "options": ["--fast", "--safe", "--verbose"] },
+            ],
+        });
+        let req = parse_ask_request(&json!(1), &args).expect("valid form");
+        let qs = req.questions.as_ref().expect("questions parsed");
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].header.as_deref(), Some("Env"));
+        assert_eq!(qs[0].question, "Which environment?");
+        assert!(!qs[0].multi_select, "multiSelect defaults false");
+        assert_eq!(qs[0].options, ["prod", "staging"]);
+        assert!(qs[1].multi_select);
+        assert_eq!(qs[1].options.len(), 3);
+        // Fallback headline synthesized from the first question (not the ignored
+        // top-level `question`).
+        assert_eq!(req.question, "Which environment?");
+        assert_eq!(req.options.as_deref().unwrap(), &["prod", "staging"]);
+    }
+
+    #[test]
+    fn parse_ask_request_enforces_form_caps_and_sanitizes() {
+        // R-29.6: ≤8 questions, ≤12 options/question, grapheme caps, empty
+        // questions dropped, bidi controls stripped.
+        let mut questions: Vec<Value> = Vec::new();
+        // 10 questions → clamp to 8.
+        for i in 0..10 {
+            questions.push(json!({ "question": format!("Q{i}?") }));
+        }
+        // A question with 20 options (clamp to 12) + an empty option (dropped).
+        let many_opts: Vec<String> = (0..20).map(|i| format!("opt{i}")).collect();
+        let mut opts_with_blank = many_opts.clone();
+        opts_with_blank.push(String::new());
+        questions.push(json!({ "question": "Too many opts?", "options": opts_with_blank }));
+        // An empty-question item is dropped entirely.
+        questions.push(json!({ "question": "   " }));
+        // A bidi-spoofed header/question/option is stripped.
+        questions.push(json!({
+            "header": "H\u{202E}dr",
+            "question": "Run \u{202E}cod.exe\u{202C}?",
+            "options": ["\u{202E}yes\u{202C}"],
+        }));
+        // An over-long question is grapheme-capped to 200 (+ ellipsis).
+        let long_q = "x".repeat(400);
+        questions.push(json!({ "question": long_q }));
+
+        let args = json!({ "questions": questions });
+        let req = parse_ask_request(&json!(1), &args).expect("valid form");
+        let qs = req.questions.as_ref().unwrap();
+        assert_eq!(qs.len(), MAX_QUESTIONS, "questions clamped to 8");
+        // All 8 survivors are the first 8 non-empty "Q{i}?" items.
+        assert_eq!(qs[0].question, "Q0?");
+        assert_eq!(qs[7].question, "Q7?");
+        // (The over-cap options / bidi / long items came after the first 8 and
+        // were cut by the question cap — assert the caps directly on a focused
+        // form below.)
+
+        // Focused: options cap + blank drop + bidi strip + question cap.
+        let args2 = json!({ "questions": [
+            { "question": "opts?", "options": (0..20).map(|i| format!("o{i}")).collect::<Vec<_>>() },
+            { "header": "H\u{202E}", "question": "\u{202E}spoof\u{202C}?", "options": ["\u{202E}a\u{202C}", ""] },
+            { "question": "y".repeat(400) },
+        ]});
+        let req2 = parse_ask_request(&json!(2), &args2).unwrap();
+        let qs2 = req2.questions.as_ref().unwrap();
+        assert_eq!(qs2[0].options.len(), MAX_OPTIONS_PER_QUESTION, "options clamped to 12");
+        assert_eq!(qs2[1].header.as_deref(), Some("H"), "bidi stripped from header");
+        assert_eq!(qs2[1].question, "spoof?", "bidi stripped from question");
+        assert_eq!(qs2[1].options, ["a"], "bidi stripped + blank option dropped");
+        // 200-cap keeps 199 chars + the ellipsis.
+        assert_eq!(qs2[2].question.chars().count(), MAX_QUESTION_CHARS);
+        assert!(qs2[2].question.ends_with('…'));
+    }
+
+    #[test]
+    fn parse_ask_request_rejects_when_neither_question_nor_valid_questions() {
+        // R-29.1: reject only when NEITHER a valid `question` nor any valid
+        // `questions[]` survives. An empty questions array / all-empty items are
+        // not enough.
+        assert!(parse_ask_request(&json!(1), &json!({})).is_err());
+        assert!(parse_ask_request(&json!(1), &json!({ "questions": [] })).is_err());
+        assert!(parse_ask_request(&json!(1), &json!({ "questions": [{ "question": "  " }] })).is_err());
+        // But an empty top-level `question` WITH a valid form is fine.
+        assert!(parse_ask_request(
+            &json!(1),
+            &json!({ "question": "", "questions": [{ "question": "ok?" }] })
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ask_answer_form_serializes_kind_form() {
+        // R-29.3: a form answer serializes with kind "form" and the answer JSON
+        // on the existing channel.
+        let doc = r#"{"answers":[{"question":"Which?","selected":["prod"]}]}"#;
+        let content = ask_answer_content("ask-1", &AskAnswer::form(doc));
+        assert_eq!(content["structuredContent"]["kind"], "form");
+        assert_eq!(content["structuredContent"]["answer"], doc);
+        assert_eq!(content["structuredContent"]["ask_id"], "ask-1");
+        assert_eq!(content["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn ask_user_form_round_trip_returns_kind_form() {
+        // R-29.1/R-29.3 end-to-end: an ask with `questions[]` blocks, the form
+        // answer resolves it, and the MCP result carries kind:"form" + the doc.
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        let body = r#"{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"ask_user","arguments":{"questions":[{"header":"Env","question":"Which environment?","options":["prod","staging"]},{"question":"Flags?","multiSelect":true,"options":["--fast","--safe"]}]}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        let ask = &gw.asks()[0];
+        let qs = ask.questions.as_ref().expect("form carried to the gateway");
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].question, "Which environment?");
+        // The synthesized headline is the first question.
+        assert_eq!(ask.question, "Which environment?");
+
+        let doc = r#"{"answers":[{"header":"Env","question":"Which environment?","selected":["prod"]},{"question":"Flags?","selected":["--fast","--safe"],"text":"go"}]}"#;
+        assert!(gw.answer_next(AskAnswer::form(doc)));
+
+        let (status, resp) = call.await.unwrap();
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["kind"], "form");
+        assert_eq!(v["result"]["structuredContent"]["answer"], doc);
+        let _ = shutdown.send(());
     }
 
     fn node_available() -> bool {

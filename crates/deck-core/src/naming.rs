@@ -159,6 +159,30 @@ pub fn title_from_registry(
     ])
 }
 
+/// Apply the R-27.1 precedence: a user-set title override wins over every other
+/// source (registry `name` → `session_title` → latest `UserPromptSubmit.prompt`
+/// → cold-start transcript fallback → `(no title)`). The override is fed through
+/// the same [`pick_title`] pipeline as every other candidate, so it inherits the
+/// whitespace-collapse + [`strip_bidi_controls`] + [`truncate_graphemes`] cap of
+/// [`normalize_title`] for free (R-27.7). A blank/whitespace override falls
+/// through to the normal chain (R-27.4 "empty name clears").
+#[must_use]
+pub fn title_with_override(
+    override_name: Option<&str>,
+    registry_name: Option<&str>,
+    session_title: Option<&str>,
+    latest_prompt: Option<&str>,
+    transcript_fallback: Option<&str>,
+) -> String {
+    pick_title([
+        override_name,
+        registry_name,
+        session_title,
+        latest_prompt,
+        transcript_fallback,
+    ])
+}
+
 /// Full precedence including the guarded transcript read (R-5.2). Used where a
 /// caller has a `transcript_path` but no cached fallback yet.
 #[must_use]

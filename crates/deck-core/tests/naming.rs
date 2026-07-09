@@ -4,7 +4,7 @@ use std::fs;
 
 use deck_core::naming::{
     derive_title, normalize_title, project_name, strip_bidi_controls, title_from_sources,
-    transcript_cwd, transcript_first_user_text, NO_TITLE, UNKNOWN_PROJECT,
+    title_with_override, transcript_cwd, transcript_first_user_text, NO_TITLE, UNKNOWN_PROJECT,
 };
 use tempfile::tempdir;
 
@@ -12,6 +12,55 @@ use tempfile::tempdir;
 fn title_precedence_session_title_wins() {
     let t = title_from_sources(Some("Ship the release"), Some("some prompt"), Some("txt"));
     assert_eq!(t, "Ship the release");
+}
+
+#[test]
+fn title_override_wins_over_registry_and_every_other_source() {
+    // R-27.1: the user override is the new highest-precedence layer — it beats
+    // even the registry `name` (the former head of the chain).
+    let t = title_with_override(
+        Some("My renamed session"),
+        Some("registry name"),
+        Some("session title"),
+        Some("latest prompt"),
+        Some("transcript fallback"),
+    );
+    assert_eq!(t, "My renamed session");
+}
+
+#[test]
+fn title_override_blank_falls_through_to_the_normal_chain() {
+    // R-27.4 "empty name clears": a blank/whitespace override is ignored, so the
+    // registry name (next in the chain) wins.
+    let t = title_with_override(
+        Some("   "),
+        Some("registry name"),
+        Some("session title"),
+        None,
+        None,
+    );
+    assert_eq!(t, "registry name");
+    // No override at all → same fall-through.
+    let t2 = title_with_override(None, None, Some("session title"), None, None);
+    assert_eq!(t2, "session title");
+}
+
+#[test]
+fn title_override_is_bidi_stripped_and_capped_like_every_other_source() {
+    // R-27.7: the override rides the same `normalize_title` pipeline — bidi
+    // controls stripped, whitespace collapsed, capped at 60 grapheme clusters.
+    let spoof = title_with_override(
+        Some("run \u{202E}cod.exe\u{202C}  now"),
+        Some("registry"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(spoof, "run cod.exe now");
+    let long = "я".repeat(100);
+    let capped = title_with_override(Some(&long), None, None, None, None);
+    assert_eq!(capped.chars().count(), 60);
+    assert!(capped.ends_with('…'));
 }
 
 #[test]

@@ -55,12 +55,34 @@ export interface SessionRow {
   subagentSpend?: string;
 }
 
+/**
+ * One question inside a multi-question / multi-select `ask_user` form (SPEC §29,
+ * R-29.1). Mirror of `AskQuestion` in `crates/deck-core/src/ask.rs`. Every string
+ * is bidi-stripped + grapheme-capped by the shell before it reaches here.
+ */
+export interface AskQuestion {
+  /** Optional short header/label rendered above the question. */
+  header?: string;
+  /** The question text (always present). */
+  question: string;
+  /** true → multiple options selectable (checkboxes); false/absent → one (radio). */
+  multiSelect?: boolean;
+  /** The offered choices (may be empty for a free-text-only sub-question). */
+  options: string[];
+}
+
 export interface AskRow {
   id: string;
   sessionId?: string;
   project?: string;
   question: string;
   options?: string[];
+  /**
+   * Multi-question / multi-select form (SPEC §29, R-29.5): when present and
+   * non-empty, the ask window renders a form of these blocks and the popup mirror
+   * shows "N questions — Answer in window". Absent for a legacy single-question ask.
+   */
+  questions?: AskQuestion[];
   /** Long rationale/body (R-19.1), rendered muted under the question. */
   detail?: string;
   /**
@@ -109,6 +131,14 @@ export interface PermRow {
    * (R-16.2). Compared against a front ask's `queuedAt`.
    */
   queuedAt: number;
+  /**
+   * SPEC R-32.1: epoch ms at which this perm expires. Its `PermissionRequest`
+   * hook (90 s timeout, R-16.1) has by then exited, so a deck decision could no
+   * longer reach it. The shell sweeps the perm off its tick past this instant;
+   * until then the UI disables the Allow/Deny buttons. Absent on an older
+   * snapshot without the field.
+   */
+  expiresAt?: number;
 }
 
 /** The deck-side decision for a perm (SPEC R-16.2). `defer` = "In terminal" —
@@ -197,7 +227,7 @@ export const STATE_EVENT = 'deck://state';
 
 /** Result kind of an MCP `ask_user` call, mirrored to the UI. `cancelled` (R-19.5)
  * is produced by a `cancel_ask` tool call, never by a UI action. */
-export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed' | 'cancelled';
+export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed' | 'cancelled' | 'form';
 
 /**
  * Tauri commands exposed by the shell (implemented in T3). Argument objects are
@@ -212,6 +242,13 @@ export interface Commands {
    */
   answer_perm: (args: { permId: string; decision: PermDecision; reason?: string }) => Promise<void>;
   remove_row: (args: { sessionId: string }) => Promise<void>;
+  /**
+   * Renames a session (SPEC §27 R-27.4): sets a user title override that wins
+   * over every other title source (registry name, session title, prompt). An
+   * empty/whitespace `name` clears the override, restoring the normal chain. The
+   * name is bidi-stripped + capped to 60 grapheme clusters shell-side (R-27.7).
+   */
+  rename_session: (args: { sessionId: string; name: string }) => Promise<void>;
   /**
    * Generic settings setter. `key` is one of the `SettingsState` keys above
    * (`notifyIdle` | `notifyAttention` | `notifyReminder` | `launchAtLogin` |

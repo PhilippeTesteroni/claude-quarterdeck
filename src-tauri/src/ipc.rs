@@ -77,6 +77,13 @@ pub struct AskRow {
     pub question: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub options: Option<Vec<String>>,
+    /// Multi-question / multi-select form (SPEC §29, R-29.5): when present and
+    /// non-empty, the ask window renders a form of these blocks (radio/checkbox
+    /// per `multiSelect`) instead of the single-question options, and the popup
+    /// mirror shows "N questions — Answer in window". Defaulted/optional so an
+    /// older snapshot without the field still deserializes (R-29.6).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub questions: Option<Vec<deck_core::ask::AskQuestion>>,
     /// Long rationale/body (R-19.1), rendered muted under the question. Absent
     /// for asks that carried no `detail`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -130,6 +137,13 @@ pub struct PermRow {
     /// older snapshot without the field still deserializes.
     #[serde(default)]
     pub queued_at: u64,
+    /// SPEC R-32.1: epoch ms at which this perm expires — its `PermissionRequest`
+    /// hook (90 s timeout, R-16.1) has by then exited, so no deck decision could
+    /// reach it. The shell sweeps the perm off the tick past this instant; until
+    /// then the UI disables its Allow/Deny buttons. Optional so an older snapshot
+    /// without the field still deserializes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub expires_at: Option<u64>,
 }
 
 /// Per-status session counts shown in the footer.
@@ -211,6 +225,12 @@ pub enum AskAnswerKind {
     /// R-19.5: the ask was cancelled by a `cancel_ask` tool call (from a
     /// parallel tool call / another session) before the user answered.
     Cancelled,
+    /// SPEC §29 (R-29.2/R-29.3): the answer to a multi-question / multi-select
+    /// form. The `answer` string is a JSON document
+    /// `{"answers":[{header,question,selected:[...],text?}, ...]}` carried on the
+    /// existing answer channel — the delivery pipe (`AnswerFile`, the oneshot,
+    /// `resolve_answer`) is unchanged.
+    Form,
 }
 
 /// The deck-side decision for a pending permission request (SPEC §16, R-16.2).
@@ -325,6 +345,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// SPEC §29 (R-29.6): backstop cap on the assembled answer string before it is
+/// persisted, so a pathologically large form answer (many questions × long
+/// free-text) can never write an unbounded file / deliver an unbounded blob to
+/// the agent. Well above any real answer (the request-side caps already bound a
+/// form to ≤8 questions × ≤12 options); grapheme-based so a multibyte answer is
+/// never cut mid-cluster. Applies to every answer kind uniformly.
+const ANSWER_MAX_CHARS: usize = 8192;
+
 /// Persists an ask answer to `<dir>/<askId>.json` atomically (SPEC R-8.7).
 pub fn write_answer_file(
     dir: &std::path::Path,
@@ -333,9 +361,12 @@ pub fn write_answer_file(
     kind: AskAnswerKind,
 ) -> Result<(), String> {
     let stem = safe_file_stem(ask_id)?;
+    // R-29.6: cap the assembled answer string before writing (a no-op for the
+    // short single-question answers that never approach the cap).
+    let capped = deck_core::naming::truncate_graphemes(answer, ANSWER_MAX_CHARS);
     let record = AnswerRecord {
         id: stem,
-        answer,
+        answer: &capped,
         kind,
         answered_at_ms: now_ms(),
     };
@@ -406,12 +437,28 @@ pub fn remove_row(
     app: tauri::AppHandle,
     session_id: String,
 ) -> Result<(), String> {
+    // SPEC R-27.6: drop any user title override for the removed row (engine map +
+    // `<data>/session-names.json`) so a reused id never inherits a stale name.
+    crate::prune_session_override(&app, &session_id);
     let snapshot = {
         let mut guard = state.0.lock().map_err(|err| err.to_string())?;
         apply_remove_row(&mut guard, &session_id);
         guard.clone()
     };
     emit_state(&app, &snapshot)
+}
+
+/// Renames a session by setting a user title override (`rename_session` command,
+/// SPEC §27 R-27.4): the new name wins over every other title source (registry
+/// name, session title, prompt). An empty/whitespace name clears the override,
+/// restoring the normal title chain. Sanitized + capped shell-side (R-27.7).
+#[tauri::command]
+pub fn rename_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    name: String,
+) -> Result<(), String> {
+    crate::rename_session_command(&app, &session_id, &name)
 }
 
 /// Submits an answer for a pending ask (`answer_ask` command, SPEC §8): the
@@ -590,6 +637,7 @@ mod tests {
                     project: None,
                     question: "Proceed?".to_string(),
                     options: None,
+                    questions: None,
                     detail: None,
                     timeout_at: None,
                     context: None,
@@ -602,6 +650,7 @@ mod tests {
                     project: None,
                     question: "Also proceed?".to_string(),
                     options: None,
+                    questions: None,
                     detail: None,
                     timeout_at: None,
                     context: None,
@@ -734,6 +783,7 @@ mod tests {
                     tool_input: "{}".to_string(),
                     context: None,
                     queued_at: 0,
+                    expires_at: None,
                 },
                 PermRow {
                     id: "p2".to_string(),
@@ -743,6 +793,7 @@ mod tests {
                     tool_input: "{}".to_string(),
                     context: Some("C:/x".to_string()),
                     queued_at: 0,
+                    expires_at: None,
                 },
             ],
             ..Default::default()
@@ -763,12 +814,82 @@ mod tests {
             tool_input: "{\"command\":\"ls\"}".to_string(),
             context: None,
             queued_at: 0,
+            expires_at: Some(90_000),
         };
         let v = serde_json::to_value(&perm).unwrap();
         assert_eq!(v["toolName"], "Bash");
         assert_eq!(v["toolInput"], "{\"command\":\"ls\"}");
         assert_eq!(v["sessionId"], "s1");
+        assert_eq!(v["expiresAt"], 90_000);
         assert!(v.get("context").is_none(), "None context omitted");
+    }
+
+    #[test]
+    fn ask_answer_kind_form_serializes_lowercase() {
+        // SPEC §29 (R-29.2): the new `Form` kind is the lowercase `"form"` token
+        // on the wire, matching the TS `AskAnswerKind` union.
+        assert_eq!(
+            serde_json::to_string(&AskAnswerKind::Form).unwrap(),
+            "\"form\""
+        );
+        let k: AskAnswerKind = serde_json::from_str("\"form\"").unwrap();
+        assert_eq!(k, AskAnswerKind::Form);
+    }
+
+    #[test]
+    fn ask_row_serializes_questions_with_camel_case_multi_select() {
+        // SPEC §29 (R-29.5): `questions` mirrors to the UI with `multiSelect`
+        // camelCase, matching `AskQuestion` in `ui/src/ipc-contract.ts`.
+        let ask = AskRow {
+            id: "a1".to_string(),
+            session_id: None,
+            project: None,
+            question: "Which environment?".to_string(),
+            options: Some(vec!["prod".to_string()]),
+            questions: Some(vec![deck_core::ask::AskQuestion {
+                header: Some("Env".to_string()),
+                question: "Which environment?".to_string(),
+                multi_select: true,
+                options: vec!["prod".to_string(), "staging".to_string()],
+            }]),
+            detail: None,
+            timeout_at: None,
+            context: None,
+            orphaned: false,
+            queued_at: 0,
+        };
+        let v = serde_json::to_value(&ask).unwrap();
+        assert_eq!(v["questions"][0]["header"], "Env");
+        assert_eq!(v["questions"][0]["multiSelect"], true);
+        assert_eq!(v["questions"][0]["options"][1], "staging");
+
+        // R-29.6: an old AskRow JSON with no `questions` still deserializes.
+        let legacy = serde_json::json!({
+            "id": "a2", "question": "q?", "orphaned": false, "queuedAt": 0
+        });
+        let back: AskRow = serde_json::from_value(legacy).unwrap();
+        assert!(back.questions.is_none());
+    }
+
+    #[test]
+    fn write_answer_file_caps_a_pathologically_large_answer() {
+        // SPEC §29 (R-29.6): a huge assembled answer is grapheme-capped before it
+        // is written, so it can never persist / deliver an unbounded blob.
+        let dir = std::env::temp_dir().join(format!(
+            "quarterdeck-answer-cap-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let huge = "z".repeat(50_000);
+        write_answer_file(&dir, "ask-big", &huge, AskAnswerKind::Form).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("ask-big.json")).unwrap())
+                .unwrap();
+        let written = v["answer"].as_str().unwrap();
+        assert!(written.chars().count() <= ANSWER_MAX_CHARS, "answer capped");
+        assert!(written.ends_with('…'), "cap appends an ellipsis");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

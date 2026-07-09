@@ -18,3 +18,4 @@ src-tauri/gen/
 # OS / editor
 .DS_Store
 Thumbs.db
+test-results/
