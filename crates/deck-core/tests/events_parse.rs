@@ -7,49 +7,6 @@ fn env(json: &str) -> Result<deck_core::events::SpoolEvent, ParseError> {
 }
 
 #[test]
-fn parses_session_start_ancestor_r15_4a() {
-    // R-15.4a: `extra.ancestor = {pid, hwnd, exe}` captured on SessionStart, the
-    // exact shape the real Windows hook writes (verified live).
-    let ev = env(r#"{
-        "event": "SessionStart",
-        "payload": { "session_id": "s1", "hook_event_name": "SessionStart" },
-        "extra": { "claudePid": 14216,
-                   "ancestor": { "pid": 12960, "hwnd": 197486, "exe": "WindowsTerminal.exe" } }
-    }"#)
-    .unwrap();
-    let anc = ev.ancestor.expect("ancestor parsed");
-    assert_eq!(anc.pid, Some(12960));
-    assert_eq!(anc.hwnd, Some(197486));
-    assert_eq!(anc.exe.as_deref(), Some("WindowsTerminal.exe"));
-}
-
-#[test]
-fn tolerates_partial_and_zeroed_ancestor() {
-    // R-15.4a defensiveness: a `0` handle/pid means "unresolved" and is dropped;
-    // an all-empty ancestor collapses to None; a missing ancestor is fine.
-    let ev = env(r#"{
-        "event": "SessionStart",
-        "payload": { "session_id": "s1" },
-        "extra": { "ancestor": { "pid": 0, "hwnd": 0 } }
-    }"#)
-    .unwrap();
-    assert!(
-        ev.ancestor.is_none(),
-        "an all-zero ancestor collapses to None"
-    );
-
-    let ev2 = env(r#"{
-        "event": "SessionStart",
-        "payload": { "session_id": "s1" },
-        "extra": { "ancestor": { "exe": "iTerm.app" } }
-    }"#)
-    .unwrap();
-    let anc = ev2.ancestor.expect("exe-only ancestor kept");
-    assert_eq!(anc.pid, None);
-    assert_eq!(anc.exe.as_deref(), Some("iTerm.app"));
-}
-
-#[test]
 fn parses_session_start_with_extra_pid() {
     let ev = env(r#"{
         "v": 1,

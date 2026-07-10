@@ -66,34 +66,6 @@ pub enum HookEvent {
     Unknown { name: String },
 }
 
-/// The terminal-window ancestor captured on `SessionStart` (R-15.4a) so a row
-/// click can focus the terminal hosting the session. On Windows the hook walks
-/// the parent-process chain for the nearest ancestor with a real top-level
-/// window (`MainWindowHandle != 0`); on macOS it records `TERM_PROGRAM` + a pid.
-/// Every field is optional — the hook writes whatever it could resolve, and a
-/// drifting/absent shape must never break ingestion (R-4.5).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Ancestor {
-    /// PID of the ancestor process that owns the terminal window.
-    pub pid: Option<u32>,
-    /// Native window handle (`HWND`) of that terminal window, if known (Windows).
-    /// Stored as `i64` so the full unsigned handle range round-trips through
-    /// JSON's number type without loss.
-    pub hwnd: Option<i64>,
-    /// Executable / terminal-program name (Windows process name, or macOS
-    /// `TERM_PROGRAM`), used for the title-substring focus fallback and the
-    /// macOS bundle-id mapping (R-15.4b/c).
-    pub exe: Option<String>,
-}
-
-impl Ancestor {
-    /// Whether this ancestor carries anything actionable for focus (R-15.4).
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.pid.is_none() && self.hwnd.is_none() && self.exe.is_none()
-    }
-}
-
 impl HookEvent {
     /// The canonical hook event name for logging/attribution.
     #[must_use]
@@ -122,9 +94,6 @@ pub struct SpoolEvent {
     pub transcript_path: Option<String>,
     /// `extra.claudePid` — present only on `SessionStart` (R-4.3).
     pub claude_pid: Option<u32>,
-    /// `extra.ancestor` — the terminal-window ancestor, present only on
-    /// `SessionStart` (R-15.4a). `None` when the hook couldn't resolve one.
-    pub ancestor: Option<Ancestor>,
     pub kind: HookEvent,
 }
 
@@ -193,20 +162,6 @@ struct RawPayload {
 struct RawExtra {
     #[serde(default, rename = "claudePid")]
     claude_pid: Option<u32>,
-    #[serde(default)]
-    ancestor: Option<RawAncestor>,
-}
-
-/// Raw serde mirror of `extra.ancestor` (R-15.4a). Every field is optional so a
-/// partial or drifting shape parses without failing the whole envelope (R-4.5).
-#[derive(Debug, Default, Deserialize)]
-struct RawAncestor {
-    #[serde(default)]
-    pid: Option<u32>,
-    #[serde(default)]
-    hwnd: Option<i64>,
-    #[serde(default)]
-    exe: Option<String>,
 }
 
 /// A JSON value that could carry a timestamp in several shapes (R-4.5 tolerance):
@@ -269,27 +224,12 @@ pub fn parse_envelope(bytes: &[u8]) -> Result<SpoolEvent, ParseError> {
         cwd: clean(raw.payload.cwd),
         transcript_path: clean(raw.payload.transcript_path),
         claude_pid: raw.extra.claude_pid,
-        ancestor: raw
-            .extra
-            .ancestor
-            .map(ancestor_from_raw)
-            .filter(|a| !a.is_empty()),
         kind,
     })
 }
 
 fn clean(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
-}
-
-fn ancestor_from_raw(raw: RawAncestor) -> Ancestor {
-    Ancestor {
-        // A `0` hwnd/pid means "no window / unresolved" from the hook's walk —
-        // drop it so focus code never tries to act on a null handle (R-15.4b).
-        pid: raw.pid.filter(|&p| p != 0),
-        hwnd: raw.hwnd.filter(|&h| h != 0),
-        exe: clean(raw.exe),
-    }
 }
 
 fn classify_event(name: &str, payload: &RawPayload) -> HookEvent {

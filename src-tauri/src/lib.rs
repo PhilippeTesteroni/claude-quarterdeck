@@ -18,7 +18,6 @@
 //! [`ipc::StateSnapshot`] pushed over `deck://state`; the UI sends intent back
 //! through the commands registered below.
 
-pub mod focus;
 pub mod foreground;
 pub mod ipc;
 pub mod mcp_server;
@@ -44,7 +43,7 @@ use tokio::sync::oneshot;
 
 use deck_core::ask::{AskStore, PendingAsk};
 use deck_core::engine::{Effect, SessionStore, SessionView, Status as EngineStatus};
-use deck_core::naming::{strip_bidi_controls, truncate_graphemes};
+use deck_core::naming::{extract_ai_title, strip_bidi_controls, truncate_graphemes};
 use deck_core::traits::{Notifier, ProcessTable, ToastKind};
 use deck_core::usage::{self, SessionUsageGroup};
 use deck_core::{discovery, events, hooks_config, registry};
@@ -321,6 +320,29 @@ fn transcript_mtime_ms(path: &str) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_millis() as u64)
+}
+
+/// §34 `aiTitle` tail-read budget: the last 128 KB of a transcript is plenty —
+/// `aiTitle` is (re)written on recent lines — so a multi-MB transcript is never
+/// read whole on the tick (R-34).
+const AI_TITLE_TAIL_BYTES: u64 = 128 * 1024;
+
+/// Read up to the last `max_bytes` of a file into memory (the transcript TAIL,
+/// §34). Seeks to `len - max_bytes` so a large transcript is never read whole.
+/// Best-effort: `None` on any IO error. The returned slice may begin mid-line
+/// (and mid-UTF-8-char), which is fine — [`extract_ai_title`] scans for the
+/// ASCII `"aiTitle"` key and decodes only its complete value.
+fn read_transcript_tail(path: &str, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::with_capacity(len.saturating_sub(start).min(max_bytes) as usize);
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +678,11 @@ struct Shell {
     /// projected into `SessionRow` in `snapshot` and mined for the R-24.1 idle
     /// toast body. Pruned to live sessions each update.
     usage: Mutex<HashMap<String, SessionUsageGroup>>,
+    /// §34: per-session transcript mtime (epoch ms) at the last `aiTitle` tail
+    /// read, keyed by session id. Gates [`Shell::refresh_ai_titles`] so a
+    /// transcript is re-read only when its file mtime advanced (R-34), and pruned
+    /// to live sessions each pass.
+    ai_title_mtime: Mutex<HashMap<String, u64>>,
     notifier: DesktopNotifier<Wry>,
     tray: tauri::tray::TrayIcon<Wry>,
     data_dir: PathBuf,
@@ -839,8 +866,8 @@ impl Shell {
 
     // --- focus-aware suppression (§17) ------------------------------------
 
-    /// The terminal PIDs for one session (ancestor pid ∪ registry/claude pid,
-    /// R-17.2). Empty when the session is unknown or has no known pid.
+    /// The terminal PIDs for one session (the registry/claude pid, R-17.2).
+    /// Empty when the session is unknown or has no known pid.
     fn session_terminal_pids(&self, session_id: &str) -> Vec<u32> {
         self.store
             .lock()
@@ -964,16 +991,6 @@ impl Shell {
         }
     }
 
-    /// Focus the terminal window hosting `session_id` (R-15.4). Looks up the
-    /// captured ancestor + project from the store, then best-effort focuses.
-    fn focus_terminal(&self, session_id: &str) -> Result<(), String> {
-        let (ancestor, project) = {
-            let store = self.store.lock().expect("store poisoned");
-            (store.ancestor_of(session_id), store.project_of(session_id))
-        };
-        focus::focus_terminal(ancestor, &project.unwrap_or_default())
-    }
-
     // --- toast firing ------------------------------------------------------
 
     /// Fire engine-emitted toast decisions, honoring the R-9.5 per-type toggles
@@ -1083,6 +1100,49 @@ impl Shell {
                 continue;
             };
             usage.entry(id.clone()).or_default().update(Path::new(path));
+        }
+    }
+
+    /// §34: refresh each session's transcript `aiTitle` — the terminal-tab chat
+    /// name that is the default row title (R-34). mtime-gated (a transcript is
+    /// re-read only when its file mtime advanced since the last read) and reads
+    /// only the TAIL (last [`AI_TITLE_TAIL_BYTES`]), since `aiTitle` is rewritten
+    /// on recent lines — a multi-MB transcript is never read whole. Failure-
+    /// tolerant: a missing/unreadable transcript, or one with no `aiTitle` yet,
+    /// leaves the cached title untouched (never clobbers a known name with a
+    /// blank). Runs on the shell tick before `push_state`.
+    fn refresh_ai_titles(&self) {
+        let transcripts = self
+            .store
+            .lock()
+            .expect("store poisoned")
+            .session_transcripts();
+        let present: std::collections::HashSet<&str> =
+            transcripts.iter().map(|(id, _)| id.as_str()).collect();
+        let mut seen = self.ai_title_mtime.lock().expect("ai_title_mtime poisoned");
+        seen.retain(|id, _| present.contains(id.as_str()));
+        for (id, path) in &transcripts {
+            let Some(path) = path.as_deref().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let Some(mtime) = transcript_mtime_ms(path) else {
+                continue; // missing/unreadable — leave ai_title as-is (R-34).
+            };
+            if seen.get(id) == Some(&mtime) {
+                continue; // unchanged since the last read — skip the tail read.
+            }
+            seen.insert(id.clone(), mtime);
+            let Some(bytes) = read_transcript_tail(path, AI_TITLE_TAIL_BYTES) else {
+                continue;
+            };
+            // Only push through a found title; an absent `aiTitle` (early in a
+            // session) must not clear a previously-read one.
+            if let Some(title) = extract_ai_title(&bytes) {
+                self.store
+                    .lock()
+                    .expect("store poisoned")
+                    .set_ai_title(id, Some(title));
+            }
         }
     }
 
@@ -2209,6 +2269,9 @@ fn run_tick(shell: &Arc<Shell>) {
     // §23: fold newly-appended transcript bytes into per-session token telemetry
     // (R-23.1), off the UI thread, before the snapshot is pushed below.
     shell.update_usage();
+    // §34: refresh the default row title from each transcript's `aiTitle` (the
+    // terminal-tab chat name), mtime-gated + tail-read (R-34), before push_state.
+    shell.refresh_ai_titles();
     enforce_disk_caps();
     // R-27.6: re-persist session-names.json when an end-of-session prune (or a
     // rename) dirtied the overrides map. No-op when nothing changed.
@@ -2765,17 +2828,6 @@ pub fn uninstall_hooks_command() -> Result<(), String> {
     perform_uninstall_hooks()
 }
 
-/// Focus the terminal window hosting `session_id` (R-15.4), invoked by the
-/// `focus_terminal` command (row click / context menu). Returns
-/// `focus::NOT_FOUND_MSG` when no window could be focused, which the UI shows as
-/// an inline notice (R-15.4b).
-pub fn focus_terminal_command(app: &AppHandle<Wry>, session_id: &str) -> Result<(), String> {
-    let shell = app
-        .try_state::<Arc<Shell>>()
-        .ok_or_else(|| "Quarterdeck is still starting up".to_string())?;
-    shell.focus_terminal(session_id)
-}
-
 /// Rename a session (§27 R-27.4), invoked by the `rename_session` command (the
 /// popup's double-click inline editor). An empty/whitespace name clears the
 /// override.
@@ -2903,7 +2955,6 @@ pub fn run() {
             ipc::uninstall_hooks,
             ipc::resize_popup,
             ipc::show_ask_window,
-            ipc::focus_terminal,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -2927,6 +2978,7 @@ pub fn run() {
                 asks: Mutex::new(AskStore::with_system_clock()),
                 perms: Mutex::new(Vec::new()),
                 usage: Mutex::new(HashMap::new()),
+                ai_title_mtime: Mutex::new(HashMap::new()),
                 notifier: DesktopNotifier::new(handle.clone()),
                 tray,
                 data_dir: data_dir.clone(),
@@ -3069,6 +3121,49 @@ mod tests {
     }
 
     #[test]
+    fn read_transcript_tail_reads_only_the_last_bytes_and_feeds_ai_title() {
+        // §34: a large transcript is tail-read (last N bytes), and the LAST
+        // aiTitle in that tail is what `extract_ai_title` resolves. Also proves
+        // the tail can begin mid-line without corrupting the extracted value.
+        let dir = unique_tmp("aititle-tail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // A big head padding (so a small tail budget skips it), an EARLY aiTitle
+        // that must be excluded by the tail window, then a recent one to keep.
+        let mut body = String::new();
+        body.push_str("{\"aiTitle\":\"early - should be skipped by the tail\"}\n");
+        body.push_str(&"{\"pad\":\"x\"}\n".repeat(4000)); // ~48 KB of padding
+        body.push_str("{\"type\":\"summary\",\"aiTitle\":\"Тестирование Dreambook\"}\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let path_str = path.to_str().unwrap();
+        // Tail budget smaller than the file → the early aiTitle is out of window.
+        let tail = read_transcript_tail(path_str, 8 * 1024).unwrap();
+        assert!((tail.len() as u64) <= 8 * 1024);
+        assert_eq!(
+            extract_ai_title(&tail).as_deref(),
+            Some("Тестирование Dreambook")
+        );
+        assert!(
+            !tail.windows(5).any(|w| w == b"early"),
+            "the early aiTitle must fall outside the tail window"
+        );
+
+        // A tail budget larger than the file reads the whole thing; the LAST
+        // aiTitle still wins over the earlier one.
+        let whole = read_transcript_tail(path_str, 1024 * 1024).unwrap();
+        assert_eq!(whole.len(), body.len());
+        assert_eq!(
+            extract_ai_title(&whole).as_deref(),
+            Some("Тестирование Dreambook")
+        );
+
+        // Missing file → None, never panics (failure-tolerant, R-34).
+        assert!(read_transcript_tail("/no/such/transcript.jsonl", 4096).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn basename_and_paths_eq_handle_mixed_separators() {
         assert_eq!(basename("C:/Users/phil/repo"), "repo");
         assert_eq!(basename("C:\\Users\\phil\\repo\\"), "repo");
@@ -3092,7 +3187,7 @@ mod tests {
     fn foreground_suppression_composition_matches_a_session_terminal_pid() {
         // R-17.2 composition: the shell decides "is this session's terminal the
         // foreground window?" by intersecting the engine's per-session terminal
-        // pids (ancestor pid ∪ registry/claude pid, R-15.4a) with the sampled
+        // pids (the registry/claude pid, R-17.2) with the sampled
         // foreground chain — the exact matching `session_foreground` /
         // `fire_effects` / `maybe_surface_asks` gate on. The lower-level pieces
         // (the `QUARTERDECK_FAKE_FOREGROUND` parse, the pid intersection) are

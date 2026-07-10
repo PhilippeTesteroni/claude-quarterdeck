@@ -9,7 +9,6 @@ import { gotoPopup, row } from '../helpers/popup';
 // rebuild (R-27.5, the `captureAskInputs` analog).
 type Hooks = {
   answerAsk(askId: string, answer: string, kind: string): void;
-  focusTerminalCallCount(): number;
 };
 
 const pushBackgroundState = (page: import('@playwright/test').Page): Promise<void> =>
@@ -78,25 +77,6 @@ test.describe('rename by double-click (R-27.5)', () => {
     await expect(row(page, 'dream-book-web').locator('.qd-row-title')).toHaveText(
       'Fix locale-native generator cron',
     );
-  });
-
-  test('a rename double-click does not raise the terminal (no focus_terminal)', async ({ page }) => {
-    await gotoPopup(page, 'default');
-    const target = row(page, 'dream-book-web');
-
-    // The two `click` events a double-click emits must not bubble to the row's
-    // focus-terminal handler — that would raise the terminal and, unpinned, hide
-    // the popup on blur, defeating the rename gesture.
-    await target.locator('.qd-row-title').dblclick();
-    await expect(page.locator('.qd-row-title-edit')).toBeFocused();
-
-    // Wait past the single-vs-double-click disambiguation window: the scheduled
-    // focus must have been cancelled, not merely still pending.
-    await page.waitForTimeout(600);
-    const focusCount = await page.evaluate(() =>
-      (window as unknown as { __qdMock: Hooks }).__qdMock.focusTerminalCallCount(),
-    );
-    expect(focusCount).toBe(0);
   });
 
   test('the open editor survives a background state rebuild (R-27.5)', async ({ page }) => {

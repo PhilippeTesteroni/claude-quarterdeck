@@ -175,12 +175,7 @@ Nine items from Philipp's live dogfooding + agent-side API feedback. Same rules:
 - **R-15.1 Live session registry.** New core source: `~/.claude/sessions/*.json` (undocumented internal registry: `{pid, sessionId, cwd, name, status, kind, entrypoint, ...}`). Parsed DEFENSIVELY (any missing field tolerated; unreadable file skipped; format drift must never crash — quarantine-free, just log+skip). Polled every 10s alongside liveness AND read at cold start.
 - **R-15.2 Title precedence (replaces R-5.2 chain head).** `name` from the live registry (matched by sessionId) → `session_title` (SessionStart payload) → latest `UserPromptSubmit.prompt` (≤60 chars) → transcript fallback → `(no title)`. Registry names refresh on every poll (a /rename mid-session updates the row within ≤10s).
 - **R-15.3 Registry-driven discovery.** Cold-start discovery (R-5.4) now ALSO creates rows for registry entries whose transcript is missing/stale (status from registry `status` field mapped: busy→working, else idle, flagged inferred). Registry pid feeds liveness directly (no ancestor walk needed for registry-known sessions).
-- **R-15.4 Click-to-focus terminal (v1 deferral lifted).** Row click focuses the terminal window hosting that session, best-effort:
-  (a) On `SessionStart` the hook script captures `extra.ancestor = {pid, hwnd, exe}` — nearest ancestor process with a real top-level window (Win: `MainWindowHandle != 0` via CIM walk; mac: `TERM_PROGRAM` + pid).
-  (b) Focus (Win): validate hwnd still belongs to ancestor pid (`GetWindowThreadProcessId`), then `ShowWindow(SW_RESTORE)` + `SetForegroundWindow` via a spawned `powershell -NoProfile` P/Invoke snippet (no new native deps). Stale/missing hwnd → fallback: enumerate top-level windows, focus first whose title contains the project basename; none → inline toast-in-window "Couldn't find the terminal window".
-  (c) Focus (mac): `osascript` activate by bundle id derived from `TERM_PROGRAM` (Terminal/iTerm/VS Code map). Code-complete, compile-gated, not live-tested (no mac hardware).
-  (d) Windows Terminal TAB-level focus remains out of scope (README limitation).
-  Row click = focus; the former row-click no-op is gone. Right-click menu gains "Focus terminal" as first item.
+- **R-15.4 Click-to-focus terminal — REMOVED (v1.4).** Shipped in v1.3, then cut entirely: its Windows focus path spawned a synchronous PowerShell using `AttachThreadInput`, an input-queue deadlock that hard-hung Quarterdeck. The whole feature is gone — no row-click terminal focus, no "Focus terminal" context-menu item, no `extra.ancestor` capture in the hooks, no `focus_terminal` command. A row's single click now does nothing; navigation is by matching the row title to the terminal tab name (R-15.2 aiTitle default). The `claudePid` ancestor walk (R-4.3) that feeds liveness stays.
 
 ## 16. Permission requests in the deck (item 6)
 
@@ -196,7 +191,7 @@ Nine items from Philipp's live dogfooding + agent-side API feedback. Same rules:
 ## 17. Focus-aware suppression (item 7)
 
 - **R-17.1** Every 2s (and immediately before showing the ask window or firing any toast) the shell samples the foreground window's root process chain (Win: `GetForegroundWindow` → pid → ancestor chain; mac: frontmost app pid via `osascript`, best-effort).
-- **R-17.2** If the foreground window belongs to the session's terminal (matches its `ancestor.pid`/hwnd from R-15.4a, or the registry pid's window), then for THAT session: the ask window does NOT auto-appear (ask stays queued + mirrored in popup; appears as soon as focus leaves), toasts (idle/attention/ask/perm) are suppressed, and perms auto-defer (R-16.3). Suppressed toasts refund the throttle slot (QA round-4 rule).
+- **R-17.2** If the foreground window belongs to the session's terminal (matches the registry/`claude` pid's window), then for THAT session: the ask window does NOT auto-appear (ask stays queued + mirrored in popup; appears as soon as focus leaves), toasts (idle/attention/ask/perm) are suppressed, and perms auto-defer (R-16.3). Suppressed toasts refund the throttle slot (QA round-4 rule).
 - **R-17.3** The popup itself being foreground keeps v1.0 R-9.4 suppression semantics. Suppression never LOSES anything: asks/perms stay pending, statuses still update.
 
 ## 18. Ask window UX (item 8)

@@ -52,14 +52,6 @@ let renameEdit: RenameEdit | null = null;
  * R-27.5 says must survive). The real user-blur path never runs through the
  * rebuild, so it still commits. */
 let suppressRenameBlur = false;
-/** Pending single-click-to-focus on a row title (R-15.4 vs R-27.5): a title
- * click stops the row's immediate focus and schedules it after the double-click
- * window so a rename double-click can cancel it, keeping `focus_terminal` from
- * raising the terminal (and, unpinned, hiding the popup) mid-gesture. */
-let titleFocusTimer: number | null = null;
-/** The OS double-click threshold is ~500ms on Windows; 400ms disambiguates a
- * rename double-click from a single focus click without a noticeable lag. */
-const TITLE_DBLCLICK_MS = 400;
 let installBusy = false;
 let installError: string | null = null;
 let uninstallBusy = false;
@@ -125,20 +117,6 @@ document.addEventListener('scroll', closeCtxMenu, true);
 function openCtxMenu(x: number, y: number, row: SessionRow): void {
   closeCtxMenu();
   const menu = h('div', { className: 'qd-ctx-menu', style: `left:${x}px;top:${y}px` }, [
-    // SPEC R-15.4: "Focus terminal" is the first context-menu item.
-    h(
-      'button',
-      {
-        className: 'qd-ctx-item',
-        type: 'button',
-        onclick: (ev: Event) => {
-          ev.stopPropagation();
-          focusTerminal(row.id);
-          closeCtxMenu();
-        },
-      },
-      ['Focus terminal'],
-    ),
     h(
       'button',
       {
@@ -200,42 +178,6 @@ function openCtxMenu(x: number, y: number, row: SessionRow): void {
   menu.style.left = `${Math.min(x, Math.max(4, maxX))}px`;
   menu.style.top = `${Math.min(y, Math.max(4, maxY))}px`;
   ctxMenuEl = menu;
-}
-
-/** SPEC R-15.4b: a transient inline notice shown in the popup when the terminal
- * window couldn't be focused ("toast-in-window"). Auto-dismisses. */
-let focusNoticeEl: HTMLElement | null = null;
-let focusNoticeTimer: ReturnType<typeof setTimeout> | null = null;
-
-function showFocusNotice(message: string): void {
-  focusNoticeEl?.remove();
-  if (focusNoticeTimer) clearTimeout(focusNoticeTimer);
-  const el = h(
-    'div',
-    {
-      className: 'qd-focus-notice',
-      style:
-        'position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:50;' +
-        'max-width:92%;padding:6px 12px;border-radius:6px;font-size:12px;' +
-        'background:var(--surface,#161b22);color:var(--text,#e6edf3);' +
-        'border:1px solid var(--border,#30363d);box-shadow:0 4px 14px rgba(0,0,0,.35);',
-    },
-    [message],
-  );
-  document.body.append(el);
-  focusNoticeEl = el;
-  focusNoticeTimer = setTimeout(() => {
-    el.remove();
-    if (focusNoticeEl === el) focusNoticeEl = null;
-  }, 2600);
-}
-
-/** SPEC R-15.4: focus the terminal hosting a session. On failure the shell
- * rejects with "Couldn't find the terminal window", shown inline (R-15.4b). */
-function focusTerminal(sessionId: string): void {
-  void invoke('focus_terminal', { sessionId }).catch((err) => {
-    showFocusNotice(err instanceof Error ? err.message : String(err));
-  });
 }
 
 function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
@@ -302,9 +244,6 @@ function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
     {
       className: 'qd-row',
       title: tooltip,
-      // SPEC R-15.4: a row click focuses the terminal window hosting the
-      // session (the former row-click no-op is gone).
-      onclick: () => focusTerminal(row.id),
       oncontextmenu: (ev: Event) => {
         ev.preventDefault();
         const mouse = ev as MouseEvent;
@@ -327,28 +266,15 @@ function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
 }
 
 /** The normal (non-editing) row title span. SPEC §27 R-27.5: double-clicking it
- * opens the inline rename editor. A double-click first emits two `click` events
- * (detail 1 then 2) that bubble to the row before `dblclick` fires, so leaving
- * the row's `focus_terminal` handler to run would raise the terminal and,
- * unpinned, hide the popup on blur (R-7.1/R-14.2) mid-gesture — the user could
- * never rename. We therefore `stopPropagation` on the title's own click and,
- * to preserve click-to-focus on the title (R-15.4), re-schedule the focus after
- * the double-click window; `beginRename` cancels it when the second click lands.
- */
+ * opens the inline rename editor. The title's own click is swallowed so a
+ * click on it never bubbles to the row (which no longer does anything on click). */
 function renderRowTitle(row: SessionRow): HTMLElement {
   return h(
     'span',
     {
       className: 'qd-row-title',
       title: 'Double-click to rename',
-      onclick: (ev: Event) => {
-        ev.stopPropagation();
-        if (titleFocusTimer !== null) clearTimeout(titleFocusTimer);
-        titleFocusTimer = window.setTimeout(() => {
-          titleFocusTimer = null;
-          focusTerminal(row.id);
-        }, TITLE_DBLCLICK_MS);
-      },
+      onclick: (ev: Event) => ev.stopPropagation(),
       ondblclick: (ev: Event) => beginRename(ev, row),
     },
     [row.title],
@@ -394,12 +320,6 @@ function buildRenameInput(row: SessionRow): HTMLInputElement {
 function beginRename(ev: Event, row: SessionRow): void {
   ev.stopPropagation();
   ev.preventDefault();
-  // Cancel the single-click focus the two preceding clicks scheduled so this
-  // rename gesture never raises the terminal (R-15.4 vs R-27.5).
-  if (titleFocusTimer !== null) {
-    clearTimeout(titleFocusTimer);
-    titleFocusTimer = null;
-  }
   renameEdit = { id: row.id, value: row.title, focused: true, selStart: null, selEnd: null };
   if (latest) renderContent(latest);
 }

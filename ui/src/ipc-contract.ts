@@ -274,13 +274,6 @@ export interface Commands {
    * button while asks are still pending. A no-op if already visible.
    */
   show_ask_window: () => Promise<void>;
-  /**
-   * Focuses the terminal window hosting a session (SPEC R-15.4): a row click or
-   * the "Focus terminal" context-menu item. Best-effort — rejects with
-   * "Couldn't find the terminal window" when no window could be focused, which
-   * the popup shows as an inline notice (R-15.4b).
-   */
-  focus_terminal: (args: { sessionId: string }) => Promise<void>;
 }
 
 export type CommandName = keyof Commands;

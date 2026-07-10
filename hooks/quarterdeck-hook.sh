@@ -251,7 +251,7 @@ main() {
         return 0
     fi
 
-    # extra: claudePid + terminal ancestor, only on SessionStart
+    # extra: claudePid, only on SessionStart
     if [ "$event" = "SessionStart" ]; then
         cpid="$(claude_ancestor_pid)"
         if [ -n "$cpid" ]; then
@@ -259,16 +259,7 @@ main() {
         else
             cpid_json="null"
         fi
-        # R-15.4a (mac): the terminal is identified by TERM_PROGRAM (mapped to a
-        # bundle id by focus.rs) + a pid. Only emit the ancestor when we know the
-        # terminal program; the focus path is compile-gated and not live-tested.
-        term="${TERM_PROGRAM:-}"
-        if [ -n "$term" ]; then
-            esc_term="$(printf '%s' "$term" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-            extra="{\"claudePid\":$cpid_json,\"ancestor\":{\"pid\":$cpid_json,\"exe\":\"$esc_term\"}}"
-        else
-            extra="{\"claudePid\":$cpid_json}"
-        fi
+        extra="{\"claudePid\":$cpid_json}"
     else
         extra="{}"
     fi

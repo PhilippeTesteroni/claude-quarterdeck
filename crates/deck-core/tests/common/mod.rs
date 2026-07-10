@@ -104,7 +104,6 @@ pub fn session_start(id: &str, cwd: &str, ts: u64) -> SpoolEvent {
         cwd: Some(cwd.to_string()),
         transcript_path: None,
         claude_pid: None,
-        ancestor: None,
         kind: HookEvent::SessionStart {
             source: Some("startup".to_string()),
             session_title: None,
@@ -127,32 +126,9 @@ pub fn session_start_full(
         cwd: Some(cwd.to_string()),
         transcript_path: transcript.map(ToString::to_string),
         claude_pid: pid,
-        ancestor: None,
         kind: HookEvent::SessionStart {
             source: Some("startup".to_string()),
             session_title: title.map(ToString::to_string),
-        },
-    }
-}
-
-/// A `SessionStart` carrying an `extra.ancestor` (R-15.4a) for focus tests.
-pub fn session_start_with_ancestor(
-    id: &str,
-    cwd: &str,
-    ancestor: deck_core::events::Ancestor,
-    ts: u64,
-) -> SpoolEvent {
-    SpoolEvent {
-        v: 1,
-        session_id: id.to_string(),
-        received_at_ms: Some(ts),
-        cwd: Some(cwd.to_string()),
-        transcript_path: None,
-        claude_pid: None,
-        ancestor: Some(ancestor),
-        kind: HookEvent::SessionStart {
-            source: Some("startup".to_string()),
-            session_title: None,
         },
     }
 }
@@ -165,7 +141,6 @@ pub fn prompt(id: &str, text: &str, ts: u64) -> SpoolEvent {
         cwd: None,
         transcript_path: None,
         claude_pid: None,
-        ancestor: None,
         kind: HookEvent::UserPromptSubmit {
             prompt: Some(text.to_string()),
         },
@@ -180,7 +155,6 @@ pub fn notification(id: &str, ntype: &str, message: Option<&str>, ts: u64) -> Sp
         cwd: None,
         transcript_path: None,
         claude_pid: None,
-        ancestor: None,
         kind: HookEvent::Notification {
             message: message.map(ToString::to_string),
             notification_type: Some(ntype.to_string()),
@@ -196,7 +170,6 @@ pub fn stop(id: &str, ts: u64) -> SpoolEvent {
         cwd: None,
         transcript_path: None,
         claude_pid: None,
-        ancestor: None,
         kind: HookEvent::Stop,
     }
 }
@@ -209,7 +182,6 @@ pub fn session_end(id: &str, reason: &str, ts: u64) -> SpoolEvent {
         cwd: None,
         transcript_path: None,
         claude_pid: None,
-        ancestor: None,
         kind: HookEvent::SessionEnd {
             reason: Some(reason.to_string()),
         },

@@ -94,11 +94,6 @@ let asks: InternalAsk[] = [];
 let perms: InternalPerm[] = [];
 let hooksInstalled = true;
 let installShouldFail = false;
-/** When set (via `?scenario=focus-fail`), the next `focus_terminal` call rejects
- * so a spec can exercise the inline "Couldn't find the terminal window" notice
- * (SPEC R-15.4b). Declared here (not with the other window-op counters below) so
- * it exists before `loadScenario` runs at module load. */
-let focusTerminalShouldFail = false;
 let settings: SettingsState = defaultSettings();
 let listeners: Array<(s: StateSnapshot) => void> = [];
 let askCounter = 0;
@@ -734,9 +729,6 @@ function loadScenario(name: string): void {
   hooksInstalled = fixture.hooksInstalled;
   settings = fixture.settings;
   installShouldFail = name === 'error';
-  // SPEC R-15.4b: `?scenario=focus-fail` makes focus_terminal reject so a spec
-  // can assert the inline notice appears (the fixture itself is the default).
-  focusTerminalShouldFail = name === 'focus-fail';
   askCounter = asks.length;
 }
 
@@ -840,11 +832,6 @@ let resizePopupCalls = 0;
  * window; there's no second real window in mock mode, so a call counter is
  * the observable. */
 let showAskWindowCalls = 0;
-/** Records `focus_terminal` calls (SPEC R-15.4): the row click / context-menu
- * "Focus terminal" invokes it; there's no real terminal in mock/browser mode,
- * so a spec asserts against this counter (and the last session id). */
-let focusTerminalCalls = 0;
-let lastFocusTerminalId: string | null = null;
 /** Count of `hideCurrentWindow()` calls (SPEC R-18.1 close-X/Esc): the ask
  * window's own X button / Esc key hide the window directly via the Tauri
  * window API (see `ipc-client.ts`), bypassing `invoke` entirely — tracked
@@ -1005,17 +992,6 @@ export async function invoke<K extends keyof Commands>(
       showAskWindowCalls += 1;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
-    case 'focus_terminal':
-      // SPEC R-15.4: no real terminal in mock/browser mode — record the call so
-      // a spec can assert the row click fired it, and optionally reject to
-      // exercise the inline "Couldn't find the terminal window" notice (R-15.4b).
-      focusTerminalCalls += 1;
-      lastFocusTerminalId = a.sessionId as string;
-      if (focusTerminalShouldFail) {
-        throw new Error("Couldn't find the terminal window");
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return undefined as any;
     default:
       throw new Error(`quarterdeck mock: unknown command ${String(cmd)}`);
   }
@@ -1075,9 +1051,6 @@ if (!isTauri()) {
     hideCurrentWindowCallCount: () => hideCurrentWindowCalls,
     // R-25.1: lamp drag-vs-click discrimination call count.
     startDraggingCallCount: () => startDraggingCalls,
-    // R-15.4: click-to-focus counters (no real terminal in mock mode).
-    focusTerminalCallCount: () => focusTerminalCalls,
-    lastFocusTerminalId: () => lastFocusTerminalId,
     // R-16.2: last permission decision routed via `answer_perm`.
     lastPermDecision: () => lastPermDecision,
     // R-19.4: last (askId, kind) routed via `answer_ask` — asserts Dismiss

@@ -529,15 +529,6 @@ pub fn show_ask_window(app: tauri::AppHandle) -> Result<(), String> {
     crate::windows::show_ask_window(&app)
 }
 
-/// Focuses the terminal window hosting a session (`focus_terminal` command, SPEC
-/// R-15.4): a row click (or the "Focus terminal" context-menu item). Best-effort
-/// — returns an error string the UI shows as an inline notice ("Couldn't find
-/// the terminal window") when no window could be focused (R-15.4b).
-#[tauri::command]
-pub fn focus_terminal(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
-    crate::focus_terminal_command(&app, &session_id)
-}
-
 fn set_hooks_installed(
     state: &tauri::State<AppState>,
     app: &tauri::AppHandle,

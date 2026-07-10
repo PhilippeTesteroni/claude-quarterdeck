@@ -1,12 +1,11 @@
 //! SPEC §15 live-registry wiring: title precedence (R-15.2), registry-driven
-//! discovery + pid→liveness (R-15.3), and the ancestor/terminal-pid plumbing
-//! for click-to-focus + foreground suppression (R-15.4, R-17.2).
+//! discovery + pid→liveness (R-15.3), and the terminal-pid plumbing for
+//! foreground suppression (R-17.2).
 
 mod common;
 
 use common::*;
 use deck_core::engine::Status;
-use deck_core::events::Ancestor;
 use deck_core::registry::{merge_registry_into_store, registry_status_to_engine, RegistryEntry};
 
 fn entry(id: &str) -> RegistryEntry {
@@ -176,48 +175,20 @@ fn status_mapping_busy_is_working_else_idle() {
 }
 
 #[test]
-fn ancestor_captured_on_session_start_and_surfaced() {
-    // R-15.4a/R-15.4: the ancestor is captured at SessionStart and exposed for
-    // click-to-focus (ancestor_of) and the projection (SessionView.ancestor).
+fn terminal_pids_carry_the_registry_claude_pid() {
+    // R-17.2 matching set: a session's terminal pid is the registry/claude pid
+    // that hosts it.
     let (mut store, _c) = store_at(1_000);
-    let anc = Ancestor {
-        pid: Some(1234),
-        hwnd: Some(0x00AB_CDEF),
-        exe: Some("WindowsTerminal.exe".to_string()),
-    };
-    store.on_event(&session_start_with_ancestor(
-        "s1",
-        "C:/proj",
-        anc.clone(),
-        1_000,
-    ));
-
-    assert_eq!(store.ancestor_of("s1"), Some(anc.clone()));
-    let view = store.view();
-    assert_eq!(view[0].ancestor.as_ref().unwrap().hwnd, Some(0x00AB_CDEF));
-    assert_eq!(store.project_of("s1").as_deref(), Some("proj"));
-}
-
-#[test]
-fn terminal_pids_union_ancestor_and_claude_pid() {
-    // R-17.2 matching set: a session's terminal pids are its ancestor pid plus
-    // the registry/claude pid, de-duplicated.
-    let (mut store, _c) = store_at(1_000);
-    let anc = Ancestor {
-        pid: Some(1111),
-        hwnd: Some(42),
-        exe: None,
-    };
-    store.on_event(&session_start_with_ancestor("s1", "C:/proj", anc, 1_000));
+    store.on_event(&session_start("s1", "C:/proj", 1_000));
     let mut e = entry("s1");
     e.pid = Some(2222);
     store.apply_registry(&[e]);
 
     let pids = store.terminal_pids();
     let s1 = pids.iter().find(|(id, _)| id == "s1").unwrap();
-    assert!(s1.1.contains(&1111) && s1.1.contains(&2222));
+    assert!(s1.1.contains(&2222));
 
-    // A session with no ancestor and no pid is omitted (nothing to match).
+    // A session with no known pid is omitted (nothing to match).
     store.on_event(&session_start("s2", "C:/proj2", 1_000));
     let pids = store.terminal_pids();
     assert!(pids.iter().all(|(id, _)| id != "s2"));

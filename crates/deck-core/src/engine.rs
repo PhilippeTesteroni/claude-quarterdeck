@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::events::{Ancestor, HookEvent, SpoolEvent};
+use crate::events::{HookEvent, SpoolEvent};
 use crate::registry::RegistryEntry;
 use crate::traits::{Clock, ProcessTable, ToastKind};
 use crate::{liveness, naming};
@@ -123,8 +123,6 @@ pub struct SessionView {
     pub inferred: bool,
     pub since_ms: u64,
     pub cwd: String,
-    /// Terminal-window ancestor for click-to-focus (R-15.4), when captured.
-    pub ancestor: Option<Ancestor>,
     /// Active background subagents for the `⛭ N` badge (R-21.2); 0 hides it.
     pub subagents: u32,
     /// Total session age in ms when an anchor is known (R-22.3): registry
@@ -164,13 +162,21 @@ struct Session {
     started_at_ms: u64,
     session_title: Option<String>,
     latest_prompt: Option<String>,
-    /// Highest-precedence title: the live registry `name` matched by sessionId
-    /// (R-15.2), refreshed on every registry poll so a mid-session `/rename`
-    /// shows up within ≤10 s.
+    /// The live registry `name` matched by sessionId (R-15.2), refreshed on
+    /// every registry poll so a mid-session `/rename` shows up within ≤10 s. Its
+    /// §34 precedence rung depends on [`Session::registry_name_is_user`].
     registry_name: Option<String>,
-    /// Terminal-window ancestor captured on `SessionStart` (R-15.4a), for
-    /// click-to-focus and foreground-suppression matching (R-17.2).
-    ancestor: Option<Ancestor>,
+    /// Whether [`Session::registry_name`] was set by an explicit Claude-side
+    /// `/rename` (registry `nameSource == "user"`, R-34). A user-set name
+    /// outranks the transcript `aiTitle`; a derived `phily-XX` handle loses to
+    /// it. Set by [`SessionStore::apply_registry_entry`].
+    registry_name_is_user: bool,
+    /// The transcript `aiTitle` (§34, R-34): the terminal-tab chat name Claude
+    /// derives for the conversation. The DEFAULT row title — it wins over the
+    /// derived `phily-XX` registry handle so a Quarterdeck row matches its
+    /// terminal tab. Refreshed by the shell's mtime-gated tail read via
+    /// [`SessionStore::set_ai_title`]. Below an override / user `/rename`.
+    ai_title: Option<String>,
     /// Cached cold-start transcript title so we read the file at most once.
     transcript_title: Option<String>,
     /// Highest-precedence title: a user-set override (R-27.1), typed by
@@ -252,7 +258,8 @@ impl Session {
             session_title: None,
             latest_prompt: None,
             registry_name: None,
-            ancestor: None,
+            registry_name_is_user: false,
+            ai_title: None,
             transcript_title: None,
             override_name: None,
             display_title: naming::NO_TITLE.to_string(),
@@ -417,9 +424,19 @@ impl Session {
         } else {
             None
         };
-        self.display_title = naming::title_with_override(
+        // §34: the single registry `name` occupies exactly one precedence rung —
+        // the user-set slot (above `aiTitle`) when it came from a Claude `/rename`,
+        // else the derived slot (below `aiTitle`) for the `phily-XX` handle (R-34).
+        let (user_registry, derived_registry) = if self.registry_name_is_user {
+            (self.registry_name.as_deref(), None)
+        } else {
+            (None, self.registry_name.as_deref())
+        };
+        self.display_title = naming::title_full(
             self.override_name.as_deref(),
-            self.registry_name.as_deref(),
+            user_registry,
+            self.ai_title.as_deref(),
+            derived_registry,
             self.session_title.as_deref(),
             self.latest_prompt.as_deref(),
             fallback.as_deref(),
@@ -750,14 +767,6 @@ impl SessionStore {
                 session.started_at_ms = ts;
                 if let Some(pid) = ev.claude_pid {
                     session.claude_pid = Some(pid);
-                }
-                // R-15.4a: remember the terminal-window ancestor for click-to-focus
-                // and foreground-suppression matching (only overwrite when the hook
-                // actually resolved one, so a resume without it keeps the prior).
-                if let Some(ancestor) = &ev.ancestor {
-                    if !ancestor.is_empty() {
-                        session.ancestor = Some(ancestor.clone());
-                    }
                 }
                 if let Some(t) = session_title {
                     session.session_title = Some(t.clone());
@@ -1302,6 +1311,32 @@ impl SessionStore {
 
     // --- Live registry poll (§15) -----------------------------------------
 
+    /// Set (or clear) the transcript `aiTitle` for a session (§34, R-34): the
+    /// terminal-tab chat name and the DEFAULT row title (it wins over the derived
+    /// `phily-XX` registry handle so a row matches its terminal tab). The shell
+    /// feeds this from its mtime-gated transcript tail read. Mirrors the
+    /// registry-name update path: stores the trimmed value (normalization runs in
+    /// [`Session::recompute_title`] via `pick_title`), re-derives the title, and
+    /// returns whether the row's `display_title` changed. No-op (returns `false`)
+    /// for an unknown session or an unchanged value.
+    pub fn set_ai_title(&mut self, session_id: &str, ai_title: Option<String>) -> bool {
+        let Some(s) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let normalized = ai_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        if s.ai_title == normalized {
+            return false;
+        }
+        s.ai_title = normalized;
+        let before = s.display_title.clone();
+        s.recompute_title();
+        s.display_title != before
+    }
+
     /// Apply one live-registry entry (R-15.2/R-15.3) to its matching row (by
     /// session id): refresh the registry `name` (highest-precedence title) and
     /// feed the registry pid into liveness. No-op for an unknown session.
@@ -1346,8 +1381,19 @@ impl SessionStore {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if s.registry_name.as_deref() != new_name {
+        // R-34: classify the registry name's origin. `nameSource == "user"` (an
+        // explicit Claude `/rename`) routes it above the `aiTitle`; anything else
+        // (derived/absent = `phily-XX`) below it. A flip in origin alone — same
+        // name string, `derived → user` — changes the title, so it must also
+        // trigger a recompute.
+        let new_is_user = entry
+            .name_source
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|src| src.eq_ignore_ascii_case("user"));
+        if s.registry_name.as_deref() != new_name || s.registry_name_is_user != new_is_user {
             s.registry_name = new_name.map(str::to_string);
+            s.registry_name_is_user = new_is_user;
             let before = s.display_title.clone();
             s.recompute_title();
             changed |= s.display_title != before;
@@ -1387,8 +1433,9 @@ impl SessionStore {
             // chain (session_title → prompt → transcript). Without this, a live
             // row whose `~/.claude/sessions/<id>.json` vanished while the process
             // is still alive would keep displaying its last registry name forever.
-            if s.registry_name.is_some() {
+            if s.registry_name.is_some() || s.registry_name_is_user {
                 s.registry_name = None;
+                s.registry_name_is_user = false;
                 let before = s.display_title.clone();
                 s.recompute_title();
                 changed |= s.display_title != before;
@@ -1397,45 +1444,16 @@ impl SessionStore {
         changed
     }
 
-    /// The terminal-window ancestor captured for a session (R-15.4), for
-    /// click-to-focus. `None` when unknown or the session isn't tracked.
-    #[must_use]
-    pub fn ancestor_of(&self, session_id: &str) -> Option<Ancestor> {
-        self.sessions
-            .get(session_id)
-            .and_then(|s| s.ancestor.clone())
-    }
-
-    /// The project label (basename of cwd) for a session, if tracked (R-15.4
-    /// title-substring focus fallback + toast copy).
-    #[must_use]
-    pub fn project_of(&self, session_id: &str) -> Option<String> {
-        self.sessions.get(session_id).map(Session::project)
-    }
-
     /// Per-session terminal PIDs used by foreground-suppression matching
-    /// (R-17.2): a session's terminal is whichever process owns its ancestor
-    /// window (`ancestor.pid`) or hosts it (the registry/`claude` pid). Sessions
-    /// with no known pid are omitted (nothing to match against the foreground).
+    /// (R-17.2): a session's terminal is whichever process hosts it (the
+    /// registry/`claude` pid). Sessions with no known pid are omitted (nothing to
+    /// match against the foreground).
     #[must_use]
     pub fn terminal_pids(&self) -> Vec<(String, Vec<u32>)> {
         self.sessions
             .values()
             .filter_map(|s| {
-                let mut pids: Vec<u32> = Vec::new();
-                if let Some(pid) = s.ancestor.as_ref().and_then(|a| a.pid) {
-                    pids.push(pid);
-                }
-                if let Some(pid) = s.claude_pid {
-                    if !pids.contains(&pid) {
-                        pids.push(pid);
-                    }
-                }
-                if pids.is_empty() {
-                    None
-                } else {
-                    Some((s.id.clone(), pids))
-                }
+                s.claude_pid.map(|pid| (s.id.clone(), vec![pid]))
             })
             .collect()
     }
@@ -1482,7 +1500,6 @@ impl SessionStore {
                 inferred: s.inferred,
                 since_ms: now.saturating_sub(s.entered_at_ms),
                 cwd: s.cwd.clone().unwrap_or_default(),
-                ancestor: s.ancestor.clone(),
                 subagents: s.active_subagents,
                 age_ms: Some(now.saturating_sub(s.age_anchor_ms())),
             })

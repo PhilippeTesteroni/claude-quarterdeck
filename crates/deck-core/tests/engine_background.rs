@@ -34,7 +34,6 @@ fn subagent(id: &str, kind: HookEvent, ts: u64) -> SpoolEvent {
         cwd: None,
         transcript_path: None,
         claude_pid: None,
-        ancestor: None,
         kind,
     }
 }

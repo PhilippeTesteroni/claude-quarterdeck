@@ -37,6 +37,11 @@ pub struct RegistryEntry {
     /// The session's current display name (`/rename`-able), highest-precedence
     /// title source (R-15.2).
     pub name: Option<String>,
+    /// How the registry `name` was set (`nameSource` field): `"user"` for an
+    /// explicit Claude-side `/rename`, `"derived"`/absent for the auto-generated
+    /// `phily-XX` handle. Drives the §34 title precedence — a user-set name wins
+    /// over the transcript `aiTitle`, a derived one loses to it (R-34).
+    pub name_source: Option<String>,
     /// Raw status string (`busy`, `idle`, …). Mapped to an engine [`Status`] by
     /// [`registry_status_to_engine`].
     pub status: Option<String>,
@@ -116,6 +121,7 @@ pub fn parse_entry(bytes: &[u8], filename_stem: Option<&str>) -> Option<Registry
         pid,
         cwd: str_field(&["cwd", "workingDirectory", "working_directory"]),
         name: str_field(&["name", "title", "sessionTitle", "session_title"]),
+        name_source: str_field(&["nameSource", "name_source"]),
         status: str_field(&["status", "state"]),
         kind: str_field(&["kind", "type"]),
         entrypoint: str_field(&["entrypoint", "entryPoint"]),
@@ -246,6 +252,7 @@ mod tests {
             "pid": 4242,
             "cwd": "C:/Проекты/агент",
             "name": "Fix the build",
+            "nameSource": "user",
             "status": "busy",
             "kind": "cli",
             "entrypoint": "claude",
@@ -257,6 +264,7 @@ mod tests {
         assert_eq!(e.pid, Some(4242));
         assert_eq!(e.cwd.as_deref(), Some("C:/Проекты/агент"));
         assert_eq!(e.name.as_deref(), Some("Fix the build"));
+        assert_eq!(e.name_source.as_deref(), Some("user"));
         assert_eq!(e.status.as_deref(), Some("busy"));
         assert_eq!(e.started_at_ms, Some(1720000000000));
         assert_eq!(e.updated_at_ms, Some(1720000005000));
@@ -300,6 +308,18 @@ mod tests {
         // Epoch seconds scale up to ms.
         assert_eq!(e.started_at_ms, Some(1_720_000_000_000));
         assert_eq!(e.updated_at_ms, Some(1_720_000_001_000));
+    }
+
+    #[test]
+    fn name_source_is_parsed_and_defaults_to_none() {
+        // Explicit derived source is carried through.
+        let derived =
+            parse_entry(br#"{"sessionId":"s","name":"phily-42","nameSource":"derived"}"#, None)
+                .unwrap();
+        assert_eq!(derived.name_source.as_deref(), Some("derived"));
+        // Absent nameSource → None (the derived default is inferred app-side).
+        let absent = parse_entry(br#"{"sessionId":"s","name":"phily-42"}"#, None).unwrap();
+        assert_eq!(absent.name_source, None);
     }
 
     #[test]

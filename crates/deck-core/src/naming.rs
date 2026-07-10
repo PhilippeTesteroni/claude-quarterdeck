@@ -183,6 +183,126 @@ pub fn title_with_override(
     ])
 }
 
+/// Apply the LOCKED §34 title precedence (highest → lowest, R-34):
+///
+/// 1. `override_name` — Quarterdeck §27 rename (R-27.1)
+/// 2. `user_registry_name` — an explicit Claude-side `/rename` (registry
+///    `nameSource == "user"`)
+/// 3. `ai_title` — the transcript `aiTitle`, i.e. the terminal-tab chat name
+/// 4. `derived_registry_name` — the auto-generated `phily-XX` handle (registry
+///    `nameSource` "derived"/absent)
+/// 5. `session_title`
+/// 6. `latest_prompt`
+/// 7. `transcript_fallback`
+///
+/// The two registry rungs (2 and 4) are the SAME registry `name` routed to
+/// exactly one slot by the caller's `nameSource` classification — a user-set
+/// name outranks the `aiTitle`, a derived one loses to it. Every candidate
+/// rides the same [`pick_title`] pipeline, so each inherits the whitespace
+/// collapse + [`strip_bidi_controls`] + [`truncate_graphemes`] cap of
+/// [`normalize_title`] (R-27.7); a blank/whitespace candidate falls through.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn title_full(
+    override_name: Option<&str>,
+    user_registry_name: Option<&str>,
+    ai_title: Option<&str>,
+    derived_registry_name: Option<&str>,
+    session_title: Option<&str>,
+    latest_prompt: Option<&str>,
+    transcript_fallback: Option<&str>,
+) -> String {
+    pick_title([
+        override_name,
+        user_registry_name,
+        ai_title,
+        derived_registry_name,
+        session_title,
+        latest_prompt,
+        transcript_fallback,
+    ])
+}
+
+/// The `"aiTitle"` JSON key marker scanned for in a transcript byte slice.
+const AI_TITLE_KEY: &[u8] = b"\"aiTitle\"";
+
+/// Extract the LAST non-empty `"aiTitle":"…"` value from a Claude Code
+/// transcript byte slice — or a *tail read* of one (the shell passes the last
+/// ~128 KB so a multi-MB transcript is never read whole) — for the §34 default
+/// title (R-34): the terminal-tab chat name.
+///
+/// `aiTitle` is (re)written on many transcript lines as the conversation
+/// evolves; the LAST occurrence is authoritative, so the scan runs backwards.
+/// The value is JSON-unescaped via `serde_json` so escapes (`\"`, `\n`,
+/// `\uXXXX`) decode and Cyrillic/UTF-8 survives intact. A `null`, empty, or
+/// unterminated (tail-truncated mid-value) occurrence is skipped and the scan
+/// continues to the previous one; `None` when no usable `aiTitle` is present.
+/// Pure and defensive — never panics on malformed/partial input.
+#[must_use]
+pub fn extract_ai_title(bytes: &[u8]) -> Option<String> {
+    let mut end = bytes.len();
+    while let Some(pos) = rfind_bytes(&bytes[..end], AI_TITLE_KEY) {
+        if let Some(value) = json_string_value_after(&bytes[pos + AI_TITLE_KEY.len()..]) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        // null / empty / unterminated → look further back for an earlier title.
+        end = pos;
+    }
+    None
+}
+
+/// Last index at which `needle` occurs in `haystack`, or `None`.
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// Given the bytes immediately after an `"aiTitle"` key, parse the JSON string
+/// value that follows (`: "…"`). Skips insignificant whitespace, requires the
+/// `:` and a string (a `null`/other value yields `None`), finds the closing
+/// unescaped quote, and JSON-decodes the `"…"` slice via `serde_json` so all
+/// escapes and multi-byte UTF-8 are handled correctly. `None` on any deviation
+/// (no colon, non-string value, unterminated string).
+fn json_string_value_after(bytes: &[u8]) -> Option<String> {
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b':' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'"' {
+        return None; // null, number, or missing value — no title here.
+    }
+    let start = i; // the opening quote
+    i += 1;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            // Round-trip the `"…"` slice through serde to unescape safely.
+            return serde_json::from_slice::<String>(&bytes[start..=i]).ok();
+        }
+        i += 1;
+    }
+    None // unterminated string (tail truncated mid-value)
+}
+
 /// Full precedence including the guarded transcript read (R-5.2). Used where a
 /// caller has a `transcript_path` but no cached fallback yet.
 #[must_use]

@@ -3,10 +3,172 @@
 use std::fs;
 
 use deck_core::naming::{
-    derive_title, normalize_title, project_name, strip_bidi_controls, title_from_sources,
-    title_with_override, transcript_cwd, transcript_first_user_text, NO_TITLE, UNKNOWN_PROJECT,
+    derive_title, extract_ai_title, normalize_title, project_name, strip_bidi_controls,
+    title_from_sources, title_full, title_with_override, transcript_cwd, transcript_first_user_text,
+    NO_TITLE, UNKNOWN_PROJECT,
 };
 use tempfile::tempdir;
+
+// --- §34 default-title precedence (R-34) -----------------------------------
+
+/// All seven rungs present, in order:
+/// override > user-registry > aiTitle > derived-registry > session_title >
+/// prompt > transcript_fallback.
+fn full(
+    ovr: Option<&str>,
+    user_reg: Option<&str>,
+    ai: Option<&str>,
+    derived_reg: Option<&str>,
+    sess: Option<&str>,
+    prompt: Option<&str>,
+    fallback: Option<&str>,
+) -> String {
+    title_full(ovr, user_reg, ai, derived_reg, sess, prompt, fallback)
+}
+
+#[test]
+fn s34_each_rung_wins_in_order() {
+    // 1. Quarterdeck §27 override beats everything.
+    assert_eq!(
+        full(
+            Some("override"),
+            Some("user-rename"),
+            Some("aiTitle"),
+            Some("phily-42"),
+            Some("session"),
+            Some("prompt"),
+            Some("fallback"),
+        ),
+        "override"
+    );
+    // 2. An explicit Claude `/rename` (user registry) beats the aiTitle.
+    assert_eq!(
+        full(
+            None,
+            Some("user-rename"),
+            Some("aiTitle"),
+            Some("phily-42"),
+            Some("session"),
+            Some("prompt"),
+            Some("fallback"),
+        ),
+        "user-rename"
+    );
+    // 3. THE §34 CHANGE: the transcript aiTitle is the default — it beats the
+    //    derived phily-XX registry handle and everything below it.
+    assert_eq!(
+        full(
+            None,
+            None,
+            Some("Работа над поиском работы"),
+            Some("phily-42"),
+            Some("session"),
+            Some("prompt"),
+            Some("fallback"),
+        ),
+        "Работа над поиском работы"
+    );
+    // 4. No aiTitle → the derived registry handle wins.
+    assert_eq!(
+        full(
+            None,
+            None,
+            None,
+            Some("phily-42"),
+            Some("session"),
+            Some("prompt"),
+            Some("fallback"),
+        ),
+        "phily-42"
+    );
+    // 5. session_title, 6. prompt, 7. fallback each surface in turn.
+    assert_eq!(
+        full(None, None, None, None, Some("session"), Some("prompt"), Some("fallback")),
+        "session"
+    );
+    assert_eq!(
+        full(None, None, None, None, None, Some("prompt"), Some("fallback")),
+        "prompt"
+    );
+    assert_eq!(full(None, None, None, None, None, None, Some("fallback")), "fallback");
+    // Nothing at all → placeholder.
+    assert_eq!(full(None, None, None, None, None, None, None), NO_TITLE);
+}
+
+#[test]
+fn s34_blank_rungs_fall_through_and_normalize() {
+    // A blank aiTitle is ignored; the derived registry handle wins, and the
+    // winner still rides normalize_title (bidi strip + whitespace collapse).
+    let t = full(
+        None,
+        Some("   "),
+        Some("  "),
+        Some("phily-7  \u{202E}x\u{202C}"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(t, "phily-7 x");
+    // A Cyrillic aiTitle is capped at 60 grapheme clusters, not bytes.
+    let long = "я".repeat(100);
+    let capped = full(None, None, Some(&long), Some("phily-1"), None, None, None);
+    assert_eq!(capped.chars().count(), 60);
+    assert!(capped.ends_with('…'));
+}
+
+// --- §34 aiTitle extraction (R-34) -----------------------------------------
+
+#[test]
+fn extract_ai_title_takes_the_last_occurrence() {
+    // aiTitle appears on many lines as the conversation evolves; the LAST wins.
+    let body = concat!(
+        "{\"type\":\"summary\",\"aiTitle\":\"Early guess\"}\n",
+        "{\"type\":\"user\",\"content\":\"hi\"}\n",
+        "{\"type\":\"summary\",\"aiTitle\":\"Final authoritative name\"}\n"
+    );
+    assert_eq!(
+        extract_ai_title(body.as_bytes()).as_deref(),
+        Some("Final authoritative name")
+    );
+}
+
+#[test]
+fn extract_ai_title_survives_cyrillic_and_json_escapes() {
+    // Cyrillic UTF-8 literal bytes pass through; \" and \uXXXX decode.
+    let body = "{\"aiTitle\":\"Тестирование приложения \\\"Dreambook\\\" перед \\u0440\\u0435\\u043b\\u0438\\u0437\\u043e\\u043c\"}";
+    assert_eq!(
+        extract_ai_title(body.as_bytes()).as_deref(),
+        Some("Тестирование приложения \"Dreambook\" перед релизом")
+    );
+}
+
+#[test]
+fn extract_ai_title_missing_null_and_empty_yield_none() {
+    // No aiTitle key at all.
+    assert_eq!(extract_ai_title(b"{\"type\":\"user\",\"content\":\"hi\"}"), None);
+    // Explicit null.
+    assert_eq!(extract_ai_title(b"{\"aiTitle\":null}"), None);
+    // Empty / whitespace-only value.
+    assert_eq!(extract_ai_title(b"{\"aiTitle\":\"\"}"), None);
+    assert_eq!(extract_ai_title(b"{\"aiTitle\":\"   \"}"), None);
+    // A later null does NOT clobber an earlier real title (scan skips it).
+    let body = "{\"aiTitle\":\"Real name\"}\n{\"aiTitle\":null}";
+    assert_eq!(extract_ai_title(body.as_bytes()).as_deref(), Some("Real name"));
+}
+
+#[test]
+fn extract_ai_title_tolerates_tail_truncated_mid_value() {
+    // A tail read can begin mid-line and end mid-value. An unterminated LAST
+    // aiTitle is skipped; an earlier complete one still resolves.
+    let body = "{\"aiTitle\":\"Complete one\"}\n{\"garbage\":1,\"aiTitle\":\"truncated na";
+    assert_eq!(
+        extract_ai_title(body.as_bytes()).as_deref(),
+        Some("Complete one")
+    );
+    // Leading partial line (mid-UTF-8 is fine — we only decode the key's value).
+    let lead = "рвано{\"aiTitle\":\"Хвост\"}";
+    assert_eq!(extract_ai_title(lead.as_bytes()).as_deref(), Some("Хвост"));
+}
 
 #[test]
 fn title_precedence_session_title_wins() {
