@@ -2954,6 +2954,7 @@ pub fn run() {
             ipc::install_hooks,
             ipc::uninstall_hooks,
             ipc::resize_popup,
+            ipc::resize_ask,
             ipc::show_ask_window,
         ])
         .setup(move |app| {

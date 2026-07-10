@@ -13,8 +13,11 @@ test.describe('permission requests', () => {
     await expect(page.locator('.qd-perm-tag')).toHaveText('requests permission');
     await expect(page.locator('.qd-ask-identity-project')).toHaveText('quarterdeck');
     await expect(page.locator('.qd-perm-tool')).toHaveText('Run Bash?');
-    // tool_input shown verbatim (already sanitized/capped by the shell).
+    // SPEC §35.1: a Bash perm renders the `command` in a labelled mono box (the
+    // structured render), NOT the raw JSON object.
+    await expect(page.locator('.qd-perm-field-label').first()).toHaveText('Command');
     await expect(page.locator('.qd-perm-input')).toContainText('rm -rf ./dist && npm run build');
+    await expect(page.locator('.qd-perm-input')).not.toContainText('timeout');
 
     // Allow / Deny / In terminal.
     await expect(page.locator('.qd-perm-allow')).toHaveText('Allow');
@@ -127,6 +130,65 @@ test.describe('permission requests', () => {
       () => (window as unknown as { __qdMock: { lastPermDecision(): string | null } }).__qdMock.lastPermDecision(),
     );
     expect(deferred).toBe('defer');
+  });
+
+  // SPEC §35.1: an AskUserQuestion perm renders the question + options READ-ONLY
+  // and offers "In terminal" + Deny (NO Allow, since the permission channel
+  // can't carry the user's choice back), plus a one-line hint.
+  test('an AskUserQuestion perm renders the question + options and shows In terminal + Deny (no Allow)', async ({ page }) => {
+    await gotoAsk(page, 'perm-question');
+
+    await expect(page.locator('.qd-perm')).toHaveCount(1);
+    await expect(page.locator('.qd-perm-tool')).toHaveText('Claude is asking a question');
+    // The read-only question block: header + question + numbered options.
+    await expect(page.locator('.qd-ask-q-header')).toHaveText('Deployment');
+    await expect(page.locator('.qd-perm-q-question')).toHaveText('Which environment should I deploy to?');
+    const options = page.locator('.qd-perm-q-option');
+    await expect(options).toHaveCount(2);
+    await expect(options.nth(0)).toContainText('Staging');
+    await expect(options.nth(1)).toContainText('Production');
+
+    // No Allow; grey "In terminal" (defer) + Deny; plus the hint.
+    await expect(page.locator('.qd-perm-allow')).toHaveCount(0);
+    await expect(page.locator('.qd-perm-defer')).toHaveText('In terminal');
+    await expect(page.locator('.qd-perm-deny')).toHaveText('Deny');
+    await expect(page.locator('.qd-perm-hint')).toContainText('ask_user');
+
+    // The A key is inert (no Allow); Esc routes defer ("In terminal").
+    await page.keyboard.press('a');
+    let decision = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastPermDecision(): string | null } }).__qdMock.lastPermDecision(),
+    );
+    expect(decision).toBeNull();
+    await page.keyboard.press('Escape');
+    decision = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastPermDecision(): string | null } }).__qdMock.lastPermDecision(),
+    );
+    expect(decision).toBe('defer');
+  });
+
+  // SPEC §35.1: an unrecognized tool renders its parsed input as key/value rows
+  // (mono values), never a raw JSON blob.
+  test('an unknown tool renders key/value rows (not raw JSON)', async ({ page }) => {
+    await gotoAsk(page, 'perm-unknown-tool');
+
+    await expect(page.locator('.qd-perm-tool')).toHaveText('Run WebFetch?');
+    const rows = page.locator('.qd-perm-kv .qd-perm-field');
+    await expect(rows).toHaveCount(2);
+    await expect(rows.nth(0).locator('.qd-perm-field-label')).toHaveText('url');
+    await expect(rows.nth(0).locator('.qd-perm-field-path')).toHaveText('https://example.com/api');
+    await expect(rows.nth(1).locator('.qd-perm-field-label')).toHaveText('prompt');
+    // A normal tool keeps its Allow/Deny/In terminal.
+    await expect(page.locator('.qd-perm-allow')).toHaveText('Allow');
+  });
+
+  // SPEC §35.1: a truncated/unparseable input falls back to the raw `<pre>`.
+  test('a truncated/unparseable input falls back to the raw <pre>', async ({ page }) => {
+    await gotoAsk(page, 'perm-bad-json');
+
+    // No structured body; the raw fragment shows in the `<pre>` fallback.
+    await expect(page.locator('.qd-perm-body')).toHaveCount(0);
+    await expect(page.locator('pre.qd-perm-input')).toContainText('{"command":"npm run build');
   });
 
   // SPEC R-25.4: the onboarding card carries the "Take over permission prompts"

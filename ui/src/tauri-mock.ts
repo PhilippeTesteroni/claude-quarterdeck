@@ -712,6 +712,103 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
       },
     ],
   }),
+  // SPEC §35.1: an AskUserQuestion arriving through the permission channel — it
+  // renders the question + options READ-ONLY and offers "In terminal" + Deny
+  // (NO Allow), since the hook can't carry the user's choice back.
+  'perm-question': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(6),
+      }),
+    ],
+    asks: [],
+    perms: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        toolName: 'AskUserQuestion',
+        toolInput: JSON.stringify({
+          questions: [
+            {
+              header: 'Deployment',
+              question: 'Which environment should I deploy to?',
+              options: [
+                { label: 'Staging', description: 'Safe, resets nightly' },
+                { label: 'Production', description: 'Live traffic' },
+              ],
+            },
+          ],
+        }),
+        createdAt: Date.now() - 5_000,
+      },
+    ],
+  }),
+  // SPEC §35.1: an unrecognized tool renders its parsed input as key/value rows,
+  // never a raw JSON blob.
+  'perm-unknown-tool': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(6),
+      }),
+    ],
+    asks: [],
+    perms: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        toolName: 'WebFetch',
+        toolInput: JSON.stringify({ url: 'https://example.com/api', prompt: 'Summarize the changelog' }),
+        createdAt: Date.now() - 5_000,
+      },
+    ],
+  }),
+  // SPEC §35.1: a truncated/oversized (unparseable) input falls back to the raw
+  // `<pre>` so a fragment still shows.
+  'perm-bad-json': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Long autonomous refactor',
+        status: 'attention',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(6),
+      }),
+    ],
+    asks: [],
+    perms: [
+      {
+        id: 'p1',
+        sessionId: 's1',
+        project: 'quarterdeck',
+        toolName: 'Bash',
+        // Cut off mid-value (R-16.5 cap) — JSON.parse throws, `<pre>` fallback.
+        toolInput: '{"command":"npm run build && rm -rf ./dist/cache/really/long/pa',
+        createdAt: Date.now() - 5_000,
+      },
+    ],
+  }),
   error: () => ({
     hooksInstalled: false,
     settings: defaultSettings(),
@@ -827,6 +924,10 @@ let lastResizeContentHeight: number | null = null;
  * open/close resize snaps in a single report under reduced motion vs. tweens
  * across many frames when motion is allowed. */
 let resizePopupCalls = 0;
+/** Last `contentHeight` reported via `resize_ask` (SPEC §35.2 auto-size: lets a
+ * Playwright spec assert the ask window grows for a large form / long perm input
+ * and shrinks for a short one, without a real OS window to measure). */
+let lastAskResizeHeight: number | null = null;
 /** Count of `show_ask_window` invocations (SPEC R-18.1 "(or via popup mirror
  * click)"): the popup's ask-mirror row click calls this to re-surface the ask
  * window; there's no second real window in mock mode, so a call counter is
@@ -986,6 +1087,13 @@ export async function invoke<K extends keyof Commands>(
       resizePopupCalls += 1;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return undefined as any;
+    case 'resize_ask':
+      // No ask window to size in mock/browser mode — record the reported content
+      // height (SPEC §35.2 auto-size) so a spec can assert it grows for a large
+      // form / long perm input and shrinks for a short one, and otherwise ignore.
+      lastAskResizeHeight = a.contentHeight as number;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
     case 'show_ask_window':
       // No second real window in mock/browser mode — record the call (SPEC
       // R-18.1 "(or via popup mirror click)") so a spec can assert it fired.
@@ -1045,6 +1153,8 @@ if (!isTauri()) {
     lastResizeContentHeight: () => lastResizeContentHeight,
     // R-31.2: total `resize_popup` calls (snap vs. animated tween).
     resizePopupCallCount: () => resizePopupCalls,
+    // §35.2: last content height the ask window reported via `resize_ask`.
+    lastAskResizeHeight: () => lastAskResizeHeight,
     // R-18.1: counters for the cross-window "reopen" and "close" actions,
     // which have no observable real-window effect in mock/browser mode.
     showAskWindowCallCount: () => showAskWindowCalls,

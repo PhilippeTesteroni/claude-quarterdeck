@@ -39,6 +39,15 @@ const POPUP_MAX_H: f64 = 560.0;
 /// Lamp mode's fixed square size, logical px (SPEC R-25.1 "~56x56 logical px").
 const LAMP_SIZE: f64 = 56.0;
 
+/// Ask-window logical width and the min/cap heights (SPEC §35.2 auto-size): the
+/// always-on-top ask window sizes to its content — a short perm/question is as
+/// compact as the 140 floor, a large §29 form (or a long perm input) grows up to
+/// the 640 cap, beyond which the content area scrolls. Mirrors the popup's
+/// R-14.3 grow-then-scroll band; width stays at the declared 420 (`tauri.conf.json`).
+const ASK_W: f64 = 420.0;
+const ASK_MIN_H: f64 = 140.0;
+const ASK_MAX_H: f64 = 640.0;
+
 /// Minimum gap between `popupPos` persist writes while the user drags the
 /// pinned popup (SPEC R-25.2). A drag fires many `Moved` events per second;
 /// writing `settings.json` on every one would hammer disk for no benefit — only
@@ -210,6 +219,14 @@ fn maybe_persist_popup_pos(popup: &WebviewWindow, position: PhysicalPosition<i32
 /// beyond which the window stays at 560 and the content area scrolls.
 fn popup_target_height(content_px: f64) -> f64 {
     content_px.clamp(POPUP_MIN_H, POPUP_MAX_H)
+}
+
+/// Pure clamp for the ask window's grow-then-scroll band (SPEC §35.2 auto-size):
+/// content shorter than the 140 floor keeps that floor (a compact perm/question),
+/// taller content grows up to 640, beyond which the window stays at 640 and the
+/// content area scrolls. Mirror of [`popup_target_height`] for the ask window.
+fn ask_target_height(content_px: f64) -> f64 {
+    content_px.clamp(ASK_MIN_H, ASK_MAX_H)
 }
 
 /// SPEC R-14.2: whether the popup should hide when it loses focus. Pinned
@@ -549,6 +566,28 @@ pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), S
     Ok(())
 }
 
+/// Resizes the always-on-top ask window to fit `content_px` logical pixels of
+/// content, clamped to the 140..=640 band (SPEC §35.2 auto-size — mirrors the
+/// popup's R-14.3 grow-then-scroll). Height-only: `set_size` never touches the
+/// window's top-left, so it grows/shrinks downward while its top edge — and its
+/// centered-on-appear position (R-8.3) — stay put, never yanked out from under a
+/// user who is mid-answer; always-on-top is a window flag a resize leaves alone.
+/// The frontend measures its own content height and drives this via the
+/// `resize_ask` command (R-3.4: the sizing logic stays in Rust, the view just
+/// reports a number).
+pub fn resize_ask_to_content(app: &AppHandle, content_px: f64) -> Result<(), String> {
+    let ask = ask_window(app)?;
+    let target_h = ask_target_height(content_px);
+    let scale = ask.scale_factor().map_err(|err| err.to_string())?;
+    let current_h = ask.inner_size().map_err(|err| err.to_string())?.height as f64 / scale;
+    // Avoid churn: only resize when the height meaningfully changes.
+    if (current_h - target_h).abs() < 1.0 {
+        return Ok(());
+    }
+    ask.set_size(LogicalSize::new(ASK_W, target_h))
+        .map_err(|err| err.to_string())
+}
+
 /// Pure geometry for [`anchor_near_tray`]: given the tray icon's rect, the
 /// popup's own size, and the monitor's work area (all in physical pixels),
 /// returns the top-left position to place the popup at. Kept side-effect
@@ -789,6 +828,24 @@ mod tests {
             popup_target_height(zero_rows),
             POPUP_MIN_H,
             "back to 0 rows shrinks to the 160 floor, not stuck at 560"
+        );
+    }
+
+    #[test]
+    fn ask_height_grows_then_caps_at_640() {
+        // SPEC §35.2 auto-size: short content keeps the 140 floor, taller content
+        // grows with the form/perm, and a very tall render caps at 640 (then the
+        // content area scrolls) — the ask analog of `popup_target_height`.
+        assert_eq!(
+            ask_target_height(80.0),
+            ASK_MIN_H,
+            "short/empty content → the 140 floor"
+        );
+        assert_eq!(ask_target_height(420.0), 420.0, "grows with content");
+        assert_eq!(
+            ask_target_height(900.0),
+            ASK_MAX_H,
+            "capped at 640, then scrolls"
         );
     }
 

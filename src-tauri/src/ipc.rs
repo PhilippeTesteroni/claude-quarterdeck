@@ -520,6 +520,14 @@ pub fn resize_popup(app: tauri::AppHandle, content_height: f64) -> Result<(), St
     crate::windows::resize_popup_to_content(&app, content_height)
 }
 
+/// Resizes the always-on-top ask window to fit its content within the 140..=640
+/// band (SPEC §35.2 auto-size). The frontend measures its own content height and
+/// calls this after each render; all clamping/sizing lives in Rust (R-3.4).
+#[tauri::command]
+pub fn resize_ask(app: tauri::AppHandle, content_height: f64) -> Result<(), String> {
+    crate::windows::resize_ask_to_content(&app, content_height)
+}
+
 /// Brings the ask window forward without stealing focus (`show_ask_window`
 /// command, SPEC R-18.1 "(or via popup mirror click)"): a mirrored ask row in
 /// the popup can be clicked to re-surface the ask window after it was closed

@@ -15,6 +15,11 @@ const elBadge = document.getElementById('qd-ask-badge') as HTMLElement;
 const elClose = document.getElementById('qd-ask-close') as HTMLButtonElement;
 
 let latest: StateSnapshot | null = null;
+/** SPEC §35.2: the last content height reported to the shell via `resize_ask`,
+ * so a re-render that measures the same height doesn't re-invoke the resize
+ * (guards churn from the `deck://state` re-pushes that fire on every session's
+ * change, not just this ask's). */
+let lastAskHeight: number | null = null;
 let countdownEl: HTMLElement | null = null;
 let countdownTarget: number | null = null;
 let freeTextInput: HTMLInputElement | null = null;
@@ -324,9 +329,192 @@ function sendPerm(perm: PermRow, decision: PermDecision): void {
   });
 }
 
-/** SPEC §16 (R-16.2): the permission modal — amber accent, "<project> requests
- * permission", tool name + compact pretty-printed input (already sanitized +
- * capped by the shell, R-16.5), and Allow / Deny / In terminal actions. */
+/** SPEC §35.1 truncation budgets for the structured permission render. The
+ * shell already caps `toolInput` overall (R-16.5); these keep any single long
+ * field (a file's whole content, an edit's old/new string, a stray value) from
+ * dominating the modal before the window's own scroll takes over. */
+const PERM_PREVIEW_MAX = 2000;
+const PERM_EDIT_MAX = 600;
+const PERM_VALUE_MAX = 400;
+
+/** Human labels for the path/pattern fields of the read-only tools (R-35.1). */
+const PERM_PATH_LABELS: Record<string, string> = {
+  file_path: 'Path',
+  path: 'Path',
+  pattern: 'Pattern',
+  glob: 'Glob',
+};
+
+/** Coerce a parsed JSON field to a display string: strings verbatim, everything
+ * else (numbers, booleans, nested objects/arrays) via a compact JSON dump so a
+ * `{"timeout":120000}`-style value still reads. Absent → empty. */
+function permValueStr(v: unknown): string {
+  if (typeof v === 'string') return v;
+  if (v === undefined || v === null) return '';
+  return JSON.stringify(v);
+}
+
+/** A plain (non-array) object, or null — so a malformed `edits[i]` / options
+ * entry can't throw while we index into it. */
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+/** A label + single-line mono value (a file path, pattern, or key/value cell). */
+function permLineField(label: string, value: string): HTMLElement {
+  return h('div', { className: 'qd-perm-field' }, [
+    h('div', { className: 'qd-perm-field-label' }, [label]),
+    h('div', { className: 'qd-perm-field-path mono' }, [value || '(empty)']),
+  ]);
+}
+
+/** A label + a newline-preserving mono code box (reusing the `.qd-perm-input`
+ * `<pre>` that also serves as the parse-failure fallback, so both look alike). */
+function permCodeField(label: string, code: string): HTMLElement {
+  return h('div', { className: 'qd-perm-field' }, [
+    h('div', { className: 'qd-perm-field-label' }, [label]),
+    h('pre', { className: 'qd-perm-input mono' }, [code || '(empty)']),
+  ]);
+}
+
+/** Bash: the `command` in a mono box, plus its `description` if present. */
+function renderBashInput(input: Record<string, unknown>): HTMLElement {
+  const description = typeof input.description === 'string' ? input.description : '';
+  return h('div', { className: 'qd-perm-body' }, [
+    permCodeField('Command', permValueStr(input.command)),
+    description ? h('div', { className: 'qd-perm-desc' }, [description]) : null,
+  ]);
+}
+
+/** Write: the target `file_path` + a truncated preview of `content`. */
+function renderWriteInput(input: Record<string, unknown>): HTMLElement {
+  return h('div', { className: 'qd-perm-body' }, [
+    permLineField('File', permValueStr(input.file_path)),
+    permCodeField('Content', truncate(permValueStr(input.content), PERM_PREVIEW_MAX)),
+  ]);
+}
+
+/** One old→new replacement pair (an Edit, or one entry of a MultiEdit `edits`). */
+function renderEditPair(rec: Record<string, unknown> | null, label: string | null): HTMLElement {
+  return h('div', { className: 'qd-perm-edit' }, [
+    label !== null ? h('div', { className: 'qd-perm-field-label' }, [label]) : null,
+    permCodeField('Replace', truncate(permValueStr(rec?.old_string), PERM_EDIT_MAX)),
+    permCodeField('With', truncate(permValueStr(rec?.new_string), PERM_EDIT_MAX)),
+  ]);
+}
+
+/** Edit / MultiEdit: the `file_path` + one replacement pair, or the `edits` list. */
+function renderEditInput(input: Record<string, unknown>): HTMLElement {
+  const children: (HTMLElement | null)[] = [permLineField('File', permValueStr(input.file_path))];
+  const edits = Array.isArray(input.edits) ? input.edits : null;
+  if (edits) {
+    edits.forEach((e, i) => children.push(renderEditPair(asRecord(e), edits.length > 1 ? `Edit ${i + 1}` : null)));
+  } else {
+    children.push(renderEditPair(input, null));
+  }
+  return h('div', { className: 'qd-perm-body' }, children);
+}
+
+/** Read / Glob / Grep / LS: the present path/pattern fields, one line each. */
+function renderPathInput(input: Record<string, unknown>): HTMLElement {
+  const fields = Object.keys(PERM_PATH_LABELS)
+    .filter((k) => input[k] !== undefined)
+    .map((k) => permLineField(PERM_PATH_LABELS[k], truncate(permValueStr(input[k]), PERM_VALUE_MAX)));
+  // No known path/pattern field present → fall back to generic key/value rows.
+  if (fields.length === 0) return renderKeyValueInput(input);
+  return h('div', { className: 'qd-perm-body' }, fields);
+}
+
+/** One READ-ONLY AskUserQuestion block: header (if any) + question + its options
+ * as a numbered list. This is the permission *view* — it is never answerable
+ * here (the hook can't carry a choice back), so no inputs/buttons (R-35.1). */
+function renderQuestionBlock(q: Record<string, unknown>): HTMLElement {
+  const header = typeof q.header === 'string' ? q.header : '';
+  const options = Array.isArray(q.options) ? q.options : [];
+  const optEls = options.map((opt, i) => {
+    const rec = asRecord(opt);
+    // Native options are `{label, description}`; tolerate a plain string too.
+    const label = rec ? permValueStr(rec.label ?? rec.option) : permValueStr(opt);
+    return h('li', { className: 'qd-perm-q-option' }, [
+      h('span', { className: 'qd-ask-option-key' }, [String(i + 1)]),
+      h('span', { className: 'qd-ask-option-text' }, [truncate(label, PERM_VALUE_MAX)]),
+    ]);
+  });
+  return h('div', { className: 'qd-perm-q' }, [
+    header ? h('div', { className: 'qd-ask-q-header' }, [header]) : null,
+    h('div', { className: 'qd-ask-question qd-perm-q-question' }, [truncate(permValueStr(q.question), PERM_VALUE_MAX)]),
+    optEls.length > 0 ? h('ol', { className: 'qd-perm-q-options' }, optEls) : null,
+  ]);
+}
+
+/** AskUserQuestion: every question block, read-only (R-35.1). */
+function renderQuestionInput(input: Record<string, unknown>): HTMLElement {
+  const questions = Array.isArray(input.questions) ? input.questions : null;
+  if (questions && questions.length > 0) {
+    return h('div', { className: 'qd-perm-body' }, questions.map((q) => renderQuestionBlock(asRecord(q) ?? {})));
+  }
+  // A single top-level `question` (no `questions` array) is still renderable.
+  if (typeof input.question === 'string') {
+    return h('div', { className: 'qd-perm-body' }, [renderQuestionBlock(input)]);
+  }
+  return renderKeyValueInput(input);
+}
+
+/** Unknown/other tool: the parsed object as `key: value` rows, mono values — a
+ * readable render, never a raw JSON blob (R-35.1). */
+function renderKeyValueInput(input: Record<string, unknown>): HTMLElement {
+  const entries = Object.entries(input);
+  if (entries.length === 0) return h('pre', { className: 'qd-perm-input mono' }, ['(no input)']);
+  return h(
+    'div',
+    { className: 'qd-perm-body qd-perm-kv' },
+    entries.map(([k, v]) => permLineField(k, truncate(permValueStr(v), PERM_VALUE_MAX))),
+  );
+}
+
+/** SPEC §35.1: render a permission request's `toolInput` (a JSON string, already
+ * shell-sanitized + §28-decoded) as a structured, tool-aware block keyed on
+ * `perm.toolName`, replacing the raw `<pre>` dump. On a `JSON.parse` failure
+ * (a truncated/oversized input, R-16.5) — or a JSON scalar/array with nothing
+ * to key on — it keeps the verbatim `<pre>` so a fragment still shows. */
+function renderPermInput(perm: PermRow): HTMLElement {
+  const raw = perm.toolInput || '';
+  let parsed: Record<string, unknown>;
+  try {
+    const value: unknown = JSON.parse(raw);
+    const rec = asRecord(value);
+    if (!rec) return h('pre', { className: 'qd-perm-input mono' }, [raw || '(no input)']);
+    parsed = rec;
+  } catch {
+    return h('pre', { className: 'qd-perm-input mono' }, [raw || '(no input)']);
+  }
+
+  switch (perm.toolName) {
+    case 'Bash':
+      return renderBashInput(parsed);
+    case 'Write':
+      return renderWriteInput(parsed);
+    case 'Edit':
+    case 'MultiEdit':
+      return renderEditInput(parsed);
+    case 'Read':
+    case 'Glob':
+    case 'Grep':
+    case 'LS':
+      return renderPathInput(parsed);
+    case 'AskUserQuestion':
+      return renderQuestionInput(parsed);
+    default:
+      return renderKeyValueInput(parsed);
+  }
+}
+
+/** SPEC §16 (R-16.2) / §35.1: the permission modal — amber accent, "<project>
+ * requests permission", tool name + a structured, tool-aware render of the input
+ * (R-35.1), and type-aware actions. A normal tool keeps Allow / Deny / In
+ * terminal (+ the §32 expired disabling); an `AskUserQuestion` — which the
+ * permission channel can't actually answer — drops Allow, leaving "In terminal"
+ * (defer, the real path) + Deny plus a one-line hint. */
 function renderPerm(perm: PermRow, sessions: SessionRow[]): void {
   clear(elContent);
   freeTextInput = null;
@@ -352,35 +540,48 @@ function renderPerm(perm: PermRow, sessions: SessionRow[]): void {
     h('span', { className: 'qd-perm-tag mono' }, [expired ? 'expired' : 'requests permission']),
   ]);
 
-  const allow = h(
-    'button',
-    { className: 'qd-btn qd-btn-primary qd-perm-allow', type: 'button', onclick: () => sendPerm(perm, 'allow') },
-    ['Allow'],
-  ) as HTMLButtonElement;
+  // R-35.1: an AskUserQuestion arriving through the permission channel can't be
+  // answered here (the hook only returns allow/deny/defer, never the user's
+  // choice) — so it shows NO Allow, only "In terminal" (defer) + Deny + a hint.
+  const isQuestion = perm.toolName === 'AskUserQuestion';
+
   const deny = h(
     'button',
     { className: 'qd-btn qd-perm-deny', type: 'button', onclick: () => sendPerm(perm, 'deny') },
     ['Deny'],
   ) as HTMLButtonElement;
+  const defer = h(
+    'button',
+    { className: 'qd-btn qd-btn-ghost qd-perm-defer', type: 'button', onclick: () => sendPerm(perm, 'defer') },
+    ['In terminal'],
+  ) as HTMLButtonElement;
+  const allow = isQuestion
+    ? null
+    : (h(
+        'button',
+        { className: 'qd-btn qd-btn-primary qd-perm-allow', type: 'button', onclick: () => sendPerm(perm, 'allow') },
+        ['Allow'],
+      ) as HTMLButtonElement);
   if (expired) {
-    allow.disabled = true;
+    if (allow) allow.disabled = true;
     deny.disabled = true;
   }
+
+  // Question: "In terminal" (the real path) leads, then Deny. Normal tool: the
+  // familiar Allow / Deny / In terminal.
+  const actions = isQuestion ? [defer, deny] : [allow as HTMLButtonElement, deny, defer];
 
   elContent.append(
     h('div', { className: 'qd-perm' }, [
       identity,
-      h('div', { className: 'qd-ask-question qd-perm-tool' }, [`Run ${perm.toolName}?`]),
-      h('pre', { className: 'qd-perm-input mono' }, [perm.toolInput || '(no input)']),
-      h('div', { className: 'qd-ask-actions qd-perm-actions' }, [
-        allow,
-        deny,
-        h(
-          'button',
-          { className: 'qd-btn qd-btn-ghost qd-perm-defer', type: 'button', onclick: () => sendPerm(perm, 'defer') },
-          ['In terminal'],
-        ),
+      h('div', { className: 'qd-ask-question qd-perm-tool' }, [
+        isQuestion ? 'Claude is asking a question' : `Run ${perm.toolName}?`,
       ]),
+      renderPermInput(perm),
+      isQuestion
+        ? h('p', { className: 'qd-perm-hint' }, ['Answer in the terminal — or have Claude ask via the ask_user tool.'])
+        : null,
+      h('div', { className: 'qd-ask-actions qd-perm-actions' }, actions),
     ]),
   );
 }
@@ -491,9 +692,50 @@ function render(snap: StateSnapshot): void {
   }
 }
 
+/** SPEC §35.2 auto-size: the ask window's intrinsic content height, `header +
+ * true content height`. Mirrors `popup.ts`'s `measureAutoHeight` — `#app` is
+ * normally stretched to the OS window height (`height: 100%`), so its flex-grow
+ * `.qd-ask-content` child re-stretches to fill it and would mask SHRINKING (a
+ * long perm collapsing to a short one would never report a smaller height).
+ * Momentarily letting `#app` size to its own content removes that ambient
+ * stretch so `elContent.scrollHeight` reflects the real intrinsic height;
+ * restoring right after is a same-tick style read+write that paints no
+ * intermediate frame. */
+function measureAskHeight(): number {
+  const appEl = document.getElementById('app') as HTMLElement | null;
+  const header = document.querySelector('.qd-ask .qd-header') as HTMLElement | null;
+  const prevHeight = appEl?.style.height ?? '';
+  const prevMaxHeight = appEl?.style.maxHeight ?? '';
+  if (appEl) {
+    appEl.style.height = 'auto';
+    appEl.style.maxHeight = 'none';
+  }
+  const headerH = header?.offsetHeight ?? 0;
+  const contentH = elContent.scrollHeight;
+  if (appEl) {
+    appEl.style.height = prevHeight;
+    appEl.style.maxHeight = prevMaxHeight;
+  }
+  return headerH + contentH;
+}
+
+/** SPEC §35.2: report the measured content height so the shell can size the ask
+ * window (clamped to 140..=640 in Rust). Snaps directly — the window resize
+ * isn't animated, so there's nothing for reduced-motion to disable — and is
+ * skipped when the height hasn't meaningfully changed, so an unrelated
+ * `deck://state` re-push can't thrash the window. Reported even in mock/browser
+ * mode (no window to size there, but the number itself is test-observable). */
+function syncAskHeight(): void {
+  const total = measureAskHeight();
+  if (lastAskHeight !== null && Math.abs(total - lastAskHeight) < 1) return;
+  lastAskHeight = total;
+  void invoke('resize_ask', { contentHeight: total }).catch(() => undefined);
+}
+
 onState((snap) => {
   latest = snap;
   render(snap);
+  syncAskHeight();
 });
 
 // R-18.1: the X (top-right) closes (hides) the WINDOW without dismissing any
@@ -511,7 +753,10 @@ document.addEventListener('keydown', (ev) => {
     // R-32.1: past the deadline Allow/Deny are disabled (the hook has given up),
     // so their A/D shortcuts are inert too; Esc = In terminal still clears it.
     const permExpired = primaryPerm.expiresAt !== undefined && Date.now() >= primaryPerm.expiresAt;
-    if (key === 'a' && !permExpired) {
+    // R-35.1: an AskUserQuestion perm has no Allow, so its A shortcut is inert;
+    // Esc still = In terminal (defer), and D still = Deny.
+    const isQuestion = primaryPerm.toolName === 'AskUserQuestion';
+    if (key === 'a' && !permExpired && !isQuestion) {
       sendPerm(primaryPerm, 'allow');
       return;
     }

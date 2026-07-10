@@ -268,6 +268,13 @@ export interface Commands {
    */
   resize_popup: (args: { contentHeight: number }) => Promise<void>;
   /**
+   * Ask-window content self-measurement (SPEC §35.2 auto-size). The frontend
+   * reports its content height after each render; the shell clamps it to
+   * 140..=640 and resizes the always-on-top ask window height-only, keeping its
+   * position stable (all sizing logic stays in Rust, R-3.4).
+   */
+  resize_ask: (args: { contentHeight: number }) => Promise<void>;
+  /**
    * Brings the ask window forward without stealing focus (SPEC R-18.1 "(or
    * via popup mirror click)"): clicking a mirrored ask row in the popup calls
    * this to re-surface the ask window after it was closed via its own X

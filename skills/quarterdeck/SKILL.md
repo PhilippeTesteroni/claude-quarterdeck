@@ -40,6 +40,37 @@ Do **not** use it for things you can and should decide yourself. If you can make
 a reasonable call and keep moving, do that. `ask_user` is for the human's call,
 not to offload your judgment.
 
+### `ask_user` vs. the native `AskUserQuestion`
+
+Both tools ask the user a choice, but they surface in different places, and that
+is what decides which to reach for:
+
+- **Native `AskUserQuestion`** prints inline in the terminal conversation. Use it
+  **only when the user is actively watching this terminal** and will see and
+  answer it right there.
+- **`ask_user`** raises Quarterdeck's always-on-top popup and **blocks** until the
+  user answers. Use it **whenever you are running autonomously or the user is out
+  of the terminal** — in another window, away from the desk, or following your run
+  through Quarterdeck instead of the terminal.
+
+**The honest asymmetry:** a native `AskUserQuestion` **cannot be answered from
+Quarterdeck** — the deck can only surface it and offer "In terminal", so the user
+has to come back to the terminal to respond. Only `ask_user` is both rendered
+**and** answerable inside the deck (including its `questions[]` form, which
+mirrors `AskUserQuestion`'s multi-question shape — see below). So when there is
+any chance the user is not at the terminal, reach them with `ask_user`, not
+`AskUserQuestion`; otherwise your question sits unseen behind the terminal window
+and your run stalls.
+
+**Example — same decision, two channels:**
+
+- User is right here, replying in the conversation → native
+  `AskUserQuestion("Merge to main or open a PR?", ["Merge", "PR"])`; they answer
+  inline and you continue.
+- You're 40 minutes into an unattended refactor and the user has stepped away →
+  `ask_user(question: "Merge to main or open a PR?", options: ["Merge", "PR"], context: "<cwd>")`;
+  the deck pops it to the front and they answer it there — no terminal needed.
+
 ### How to call it well
 
 ```
@@ -145,12 +176,12 @@ survives long idle waits. For extreme autonomy you may also raise the per-server
   branches) rather than firing many popups.
 - **One ask per genuine blocker.** Don't re-ask the same thing; don't ask for
   confirmation of trivial steps.
-- **Prefer the built-in `AskUserQuestion` when the user is actively interactive**
-  (they're watching this conversation and replying). `ask_user` — including its
-  `questions[]` form, which mirrors `AskUserQuestion`'s multi-question shape — is
-  for when you are running autonomously and the user is elsewhere: it interrupts
-  them with a system popup, so reserve it for when that interruption is
-  warranted. When the user is right here, ask in-conversation instead.
+- **Route to the right channel** (see "`ask_user` vs. the native
+  `AskUserQuestion`" above): when the user is actively interactive and replying in
+  this conversation, ask in-conversation with the built-in `AskUserQuestion`;
+  `ask_user` interrupts them with a system popup, so reserve it for when you are
+  autonomous or the user is away from the terminal — the one case where the
+  question can actually be answered from the deck.
 
 ## When to use `notify_user`
 
