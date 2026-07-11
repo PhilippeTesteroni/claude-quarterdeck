@@ -2,8 +2,8 @@
 // Quarterdeck icon generator (T0). Pure Node, no native deps.
 //
 // Produces:
-//   assets/tray/{green,yellow,red,gray}-{16,32}.png  -- status tray icons
-//   assets/tray/{green,yellow,red,gray}.ico          -- Windows tray variants
+//   assets/tray/{green,yellow,red,blue,gray}-{16,32}.png  -- status tray icons
+//   assets/tray/{green,yellow,red,blue,gray}.ico          -- Windows tray variants
 //   assets/app/icon-512.png                          -- neutral app source
 //   src-tauri/icons/32x32.png, 128x128.png,
 //                   128x128@2x.png, icon.ico          -- Tauri bundle icons
@@ -155,6 +155,7 @@ const STATUS = {
   green: [63, 185, 80],
   yellow: [210, 153, 34],
   red: [248, 81, 73],
+  blue: [88, 166, 255], // §43 waiting-for-workflow (#58a6ff)
   gray: [110, 118, 129],
 };
 const CLAY = [217, 119, 87]; // brand accent for the neutral app icon

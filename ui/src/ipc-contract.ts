@@ -7,7 +7,9 @@
  * the serde types in `src-tauri/src/ipc.rs` (SPEC R-3.4).
  */
 
-export type SessionStatus = 'working' | 'attention' | 'idle' | 'dead';
+// `waiting` is §43 "waiting for workflow" (blue): the parent turn's Stop fired
+// but background subagents/workflows are still running. Between working and idle.
+export type SessionStatus = 'working' | 'waiting' | 'attention' | 'idle' | 'dead';
 
 export interface SessionRow {
   id: string;
@@ -35,6 +37,20 @@ export interface SessionRow {
    */
   ageMs?: number;
   /**
+   * §36 working-time timer anchor: epoch ms the current turn's real work started
+   * (a `UserPromptSubmit`). While the row is `working` the UI renders a live
+   * `now − workStartedMs` counter ("Xm Ys") instead of raw time-in-status —
+   * anchored at the prompt so §30 reverse-gear / §21 busy-override flips don't
+   * reset it. Absent for a row that never saw a real prompt.
+   */
+  workStartedMs?: number;
+  /**
+   * §36: total working time of the just-finished turn, frozen at its `Stop`.
+   * While the row is `idle` the UI renders "took <this>" instead of a running
+   * idle timer. Absent until a started turn has stopped.
+   */
+  lastWorkMs?: number;
+  /**
    * Context fill percent (SPEC R-23.2a/R-23.4): the row's second line reads
    * `ctx {ctxPercent}% · …`, amber ≥75, red ≥90 (+ a "context nearly full"
    * tooltip). Absent until a usage record is read, or when `showTokenStats` off.
@@ -53,6 +69,12 @@ export interface SessionRow {
    * suffix on the `⛭ N` badge (`⛭ 3 · 2.1M`). Absent when zero.
    */
   subagentSpend?: string;
+  /**
+   * §38 kill-agent-process: the session's Claude host PID, when known. The
+   * right-click "Kill process" context item shows only for a row that carries
+   * one; clicking it invokes `kill_session`. Absent for a PID-less row.
+   */
+  pid?: number;
 }
 
 /**
@@ -148,6 +170,9 @@ export type PermDecision = 'allow' | 'deny' | 'defer';
 export interface Counts {
   attention: number;
   working: number;
+  /** §43 blue "waiting for workflow": hook-idle parent with open background
+   * subagents/workflows. Absent on an older snapshot without the field. */
+  waiting: number;
   idle: number;
   dead: number;
 }
@@ -242,6 +267,13 @@ export interface Commands {
    */
   answer_perm: (args: { permId: string; decision: PermDecision; reason?: string }) => Promise<void>;
   remove_row: (args: { sessionId: string }) => Promise<void>;
+  /**
+   * §38 kill-agent-process: force-terminates the session's Claude process
+   * (Windows `taskkill /PID <pid> /F`, macOS `kill`) and removes its row (reuses
+   * the `remove_row` path). The popup only offers this for a row with a known
+   * `pid`. Confirm-free but clearly labelled "Kill process".
+   */
+  kill_session: (args: { sessionId: string }) => Promise<void>;
   /**
    * Renames a session (SPEC §27 R-27.4): sets a user title override that wins
    * over every other title source (registry name, session title, prompt). An

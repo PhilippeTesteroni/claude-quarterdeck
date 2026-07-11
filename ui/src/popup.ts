@@ -6,7 +6,7 @@
 
 import { invoke, onState, startDragging, usingMock } from './ipc-client';
 import type { AskAnswerKind, AskRow, PermDecision, PermRow, SessionRow, SessionStatus, SettingsState, StateSnapshot } from './ipc-contract';
-import { footerText, formatAge, formatDuration, truncate, worstStatus } from './format';
+import { footerText, formatAge, formatDuration, truncate } from './format';
 import { clear, h } from './dom';
 import { installMockScenarioSwitcher } from './mock-switcher';
 
@@ -19,7 +19,7 @@ const elPin = document.getElementById('qd-pin') as HTMLButtonElement;
 const elCollapse = document.getElementById('qd-collapse') as HTMLButtonElement;
 const elApp = document.getElementById('app') as HTMLElement;
 const elLamp = document.getElementById('qd-lamp') as HTMLButtonElement;
-const elLampDot = document.getElementById('qd-lamp-dot') as HTMLElement;
+const elLampPie = document.getElementById('qd-lamp-pie') as unknown as SVGSVGElement;
 const elLampBadge = document.getElementById('qd-lamp-badge') as HTMLElement;
 
 let latest: StateSnapshot | null = null;
@@ -64,7 +64,8 @@ let lastLaunchChoice: boolean | null = null;
 // the rest of the DOM (keeps focus/menus).
 let timeTicks: Array<{ el: HTMLElement; base: number; prefix: string }> = [];
 
-const WATCHLINE_ORDER: SessionStatus[] = ['attention', 'working', 'idle', 'dead'];
+// §43: `waiting` (blue) slots between working and idle in the watch line too.
+const WATCHLINE_ORDER: SessionStatus[] = ['attention', 'working', 'waiting', 'idle', 'dead'];
 const watchlineSegs = new Map<string, HTMLElement>();
 for (const status of WATCHLINE_ORDER) {
   const seg = h('div', { className: 'qd-watchline-seg', 'data-status': status });
@@ -88,7 +89,7 @@ const SETTINGS_FOOTER_H = 30; // nominal footer allowance (it's covered by the o
 const SETTINGS_RESIZE_MS = 180;
 
 function renderWatchline(counts: StateSnapshot['counts']): void {
-  const total = counts.attention + counts.working + counts.idle + counts.dead;
+  const total = counts.attention + counts.working + counts.waiting + counts.idle + counts.dead;
   if (total === 0) {
     for (const status of WATCHLINE_ORDER) {
       watchlineSegs.get(status)!.style.flexBasis = '0%';
@@ -170,6 +171,24 @@ function openCtxMenu(x: number, y: number, row: SessionRow): void {
       },
       ['Remove row'],
     ),
+    // §38 kill-agent-process: only offered for a row whose Claude host pid is
+    // known. Confirm-free but clearly labelled — force-terminates the process
+    // and removes the row.
+    row.pid != null
+      ? h(
+          'button',
+          {
+            className: 'qd-ctx-item danger',
+            type: 'button',
+            onclick: (ev: Event) => {
+              ev.stopPropagation();
+              void invoke('kill_session', { sessionId: row.id });
+              closeCtxMenu();
+            },
+          },
+          ['Kill process'],
+        )
+      : null,
   ]);
   document.body.append(menu);
   const rect = menu.getBoundingClientRect();
@@ -181,13 +200,32 @@ function openCtxMenu(x: number, y: number, row: SessionRow): void {
 }
 
 function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
-  // R-22.4: a seeded (estimated) time renders with the inferred `~` convention
-  // (e.g. `~12m 40s`) until an exact hook event arrives (R-22.2 clears it).
+  // §36 working-time timer: while 🟡 working, show a live counter of time spent
+  // on the current turn, anchored at the real work start (UserPromptSubmit) —
+  // NOT the time-in-status, so §30 reverse-gear / §21 busy-override flips don't
+  // reset it. When it stops (🟢 idle after a Stop) freeze it as "took <dur>"
+  // instead of a running idle timer. Every other state (or a seeded row with no
+  // real work-start) falls back to the R-22.4 time-in-status, with the `~`
+  // estimate prefix while inferred.
   const timePrefix = row.inferred ? '~' : '';
-  const timeEl = h('span', { className: `qd-row-time mono${row.inferred ? ' estimated' : ''}` }, [
-    timePrefix + formatDuration(row.sinceMs),
-  ]);
-  timeTicks.push({ el: timeEl, base: row.sinceMs, prefix: timePrefix });
+  let timeEl: HTMLElement;
+  if (!row.inferred && row.status === 'working' && row.workStartedMs != null) {
+    // Live counter: base = elapsed-since-work-start captured now, then ticked up
+    // by the shared 1s ticker (same mechanism as time-in-status).
+    const base = Math.max(0, Date.now() - row.workStartedMs);
+    timeEl = h('span', { className: 'qd-row-time mono' }, [formatDuration(base)]);
+    timeTicks.push({ el: timeEl, base, prefix: '' });
+  } else if (row.status === 'idle' && row.lastWorkMs != null) {
+    // Frozen total of the just-finished turn — no ticker entry (it must not run).
+    timeEl = h('span', { className: 'qd-row-time mono took' }, [
+      `took ${formatDuration(row.lastWorkMs)}`,
+    ]);
+  } else {
+    timeEl = h('span', { className: `qd-row-time mono${row.inferred ? ' estimated' : ''}` }, [
+      timePrefix + formatDuration(row.sinceMs),
+    ]);
+    timeTicks.push({ el: timeEl, base: row.sinceMs, prefix: timePrefix });
+  }
 
   // R-22.3: the tooltip shows total session age alongside the cwd when known.
   let tooltip = row.ageMs != null ? `${row.cwd}\nsession ${formatAge(row.ageMs)}` : row.cwd;
@@ -219,23 +257,24 @@ function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
     }
   }
 
-  // R-21.2 / R-23.3: a compact `⛭ N` badge while background subagents are
-  // running, with the combined subagent spend appended (`⛭ 3 · 2.1M`) when known.
+  // §37 R-37: a plain multi-agent glyph while background subagents are running —
+  // just an icon meaning "multi-agent activity", carrying no count and no spend.
+  // The old `⛭ N · {spend}` chip (R-21.2 / R-23.3) surfaced a cumulative token
+  // total that read as per-flow and confused more than it informed; the glyph
+  // shows whenever `active_subagents > 0` (the §43 WaitingWorkflow /
+  // working-with-subagents case). The per-session `ctx% · spend` line is
+  // unchanged. The exact count survives in the tooltip only.
   const subagents = row.subagents ?? 0;
-  const subagentSpend = showTokens ? row.subagentSpend : undefined;
-  const badgeText =
-    subagentSpend != null && subagentSpend !== ''
-      ? `⛭ ${subagents} · ${subagentSpend}`
-      : `⛭ ${subagents}`;
   const badge =
     subagents > 0
       ? h(
           'span',
           {
-            className: 'qd-row-subagents mono',
+            className: 'qd-row-subagents',
             title: `${subagents} background ${subagents === 1 ? 'subagent' : 'subagents'} running`,
+            'aria-label': 'multi-agent activity',
           },
-          [badgeText],
+          ['⛭'],
         )
       : null;
 
@@ -251,15 +290,21 @@ function renderSessionRow(row: SessionRow, showTokens: boolean): HTMLElement {
       },
     },
     [
-      statusDot(row.status),
-      h('div', { className: 'qd-row-main' }, [
-        h('span', { className: 'qd-row-project' }, [row.project]),
+      // §42 R-42: a roomier two-line row (Mission Control, dense-but-calm).
+      // Line 1 is the primary read: the status dot, the session name, and the
+      // right-aligned §36 working-time. Line 2 carries the subordinate detail —
+      // project/branch and the §23 `ctx% · spend` usage with the §37 multi-agent
+      // glyph, grouped hard-right and indented under the name.
+      h('div', { className: 'qd-row-line1' }, [
+        statusDot(row.status),
         renameEdit?.id === row.id ? buildRenameInput(row) : renderRowTitle(row),
-        row.branch ? h('span', { className: 'qd-row-branch mono' }, [row.branch]) : null,
-        badge,
+        timeEl,
       ]),
-      // R-23.4: the right block is a vertical stack (time on top, usage below).
-      h('div', { className: 'qd-row-right' }, [timeEl, usageEl]),
+      h('div', { className: 'qd-row-line2' }, [
+        h('span', { className: 'qd-row-project' }, [row.project]),
+        row.branch ? h('span', { className: 'qd-row-branch mono' }, [row.branch]) : null,
+        h('div', { className: 'qd-row-line2-end' }, [usageEl, badge]),
+      ]),
     ],
   );
   return el;
@@ -693,11 +738,58 @@ function renderCollapseVisibility(pinned: boolean): void {
   elCollapse.hidden = !pinned;
 }
 
-/** SPEC R-25.1/R-25.3: renders the lamp — worst-of aggregate color (mirrors
- * the tray icon, R-2.6), an attention-count badge when > 0, and a hover
- * tooltip carrying the same counts line as the popup footer. */
+const SVG_NS = 'http://www.w3.org/2000/svg';
+/** Radius of the lamp pie in the 0..100 viewBox (a hair short of the edge so
+ * the working-wedge pulse doesn't clip). */
+const LAMP_PIE_R = 48;
+
+/** §41 wedge path: the `index`-th of `total` equal slices, drawn clockwise from
+ * 12 o'clock. Each slice spans ≤180° for `total` ≥ 2, so the arc's large-arc
+ * flag is always 0 (`total === 1` is a full circle, handled separately). */
+function lampWedgePath(index: number, total: number): string {
+  const a0 = (index / total) * 2 * Math.PI - Math.PI / 2;
+  const a1 = ((index + 1) / total) * 2 * Math.PI - Math.PI / 2;
+  const x0 = (50 + LAMP_PIE_R * Math.cos(a0)).toFixed(3);
+  const y0 = (50 + LAMP_PIE_R * Math.sin(a0)).toFixed(3);
+  const x1 = (50 + LAMP_PIE_R * Math.cos(a1)).toFixed(3);
+  const y1 = (50 + LAMP_PIE_R * Math.sin(a1)).toFixed(3);
+  return `M 50 50 L ${x0} ${y0} A ${LAMP_PIE_R} ${LAMP_PIE_R} 0 0 1 ${x1} ${y1} Z`;
+}
+
+/** SPEC R-25.1/R-25.3 (§41): renders the lamp as a per-agent pie — one equal
+ * wedge per session, each filled by that session's own status color (the same
+ * status→token mapping as the row dots, incl. the §43 blue), an attention-count
+ * badge when > 0, and a hover tooltip carrying the popup footer's counts line.
+ * Zero agents fall back to a neutral gray ring. */
 function renderLamp(snap: StateSnapshot): void {
-  elLampDot.setAttribute('data-status', worstStatus(snap.counts));
+  clear(elLampPie);
+  const sessions = snap.sessions;
+  const n = sessions.length;
+  if (n === 0) {
+    const ring = document.createElementNS(SVG_NS, 'circle');
+    ring.setAttribute('cx', '50');
+    ring.setAttribute('cy', '50');
+    ring.setAttribute('r', String(LAMP_PIE_R));
+    ring.setAttribute('class', 'qd-lamp-ring');
+    elLampPie.append(ring);
+  } else if (n === 1) {
+    // A single agent fills the whole disc — a wedge path would degenerate.
+    const disc = document.createElementNS(SVG_NS, 'circle');
+    disc.setAttribute('cx', '50');
+    disc.setAttribute('cy', '50');
+    disc.setAttribute('r', String(LAMP_PIE_R));
+    disc.setAttribute('class', 'qd-lamp-wedge');
+    disc.setAttribute('data-status', sessions[0].status);
+    elLampPie.append(disc);
+  } else {
+    sessions.forEach((session, i) => {
+      const wedge = document.createElementNS(SVG_NS, 'path');
+      wedge.setAttribute('d', lampWedgePath(i, n));
+      wedge.setAttribute('class', 'qd-lamp-wedge');
+      wedge.setAttribute('data-status', session.status);
+      elLampPie.append(wedge);
+    });
+  }
   const attention = snap.counts.attention;
   elLampBadge.hidden = attention <= 0;
   elLampBadge.textContent = attention > 0 ? String(attention) : '';

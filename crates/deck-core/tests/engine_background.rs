@@ -187,6 +187,199 @@ fn busy_override_ages_out_on_tick_without_a_fresh_registry_poll() {
     );
 }
 
+// --- §44 / R-44 registry-driven demote (ESC-interrupt) ---------------------
+
+fn idle_entry(id: &str, updated_at_ms: u64) -> RegistryEntry {
+    RegistryEntry {
+        session_id: id.to_string(),
+        status: Some("idle".to_string()),
+        updated_at_ms: Some(updated_at_ms),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn registry_idle_demotes_esc_wedged_working() {
+    // R-44: an ESC-interrupt fires no Stop hook, so the hook status wedges on
+    // `working` and the deck stays stuck 🟡. Claude writes the registry status to
+    // idle; a fresh idle poll (updatedAt after the last hook event) demotes the
+    // row to idle.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start("s", "/p", T0));
+    store.on_event(&prompt("s", "go", T0 + 10)); // hook working, last activity T0+10
+    // Registry was busy while the turn genuinely ran.
+    clock.set(T0 + 1_000);
+    store.apply_registry(&[busy_entry("s", T0 + 1_000)]);
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+
+    // ESC: no Stop hook fires; Claude writes the registry idle (fresh).
+    clock.set(T0 + 2_000);
+    store.apply_registry(&[idle_entry("s", T0 + 2_000)]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Idle),
+        "fresh registry idle demotes the ESC-stuck working row (R-44)"
+    );
+    // Tray follows the demoted status.
+    assert_eq!(store.worst_status(), Some(Status::Idle));
+}
+
+#[test]
+fn registry_waiting_status_also_demotes() {
+    // R-44: the `waiting` registry status string is handled the same as `idle`.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start("s", "/p", T0));
+    store.on_event(&prompt("s", "go", T0 + 10));
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+
+    clock.set(T0 + 2_000);
+    let mut e = idle_entry("s", T0 + 2_000);
+    e.status = Some("waiting".to_string());
+    store.apply_registry(&[e]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Idle),
+        "registry `waiting` demotes just like `idle` (R-44)"
+    );
+}
+
+#[test]
+fn busy_registry_does_not_demote_genuine_working() {
+    // R-44: a genuinely-busy registry must NEVER demote — the guard is the
+    // explicit idle/waiting signal, and busy never sets it. Repeated busy polls
+    // and a plain tick all leave the row working.
+    let procs = FakeProcessTable::new().with(1, "node");
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&prompt("s", "go", T0 + 10));
+    clock.set(T0 + 1_000);
+    store.apply_registry(&[busy_entry("s", T0 + 1_000)]);
+    clock.set(T0 + 2_000);
+    store.apply_registry(&[busy_entry("s", T0 + 2_000)]);
+    clock.set(T0 + 3_000);
+    store.tick(&procs, |_| Some(T0 + 3_000));
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Working),
+        "a busy registry never demotes"
+    );
+}
+
+#[test]
+fn fresher_hook_prompt_is_not_clobbered_by_a_stale_idle_registry() {
+    // R-44 "no fresher hook activity": a registry idle whose updatedAt PREDATES
+    // the last hook event must not demote — a new UserPromptSubmit that re-armed
+    // `working` after the registry went idle wins.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start("s", "/p", T0)); // hook idle
+    // Registry reports idle at T0+100 (harmless: hook is already idle).
+    clock.set(T0 + 100);
+    store.apply_registry(&[idle_entry("s", T0 + 100)]);
+    // A genuine new turn starts AFTER that registry write.
+    store.on_event(&prompt("s", "go", T0 + 200)); // hook working, last activity T0+200
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+    // The registry file hasn't been rewritten (same stale updatedAt) — a re-poll
+    // must NOT demote the fresher working turn.
+    clock.set(T0 + 300);
+    store.apply_registry(&[idle_entry("s", T0 + 100)]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Working),
+        "a registry idle older than the last hook event does not demote"
+    );
+}
+
+#[test]
+fn stale_registry_idle_does_not_demote() {
+    // R-44: the demote only fires for a FRESH updatedAt (< 30 s), symmetric with
+    // the busy-override freshness. A stale idle poll is ignored.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start("s", "/p", T0));
+    store.on_event(&prompt("s", "go", T0 + 10));
+    // updatedAt is far in the past relative to now → stale.
+    clock.set(T0 + 5 * REGISTRY_BUSY_FRESH_MS);
+    store.apply_registry(&[idle_entry("s", T0)]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Working),
+        "a stale registry idle is not authoritative enough to demote"
+    );
+}
+
+#[test]
+fn reverse_gear_recovery_promoted_row_is_owned_by_transcript_not_registry() {
+    // R-44 interplay with §30: a row promoted to `working` by transcript recovery
+    // (reverse gear) is owned by the transcript-quiescence demote, NOT §44 — a
+    // registry idle poll must not fight it while the transcript is still
+    // advancing. §30 demotes it on the first tick with no advance.
+    let procs = FakeProcessTable::new().with(1, "node");
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&stop("s", T0 + 10)); // hook idle at T0+10
+    // Transcript advances ≥2 s past the idle anchor → §30 promotes to working.
+    clock.set(T0 + 20_000);
+    store.poll_recovery(|_| Some(T0 + 13_000));
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+
+    // A fresh registry idle poll must NOT demote the recovery-promoted row.
+    store.apply_registry(&[idle_entry("s", T0 + 20_000)]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Working),
+        "§44 does not demote a §30 recovery-promoted row (transcript owns it)"
+    );
+
+    // §30 still owns the demote: a tick with no transcript advance drops it.
+    clock.set(T0 + 30_000);
+    store.tick(&procs, |_| Some(T0 + 13_000));
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Idle),
+        "§30 transcript-quiescence demote still fires"
+    );
+}
+
+#[test]
+fn registry_demote_is_re_evaluated_on_the_tick() {
+    // R-44: the demote is checked on the plain tick too (poll_busy_override), not
+    // only on the registry poll — so it stays consistent as time advances and the
+    // §30 recovery path (which shares the tick) does not re-promote a legitimately
+    // demoted, quiescent-transcript row.
+    let procs = FakeProcessTable::new().with(1, "node");
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&prompt("s", "go", T0 + 10)); // working, last activity T0+10
+    clock.set(T0 + 1_000);
+    store.apply_registry(&[idle_entry("s", T0 + 1_000)]); // demotes to idle
+    assert_eq!(store.status_of("s"), Some(Status::Idle));
+    // A subsequent tick keeps it idle (transcript held quiescent so §30 doesn't
+    // re-promote, and the registry-demote re-check is a no-op on an idle hook).
+    clock.set(T0 + 2_000);
+    store.tick(&procs, |_| Some(T0 + 10));
+    assert_eq!(store.status_of("s"), Some(Status::Idle));
+}
+
 // --- R-21.3 finished toast despite override --------------------------------
 
 #[test]
@@ -291,17 +484,67 @@ fn lost_subagent_stop_is_self_corrected_by_registry_non_busy() {
 }
 
 #[test]
-fn fresh_stop_with_stale_registry_resets_the_badge() {
-    // R-21.2: the session settling to idle from a fresh Stop (no live override)
-    // zeroes the counter immediately, without waiting for a registry poll.
+fn stop_with_open_subagent_shows_waiting_workflow_not_zeroed() {
+    // §43 (the bug fix): a fresh Stop (parent turn ended → hook idle) while a
+    // background subagent is still open must NOT zero the counter — the row shows
+    // blue `WaitingWorkflow`, not green idle (the §21 regression where the
+    // multi-agent indicator vanished the instant the parent hit Stop). A real
+    // `SubagentStop` balance back to 0 then clears it and drops to idle.
     let (mut store, _c) = store_at(T0);
     store.on_event(&session_start("s", "/p", T0));
     store.on_event(&prompt("s", "go", T0 + 10));
     store.on_event(&subagent("s", HookEvent::SubagentStart, T0 + 20));
     assert_eq!(store.subagents_of("s"), Some(1));
+
     store.on_event(&stop("s", T0 + 30));
-    assert_eq!(store.status_of("s"), Some(Status::Idle));
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::WaitingWorkflow),
+        "hook idle + open subagent => blue waiting-workflow, not idle"
+    );
+    assert_eq!(
+        store.subagents_of("s"),
+        Some(1),
+        "counter is NOT zeroed by a clean Stop while a subagent is still open"
+    );
+    // The blue row aggregates as WaitingWorkflow on the tray worst-of too.
+    assert_eq!(store.worst_status(), Some(Status::WaitingWorkflow));
+
+    // A genuine SubagentStop balance returning to 0 clears it → back to idle.
+    store.on_event(&subagent("s", HookEvent::SubagentStop, T0 + 40));
     assert_eq!(store.subagents_of("s"), Some(0));
+    assert_eq!(store.status_of("s"), Some(Status::Idle));
+}
+
+#[test]
+fn dead_clears_the_subagent_badge_even_with_open_subagents() {
+    // §43: a genuine leak still clears — liveness `dead` (the process is gone)
+    // zeroes the counter and the blue WaitingWorkflow with it, unlike a clean Stop.
+    let (mut store, clock) = store_at(T0);
+    // PID-backed row so liveness can find the process gone.
+    let procs = FakeProcessTable::new(); // pid 1 absent => dead
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&prompt("s", "go", T0 + 10));
+    store.on_event(&subagent("s", HookEvent::SubagentStart, T0 + 20));
+    store.on_event(&stop("s", T0 + 30));
+    assert_eq!(store.status_of("s"), Some(Status::WaitingWorkflow));
+    assert_eq!(store.subagents_of("s"), Some(1));
+
+    clock.set(T0 + 40);
+    store.poll_liveness(&procs, |_| None);
+    assert_eq!(store.status_of("s"), Some(Status::Dead));
+    assert_eq!(
+        store.subagents_of("s"),
+        Some(0),
+        "dead reaps the badge (genuine leak), unlike a clean Stop"
+    );
 }
 
 #[test]

@@ -50,13 +50,21 @@ export function formatCountdown(ms: number): string {
 const FOOTER_LABELS: Record<SessionStatus, string> = {
   attention: 'needs you',
   working: 'working',
+  waiting: 'waiting',
   idle: 'idle',
   dead: 'dead',
 };
 
-/** R-7.3 footer copy, e.g. "1 needs you · 2 working · 1 idle". Omits zero groups. */
-export function footerText(counts: { attention: number; working: number; idle: number; dead: number }): string {
-  const order: SessionStatus[] = ['attention', 'working', 'idle', 'dead'];
+/** R-7.3 footer copy, e.g. "1 needs you · 2 working · 1 waiting · 1 idle". §43
+ * slots `waiting` between working and idle. Omits zero groups. */
+export function footerText(counts: {
+  attention: number;
+  working: number;
+  waiting: number;
+  idle: number;
+  dead: number;
+}): string {
+  const order: SessionStatus[] = ['attention', 'working', 'waiting', 'idle', 'dead'];
   const parts = order
     .filter((status) => counts[status] > 0)
     .map((status) => `${counts[status]} ${FOOTER_LABELS[status]}`);
@@ -72,9 +80,15 @@ export function footerText(counts: { attention: number; working: number; idle: n
  * "frontend is dumb" (R-3.4), which is about business logic, not re-deriving
  * a max() over data already on the wire.
  */
-export function worstStatus(counts: { attention: number; working: number; idle: number }): SessionStatus | 'gray' {
+export function worstStatus(counts: {
+  attention: number;
+  working: number;
+  waiting: number;
+  idle: number;
+}): SessionStatus | 'gray' {
   if (counts.attention > 0) return 'attention';
   if (counts.working > 0) return 'working';
+  if (counts.waiting > 0) return 'waiting';
   if (counts.idle > 0) return 'idle';
   return 'gray';
 }

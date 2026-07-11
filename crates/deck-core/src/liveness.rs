@@ -12,6 +12,18 @@ use crate::traits::ProcessTable;
 /// for longer than this (R-6.2).
 pub const LIVENESS_STALE_MS: u64 = 6 * 60 * 60 * 1000;
 
+/// §38 lingering-row tighten: a PID-less row whose ONLY activity signal is a
+/// live-registry `updatedAt` is declared `dead` once that is stale beyond this
+/// (much shorter than [`LIVENESS_STALE_MS`]). The registry is re-polled every
+/// 10 s and a live session's `~/.claude/sessions/<id>.json` is heartbeated far
+/// more often than 15 min, so a registry file untouched this long is an
+/// abandoned/undeleted ghost — Claude Code does not always remove it on exit,
+/// and the old 6 h transcript grace kept such a pid-less ghost row on the deck
+/// for hours. A row with a live pid (the common case) is unaffected — it is
+/// verified against the process table, not this window — as is a row whose
+/// transcript is genuinely fresh (that still honors the 6 h R-6.2 grace).
+pub const REGISTRY_STALE_MS: u64 = 15 * 60 * 1000;
+
 /// The inputs a liveness check needs about one session.
 #[derive(Debug, Clone, Copy)]
 pub struct LivenessInput {
@@ -31,9 +43,9 @@ pub struct LivenessInput {
 ///
 /// * With a PID (R-6.1): dead iff no live process has that PID, or its name no
 ///   longer matches `claude|node|bun` (PID reuse guard).
-/// * Without a PID (R-6.2 / R-15.3): dead iff the freshest activity signal —
-///   the transcript mtime and/or the live-registry `updatedAt` — is stale > 6 h,
-///   or no signal exists at all.
+/// * Without a PID (R-6.2 / R-15.3 / §38): dead iff neither activity signal is
+///   fresh — the transcript mtime within the 6 h R-6.2 grace, OR the live-registry
+///   `updatedAt` within the much shorter [`REGISTRY_STALE_MS`] ghost-file window.
 #[must_use]
 pub fn is_dead(input: &LivenessInput, procs: &impl ProcessTable, now_ms: u64) -> bool {
     match input.claude_pid {
@@ -42,22 +54,23 @@ pub fn is_dead(input: &LivenessInput, procs: &impl ProcessTable, now_ms: u64) ->
             None => true,
         },
         None => {
-            // R-6.2 / R-15.3: a PID-less session stays alive while *some*
-            // activity signal is fresh. A registry-discovered row (R-15.3) may
-            // have no transcript yet — its registry `updatedAt` is the liveness
-            // anchor (the registry is re-polled every 10 s, and once the entry
-            // vanishes the shell clears this back to `None`, so the row then
-            // falls through to dead). Take the most recent of the two signals;
-            // dead iff that is stale > 6 h, or neither exists.
-            let freshest = input
+            // R-6.2 / R-15.3 / §38: a PID-less session stays alive while *some*
+            // activity signal is fresh, but the transcript and the registry file
+            // are held to DIFFERENT windows. A transcript is only touched on real
+            // model activity, so its untouched-grace stays the generous 6 h
+            // (R-6.2). A registry file, by contrast, is heartbeated every few
+            // seconds while the session lives (re-polled every 10 s, and once the
+            // entry vanishes the shell clears this back to `None`), so a registry
+            // `updatedAt` stale past the short [`REGISTRY_STALE_MS`] window is an
+            // abandoned/undeleted ghost file — not activity — and no longer keeps
+            // the row alive (§38 lingering-row fix). Dead iff neither is fresh.
+            let transcript_fresh = input
                 .transcript_mtime_ms
-                .into_iter()
-                .chain(input.registry_updated_at_ms)
-                .max();
-            match freshest {
-                Some(activity) => now_ms.saturating_sub(activity) > LIVENESS_STALE_MS,
-                None => true,
-            }
+                .is_some_and(|m| now_ms.saturating_sub(m) <= LIVENESS_STALE_MS);
+            let registry_fresh = input
+                .registry_updated_at_ms
+                .is_some_and(|m| now_ms.saturating_sub(m) <= REGISTRY_STALE_MS);
+            !(transcript_fresh || registry_fresh)
         }
     }
 }

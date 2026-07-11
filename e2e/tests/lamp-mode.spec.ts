@@ -28,13 +28,18 @@ test.describe('lamp mode (R-25.1/R-25.2)', () => {
     await expect(page.locator('#qd-footer')).toBeHidden();
   });
 
-  test('shows the worst-of aggregate color and the attention-count badge (R-25.1)', async ({ page }) => {
-    // Fixture: 1 attention + 1 working session, pinned + already collapsed.
+  test('§41: renders one pie wedge per agent, each filled by that agent status, plus the attention badge (R-25.1)', async ({ page }) => {
+    // Fixture: 2 sessions (s1 attention, s2 working), pinned + already collapsed.
     await gotoPopup(page, 'lamp');
 
     await expect(page.locator('#app')).toHaveClass(/qd-app-lamp/);
-    const dot = page.locator('#qd-lamp-dot');
-    await expect(dot).toHaveAttribute('data-status', 'attention');
+    const wedges = page.locator('#qd-lamp-pie .qd-lamp-wedge');
+    await expect(wedges).toHaveCount(2);
+    // Wedges follow the engine-sorted session order (attention before working).
+    await expect(wedges.nth(0)).toHaveAttribute('data-status', 'attention');
+    await expect(wedges.nth(1)).toHaveAttribute('data-status', 'working');
+    // No neutral ring while agents exist.
+    await expect(page.locator('#qd-lamp-pie .qd-lamp-ring')).toHaveCount(0);
 
     const badge = page.locator('#qd-lamp-badge');
     await expect(badge).toBeVisible();
@@ -44,12 +49,45 @@ test.describe('lamp mode (R-25.1/R-25.2)', () => {
     await expect(page.locator('#qd-lamp')).toHaveAttribute('title', /needs you/);
   });
 
-  test('badge is hidden when there are zero attention sessions', async ({ page }) => {
-    // `token-stats` is all working/idle (no attention) — pin + collapse it.
-    await gotoPopup(page, 'token-stats');
+  test('§41: per-status fills resolve to the status tokens in both dark and light', async ({ page }) => {
+    // token-stats = 3 sessions (working, idle, working), no attention.
+    for (const [scheme, working, idle] of [
+      ['dark', 'rgb(210, 153, 34)', 'rgb(63, 185, 80)'], // #d29922 / #3fb950
+      ['light', 'rgb(154, 103, 0)', 'rgb(26, 127, 55)'], // #9a6700 / #1a7f37
+    ] as const) {
+      await page.emulateMedia({ colorScheme: scheme });
+      await gotoPopup(page, 'token-stats');
+      await page.locator('#qd-pin').click();
+      await page.locator('#qd-collapse').click();
+
+      const wedges = page.locator('#qd-lamp-pie .qd-lamp-wedge');
+      await expect(wedges).toHaveCount(3);
+      // Two working sessions + one idle. Select wedges by status rather than
+      // array index: the engine sort (status priority, then most-recent-active)
+      // interleaves the two working rows around the idle one, so the fixed
+      // positions aren't working/idle/working.
+      const workingWedge = page.locator('#qd-lamp-pie .qd-lamp-wedge[data-status="working"]').first();
+      const idleWedge = page.locator('#qd-lamp-pie .qd-lamp-wedge[data-status="idle"]');
+      await expect(idleWedge).toHaveCount(1);
+      const fillWorking = await workingWedge.evaluate((el) => getComputedStyle(el).fill);
+      const fillIdle = await idleWedge.evaluate((el) => getComputedStyle(el).fill);
+      expect(fillWorking).toBe(working);
+      expect(fillIdle).toBe(idle);
+
+      // No attention session here → badge hidden.
+      await expect(page.locator('#qd-lamp-badge')).toBeHidden();
+    }
+  });
+
+  test('§41: zero agents render a neutral ring, no wedges (R-25.1)', async ({ page }) => {
+    // `empty` has no sessions — pin + collapse into the lamp.
+    await gotoPopup(page, 'empty');
     await page.locator('#qd-pin').click();
     await page.locator('#qd-collapse').click();
-    await expect(page.locator('#qd-lamp-dot')).toHaveAttribute('data-status', 'working');
+
+    await expect(page.locator('#app')).toHaveClass(/qd-app-lamp/);
+    await expect(page.locator('#qd-lamp-pie .qd-lamp-ring')).toHaveCount(1);
+    await expect(page.locator('#qd-lamp-pie .qd-lamp-wedge')).toHaveCount(0);
     await expect(page.locator('#qd-lamp-badge')).toBeHidden();
   });
 
@@ -105,19 +143,19 @@ test.describe('lamp mode (R-25.1/R-25.2)', () => {
     await expect(page.locator('#qd-lamp')).toBeVisible();
   });
 
-  test('reduced motion disables the working lamp pulse (R-25.5)', async ({ page }) => {
+  test('reduced motion disables the working lamp-wedge pulse (R-25.5)', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await gotoPopup(page, 'token-stats');
     await page.locator('#qd-pin').click();
     await page.locator('#qd-collapse').click();
 
-    const dot = page.locator('#qd-lamp-dot');
-    await expect(dot).toHaveAttribute('data-status', 'working');
+    const wedge = page.locator('#qd-lamp-pie .qd-lamp-wedge[data-status="working"]').first();
+    await expect(wedge).toHaveCount(1);
     // Chromium reports the computed value in whichever unit it normalizes to
     // (observed: seconds, e.g. "1e-06s"); parse the leading number rather than
     // matching the exact string — the global reduced-motion rule collapses it
     // to 0.001ms either way, so both "0.001ms" and "1e-06s" parse well under 1.
-    const duration = await dot.evaluate((el) => getComputedStyle(el).animationDuration);
+    const duration = await wedge.evaluate((el) => getComputedStyle(el).animationDuration);
     expect(parseFloat(duration)).toBeLessThan(0.01);
   });
 });

@@ -1,5 +1,6 @@
-//! Tray icon: builds the tray, swaps the five status icon variants at runtime
-//! (worst-of aggregate, SPEC R-2.6), and routes left-click to the popup.
+//! Tray icon: builds the tray, swaps the status icon variants at runtime
+//! (worst-of aggregate, SPEC R-2.6 + §43 blue waiting-workflow), and routes
+//! left-click to the popup.
 //!
 //! Filled in by T3. (T0 keeps a minimal inline tray in `lib.rs`; T7 swaps that
 //! placeholder for [`build`] + [`update`] during composition.)
@@ -18,8 +19,8 @@ pub const TRAY_ID: &str = "quarterdeck-tray";
 /// Menu id of the tray "Quit Quarterdeck" item.
 const QUIT_MENU_ID: &str = "quarterdeck-quit";
 
-/// Worst-of aggregate tray status (SPEC §1, R-2.6): red > yellow > green >
-/// gray. Gray also covers "no sessions" and "sessions exist but all are
+/// Worst-of aggregate tray status (SPEC §1, R-2.6 + §43): red > yellow > blue >
+/// green > gray. Gray also covers "no sessions" and "sessions exist but all are
 /// dead" — both read as "nothing needs you right now".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayStatus {
@@ -27,6 +28,9 @@ pub enum TrayStatus {
     Attention,
     /// At least one session is executing a turn (yellow).
     Working,
+    /// §43: at least one session's parent turn ended but background
+    /// subagents/workflows are still running (blue).
+    Waiting,
     /// At least one session is idle, awaiting instructions (green).
     Idle,
     /// No sessions, or only dead ones (gray).
@@ -34,12 +38,14 @@ pub enum TrayStatus {
 }
 
 impl TrayStatus {
-    /// Computes the aggregate status from footer counts (SPEC R-2.6).
+    /// Computes the aggregate status from footer counts (SPEC R-2.6 + §43).
     pub fn worst_of(counts: &Counts) -> Self {
         if counts.attention > 0 {
             Self::Attention
         } else if counts.working > 0 {
             Self::Working
+        } else if counts.waiting > 0 {
+            Self::Waiting
         } else if counts.idle > 0 {
             Self::Idle
         } else {
@@ -52,6 +58,7 @@ impl TrayStatus {
         match self {
             Self::Attention => "attention",
             Self::Working => "working",
+            Self::Waiting => "waiting",
             Self::Idle => "idle",
             Self::Gray => "gray",
         }
@@ -63,6 +70,7 @@ impl TrayStatus {
         match self {
             Self::Attention => tauri::include_image!("../assets/tray/red-32.png"),
             Self::Working => tauri::include_image!("../assets/tray/yellow-32.png"),
+            Self::Waiting => tauri::include_image!("../assets/tray/blue-32.png"),
             Self::Idle => tauri::include_image!("../assets/tray/green-32.png"),
             Self::Gray => tauri::include_image!("../assets/tray/gray-32.png"),
         }
@@ -151,6 +159,7 @@ fn record_tray_state_for_tests(status: TrayStatus, counts: &Counts) {
         "counts": {
             "attention": counts.attention,
             "working": counts.working,
+            "waiting": counts.waiting,
             "idle": counts.idle,
             "dead": counts.dead,
         },
@@ -169,7 +178,8 @@ fn record_tray_state_for_tests(status: TrayStatus, counts: &Counts) {
 /// "Quarterdeck — 1 needs you · 2 working · 1 idle", or "Quarterdeck — no
 /// sessions" when the fleet is empty.
 pub fn tooltip_for(counts: &Counts) -> String {
-    let total = counts.attention + counts.working + counts.idle + counts.dead;
+    let total =
+        counts.attention + counts.working + counts.waiting + counts.idle + counts.dead;
     if total == 0 {
         return "Quarterdeck — no sessions".to_string();
     }
@@ -180,6 +190,9 @@ pub fn tooltip_for(counts: &Counts) -> String {
     }
     if counts.working > 0 {
         parts.push(format!("{} working", counts.working));
+    }
+    if counts.waiting > 0 {
+        parts.push(format!("{} waiting", counts.waiting));
     }
     if counts.idle > 0 {
         parts.push(format!("{} idle", counts.idle));
@@ -199,6 +212,7 @@ mod tests {
         let counts = Counts {
             attention: 1,
             working: 5,
+            waiting: 5,
             idle: 5,
             dead: 5,
         };
@@ -206,10 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn worst_of_prefers_working_over_idle_and_dead() {
+    fn worst_of_prefers_working_over_waiting_idle_and_dead() {
         let counts = Counts {
             attention: 0,
             working: 1,
+            waiting: 5,
             idle: 5,
             dead: 5,
         };
@@ -217,10 +232,24 @@ mod tests {
     }
 
     #[test]
+    fn worst_of_prefers_waiting_over_idle_and_dead() {
+        // §43: blue waiting-workflow outranks green idle in the tray worst-of.
+        let counts = Counts {
+            attention: 0,
+            working: 0,
+            waiting: 1,
+            idle: 5,
+            dead: 5,
+        };
+        assert_eq!(TrayStatus::worst_of(&counts), TrayStatus::Waiting);
+    }
+
+    #[test]
     fn worst_of_prefers_idle_over_dead() {
         let counts = Counts {
             attention: 0,
             working: 0,
+            waiting: 0,
             idle: 1,
             dead: 5,
         };
@@ -244,12 +273,13 @@ mod tests {
         let counts = Counts {
             attention: 1,
             working: 2,
+            waiting: 1,
             idle: 1,
             dead: 0,
         };
         assert_eq!(
             tooltip_for(&counts),
-            "Quarterdeck — 1 needs you · 2 working · 1 idle"
+            "Quarterdeck — 1 needs you · 2 working · 1 waiting · 1 idle"
         );
     }
 
@@ -275,6 +305,7 @@ mod tests {
         for status in [
             TrayStatus::Attention,
             TrayStatus::Working,
+            TrayStatus::Waiting,
             TrayStatus::Idle,
             TrayStatus::Gray,
         ] {

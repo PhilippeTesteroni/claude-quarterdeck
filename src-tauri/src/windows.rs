@@ -476,6 +476,11 @@ pub fn set_popup_mode(app: &AppHandle, mode: PopupMode) -> Result<(), String> {
         // never send.
         popup.set_size(min).map_err(|e| e.to_string())?;
     }
+    // §39: keep the window on-screen across the transition. The lamp<->list
+    // switch changes the size band from a fixed top-left; the list's full
+    // height lands via the next `resize_popup_to_content` (which re-clamps
+    // too), but clamp here so the lamp square itself never straddles an edge.
+    clamp_popup_onto_screen(&popup)?;
     Ok(())
 }
 
@@ -489,6 +494,10 @@ pub fn restore_popup_position(app: &AppHandle, pos: crate::settings::PopupPos) {
     if let Ok(popup) = popup_window(app) {
         let _ = popup.set_position(LogicalPosition::new(pos.x, pos.y));
         set_popup_user_moved(true);
+        // §39: a position persisted under a different monitor arrangement (a
+        // display unplugged / resolution changed since the last quit) may now
+        // be off-screen — clamp it back onto the current work area.
+        let _ = clamp_popup_onto_screen(&popup);
     }
 }
 
@@ -562,6 +571,13 @@ pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), S
         if let Some(rect) = last_tray_rect() {
             let _ = anchor_near_tray(&popup, rect);
         }
+    } else {
+        // §39: growing in place (pinned or user-moved) keeps the top-left
+        // fixed — `anchor_near_tray` isn't producing a fresh on-screen
+        // position here — so a window that grew near a screen edge (a lamp
+        // expanding back to the full list, R-25.2) can spill off the work
+        // area. Re-clamp its top-left back on-screen.
+        clamp_popup_onto_screen(&popup)?;
     }
     Ok(())
 }
@@ -623,6 +639,70 @@ fn compute_anchor_position(
     };
 
     (x, y)
+}
+
+/// Pure geometry (SPEC §39): clamp a window's top-left so the whole window
+/// stays inside the monitor work area. Mirrors the horizontal/vertical clamp in
+/// [`compute_anchor_position`] but for an arbitrary window rect — used when a
+/// mode restore / resize grows the popup from a fixed top-left (a lamp collapsed
+/// near a screen edge expanding back to the full list, R-25.2), which would
+/// otherwise push the bottom/right edge off-screen. The `.max(work_*)` floors
+/// keep the top-left on-screen even for a window larger than the work area
+/// (bottom/right may still overflow, but the origin stays reachable). All
+/// physical pixels; kept side-effect free so it's unit-testable without a live
+/// window.
+fn clamp_rect_onto_work_area(
+    pos: (i32, i32),
+    size: (u32, u32),
+    work_area: ((i32, i32), (u32, u32)),
+) -> (i32, i32) {
+    let (x, y) = pos;
+    let (w, h) = size;
+    let ((work_x, work_y), (work_w, work_h)) = work_area;
+
+    let max_x = (work_x + work_w as i32 - w as i32).max(work_x);
+    let max_y = (work_y + work_h as i32 - h as i32).max(work_y);
+    (x.clamp(work_x, max_x), y.clamp(work_y, max_y))
+}
+
+/// SPEC §39: keep the popup fully on-screen after a mode restore / `set_size` /
+/// `set_popup_mode` transition. `set_size` and the lamp<->list mode switch grow
+/// the window from its fixed top-left, so a lamp collapsed near a screen edge
+/// (R-25.2) would restore partly/fully off the work area when expanded back to
+/// the list; this re-clamps the top-left back on. Best-effort: a missing monitor
+/// (e.g. a headless CI runner) leaves the window where it is rather than failing
+/// the transition, matching [`anchor_near_tray`]'s fallback.
+fn clamp_popup_onto_screen(popup: &WebviewWindow) -> Result<(), String> {
+    let monitor = popup
+        .current_monitor()
+        .map_err(|err| err.to_string())?
+        .or(popup.primary_monitor().map_err(|err| err.to_string())?);
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+
+    let pos = popup.outer_position().map_err(|err| err.to_string())?;
+    let size = popup.outer_size().map_err(|err| err.to_string())?;
+    let work = monitor.work_area();
+
+    let (x, y) = clamp_rect_onto_work_area(
+        (pos.x, pos.y),
+        (size.width, size.height),
+        (
+            (work.position.x, work.position.y),
+            (work.size.width, work.size.height),
+        ),
+    );
+
+    if (x, y) != (pos.x, pos.y) {
+        // R-14.1/R-14.3: this reposition is ours, not a user drag — mark it so
+        // the popup's `Moved` handler doesn't disable tray-following.
+        note_programmatic_move();
+        popup
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 fn anchor_near_tray(popup: &WebviewWindow, tray_rect: Rect) -> Result<(), String> {
@@ -784,6 +864,55 @@ mod tests {
         let tray_pos = (2, 1020);
         let (x, _) = compute_anchor_position(tray_pos, (16, 16), POPUP_SIZE, WORK_AREA);
         assert!(x >= 0);
+    }
+
+    #[test]
+    fn clamp_leaves_an_already_on_screen_window_untouched() {
+        // SPEC §39: a window comfortably inside the work area is not nudged.
+        let pos = (200, 150);
+        assert_eq!(
+            clamp_rect_onto_work_area(pos, POPUP_SIZE, WORK_AREA),
+            pos,
+            "an on-screen rect must be returned unchanged"
+        );
+    }
+
+    #[test]
+    fn clamp_pulls_a_bottom_right_overflow_back_on_screen() {
+        // SPEC §39: the exact regression — a lamp pinned near the bottom-right
+        // corner expands back to the full 360x460 list, which from that
+        // top-left would spill off the right and bottom edges. Clamp must pull
+        // the top-left up/left so the whole window fits.
+        let pos = (1900, 1030); // a ~56px lamp's origin, hard against the corner
+        let (x, y) = clamp_rect_onto_work_area(pos, POPUP_SIZE, WORK_AREA);
+        assert!(
+            x + POPUP_SIZE.0 as i32 <= WORK_AREA.1 .0 as i32,
+            "right edge must be on-screen"
+        );
+        assert!(
+            y + POPUP_SIZE.1 as i32 <= WORK_AREA.1 .1 as i32,
+            "bottom edge must be on-screen"
+        );
+        assert_eq!(x, 1920 - 360, "flush to the right work-area edge");
+        assert_eq!(y, 1040 - 460, "flush to the bottom work-area edge");
+    }
+
+    #[test]
+    fn clamp_pushes_a_top_left_overflow_back_on_screen() {
+        // SPEC §39: a negative origin (off the top-left, e.g. after a monitor
+        // arrangement change) snaps back to the work-area corner.
+        let (x, y) = clamp_rect_onto_work_area((-40, -30), POPUP_SIZE, WORK_AREA);
+        assert_eq!((x, y), (0, 0), "negative origin clamps to the work-area top-left");
+    }
+
+    #[test]
+    fn clamp_keeps_the_origin_reachable_for_an_oversized_window() {
+        // SPEC §39: a window taller/wider than the work area can't fit fully;
+        // the `.max(work_*)` floor still keeps the top-left on-screen (origin
+        // reachable) rather than clamping it to a negative value.
+        let oversized = (WORK_AREA.1 .0 + 200, WORK_AREA.1 .1 + 200);
+        let (x, y) = clamp_rect_onto_work_area((500, 500), oversized, WORK_AREA);
+        assert_eq!((x, y), (0, 0), "oversized window pins its origin to the work-area corner");
     }
 
     #[test]

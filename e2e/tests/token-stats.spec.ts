@@ -6,8 +6,8 @@ import { gotoPopup, row } from '../helpers/popup';
 // `crates/deck-core/src/usage.rs`); against the mocked IPC this proves the UI
 // RENDERS whatever the shell computed: the `ctx {n}% · {spend}` second line
 // (R-23.4), amber/red context-health coloring + the "nearly full" tooltip, the
-// "≥" lower-bound spend (R-23.1), the `⛭ N · {spend}` subagent-group badge
-// (R-23.3), and the `showTokenStats` toggle hiding all of it (R-23.6).
+// "≥" lower-bound spend (R-23.1), and the `showTokenStats` toggle hiding all of
+// it (R-23.6). §37 retired the `⛭ N · {spend}` subagent chip for a plain glyph.
 test.describe('token stats (§23)', () => {
   test('row shows the ctx% · spend second line (R-23.4)', async ({ page }) => {
     await gotoPopup(page, 'token-stats');
@@ -19,9 +19,12 @@ test.describe('token stats (§23)', () => {
     await expect(row(page, 'quarterdeck').locator('.qd-row-ctx')).not.toHaveClass(/warn|crit/);
   });
 
-  test('subagent badge carries the group spend (R-23.3)', async ({ page }) => {
+  test('multi-agent glyph carries no count or spend text (§37)', async ({ page }) => {
     await gotoPopup(page, 'token-stats');
-    await expect(row(page, 'quarterdeck').locator('.qd-row-subagents')).toHaveText('⛭ 3 · 2.1M');
+    const badge = row(page, 'quarterdeck').locator('.qd-row-subagents');
+    await expect(badge).toHaveText('⛭');
+    // §37: the old `⛭ N · {spend}` chip is gone — no number/token text at all.
+    await expect(badge).not.toContainText(/\d/);
   });
 
   test('context ≥90% is red with a nearly-full tooltip (R-23.4)', async ({ page }) => {
@@ -44,11 +47,11 @@ test.describe('token stats (§23)', () => {
 
   test('showTokenStats off hides every usage line (R-23.6)', async ({ page }) => {
     await gotoPopup(page, 'token-stats-off');
-    // The row still renders (with its ⛭ badge), but no usage second line.
+    // The row still renders (with its ⛭ glyph), but no usage second line.
     await expect(row(page, 'quarterdeck')).toBeVisible();
     await expect(page.locator('.qd-row-usage')).toHaveCount(0);
-    // The subagent badge shows the count only, without the spend suffix.
-    await expect(row(page, 'quarterdeck').locator('.qd-row-subagents')).toHaveText('⛭ 3');
+    // The multi-agent glyph is unaffected by the token toggle — still just the icon.
+    await expect(row(page, 'quarterdeck').locator('.qd-row-subagents')).toHaveText('⛭');
   });
 
   test('toggling token stats off in settings hides the usage line live (R-23.6)', async ({ page }) => {

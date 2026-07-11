@@ -86,3 +86,24 @@ test('right-click context menu offers copy session id and remove row', async ({ 
   await expect(page.locator('.qd-ctx-menu')).toHaveCount(0);
   await expect(row(page, 'dream-book-web')).toHaveCount(1);
 });
+
+// SPEC §38: the "Kill process" context item appears only for a row whose Claude
+// host pid is known (the `default` fixture gives dream-book-web a pid, dating-
+// coach none), and clicking it removes the row (the mock stands in for the real
+// taskkill + remove-row path).
+test('kill process context item shows only with a known pid and removes the row', async ({ page }) => {
+  await gotoPopup(page, 'default');
+
+  // A pid-less row does NOT offer "Kill process".
+  await row(page, 'dating-coach').click({ button: 'right' });
+  await expect(page.locator('.qd-ctx-menu')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Kill process' })).toHaveCount(0);
+  await page.locator('.qd-header').click();
+  await expect(page.locator('.qd-ctx-menu')).toHaveCount(0);
+
+  // A pid-bearing row offers it; clicking removes the row.
+  await row(page, 'dream-book-web').click({ button: 'right' });
+  await expect(page.getByRole('button', { name: 'Kill process' })).toBeVisible();
+  await page.getByRole('button', { name: 'Kill process' }).click();
+  await expect(row(page, 'dream-book-web')).toHaveCount(0);
+});

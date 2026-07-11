@@ -404,6 +404,7 @@ fn claude_settings_path() -> PathBuf {
 fn map_status(status: EngineStatus) -> SessionStatus {
     match status {
         EngineStatus::Working => SessionStatus::Working,
+        EngineStatus::WaitingWorkflow => SessionStatus::WaitingWorkflow,
         EngineStatus::Attention => SessionStatus::Attention,
         EngineStatus::Idle => SessionStatus::Idle,
         EngineStatus::Dead => SessionStatus::Dead,
@@ -422,12 +423,16 @@ fn map_row(view: &SessionView) -> SessionRow {
         cwd: view.cwd.clone(),
         subagents: view.subagents,
         age_ms: view.age_ms,
+        work_started_ms: view.work_started_ms,
+        last_work_ms: view.last_work_ms,
         // §23 token telemetry is projected in `snapshot` from the shell's usage
         // map (the engine view carries none); default to absent here.
         ctx_percent: None,
         spend: None,
         spend_approx: false,
         subagent_spend: None,
+        // §38: the Claude host pid drives the "Kill process" context item.
+        pid: view.pid,
     }
 }
 
@@ -709,6 +714,7 @@ impl Shell {
                 Counts {
                     attention: c.attention,
                     working: c.working,
+                    waiting: c.waiting,
                     idle: c.idle,
                     dead: c.dead,
                 },
@@ -2947,6 +2953,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::get_state,
             ipc::remove_row,
+            ipc::kill_session,
             ipc::rename_session,
             ipc::answer_ask,
             ipc::answer_perm,
@@ -3176,6 +3183,10 @@ mod tests {
     #[test]
     fn map_status_covers_every_variant() {
         assert_eq!(map_status(EngineStatus::Working), SessionStatus::Working);
+        assert_eq!(
+            map_status(EngineStatus::WaitingWorkflow),
+            SessionStatus::WaitingWorkflow
+        );
         assert_eq!(
             map_status(EngineStatus::Attention),
             SessionStatus::Attention

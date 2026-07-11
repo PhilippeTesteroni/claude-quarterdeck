@@ -18,6 +18,8 @@
   --status-green: #3fb950;
   --status-yellow: #d29922;
   --status-red: #f85149;
+  /* §43 waiting-for-workflow (background subagents still running). */
+  --status-blue: #58a6ff;
   --status-gray: #6e7681;
 
   --accent: #d97757;
@@ -47,6 +49,7 @@
     --status-green: #1a7f37;
     --status-yellow: #9a6700;
     --status-red: #cf222e;
+    --status-blue: #0969da;
     --status-gray: #8c959f;
 
     --amber: #9a6700;
@@ -96,6 +99,27 @@ button {
   outline: none;
   box-shadow: var(--focus-ring);
   border-radius: var(--radius-control);
+}
+
+/* --------------------------------------------------------------------------
+   §40 cursor: the deck is a control surface, not a document. Show the default
+   arrow and suppress text selection across all chrome (rows, header, lamp,
+   settings) so hovering a title/label doesn't flash the I-beam. Buttons keep
+   their own `cursor: pointer`; copy affordances stay click-driven (the MCP
+   command box declares its own `user-select: all`, which wins over the
+   inherited `none`). The text caret + selection come back only on genuinely
+   editable inputs — the §27 rename field, the ask free-text boxes.
+   -------------------------------------------------------------------------- */
+#app {
+  cursor: default;
+  user-select: none;
+}
+
+#app input,
+#app textarea,
+#app [contenteditable="true"] {
+  cursor: text;
+  user-select: text;
 }
 
 /* --------------------------------------------------------------------------
@@ -233,24 +257,40 @@ button {
   display: flex;
 }
 
-.qd-lamp-dot {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
+/* §41: the lamp is a per-agent pie (one wedge per session, `renderLamp`), not a
+   single worst-of dot. `overflow: visible` lets the working wedge's pulse
+   breathe past the disc edge. */
+.qd-lamp-pie {
+  width: 32px;
+  height: 32px;
+  overflow: visible;
 }
 
-.qd-lamp-dot[data-status="attention"] {
-  background: var(--status-red);
+/* Wedge fills reuse the same status→token mapping as the row dots (incl. the
+   §43 blue `waiting`); `dead` maps to gray. */
+.qd-lamp-wedge[data-status="attention"] {
+  fill: var(--status-red);
 }
-.qd-lamp-dot[data-status="working"] {
-  background: var(--status-yellow);
+.qd-lamp-wedge[data-status="working"] {
+  fill: var(--status-yellow);
   animation: qd-pulse 1.6s ease-in-out infinite;
 }
-.qd-lamp-dot[data-status="idle"] {
-  background: var(--status-green);
+.qd-lamp-wedge[data-status="waiting"] {
+  fill: var(--status-blue);
 }
-.qd-lamp-dot[data-status="gray"] {
-  background: var(--status-gray);
+.qd-lamp-wedge[data-status="idle"] {
+  fill: var(--status-green);
+}
+.qd-lamp-wedge[data-status="dead"] {
+  fill: var(--status-gray);
+}
+
+/* Zero agents: a neutral gray ring (no fill) rather than a solid dot. */
+.qd-lamp-ring {
+  fill: none;
+  stroke: var(--status-gray);
+  stroke-width: 6;
+  opacity: 0.5;
 }
 
 /* R-25.1: small attention-count badge, only shown when > 0 ("red lamp + 2"). */
@@ -320,6 +360,9 @@ button {
 }
 .qd-watchline-seg[data-status="working"] {
   background: var(--status-yellow);
+}
+.qd-watchline-seg[data-status="waiting"] {
+  background: var(--status-blue);
 }
 .qd-watchline-seg[data-status="idle"] {
   background: var(--status-green);
@@ -496,17 +539,47 @@ button {
   flex-direction: column;
 }
 
+/* §42 R-42: roomier two-line rows. The row is a vertical stack of a primary
+   line (dot + name + time) over a subordinate detail line (project/branch +
+   usage + glyph), with generous vertical padding so the deck breathes without
+   losing its dense Mission-Control read. */
 .qd-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
+  flex-direction: column;
+  gap: 5px;
+  padding: 11px 14px;
   border-bottom: 1px solid var(--border);
   position: relative;
 }
 
 .qd-row:last-child {
   border-bottom: none;
+}
+
+/* §42 line 1: the status dot, the session name, and the right-aligned §36
+   working-time. The name flexes to fill and ellipsizes; the time hugs the edge. */
+.qd-row-line1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* §42 line 2: project/branch on the left, the §23 `ctx% · spend` usage and the
+   §37 multi-agent glyph grouped hard-right. Indented past the dot (8px dot +
+   8px gap) so it reads as detail subordinate to the name above it. */
+.qd-row-line2 {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-left: 16px;
+}
+
+.qd-row-line2-end {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
 }
 
 .qd-row-dot {
@@ -522,6 +595,9 @@ button {
 .qd-row-dot[data-status="working"] {
   background: var(--status-yellow);
   animation: qd-pulse 1.6s ease-in-out infinite;
+}
+.qd-row-dot[data-status="waiting"] {
+  background: var(--status-blue);
 }
 .qd-row-dot[data-status="idle"] {
   background: var(--status-green);
@@ -542,17 +618,10 @@ button {
   }
 }
 
-.qd-row-main {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
 .qd-row-project {
   font-weight: 600;
-  color: var(--text);
+  font-size: 11.5px;
+  color: var(--muted);
   /* R-7.2: the project name stays legible; only the title ellipsizes. Do NOT
      let this item flex-shrink (`0 0 auto`): a flex item with non-visible
      overflow gets an automatic min-width of 0, so with `flex-shrink: 1` a wide
@@ -571,8 +640,13 @@ button {
   font-size: 11px;
 }
 
+/* §42: on the two-line row the name is the primary read — the row's own text
+   colour at a slightly larger size — so line 2 (project/usage) reads as detail
+   beneath it. */
 .qd-row-title {
-  color: var(--muted);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 500;
   flex: 1 1 auto;
   white-space: nowrap;
   overflow: hidden;
@@ -628,33 +702,30 @@ button {
   opacity: 0.85;
 }
 
-/* R-21.2: the `⛭ N` background-subagent badge. Compact chip, clay-tinted so it
-   reads as live activity without competing with the status dot. */
+/* §36: the frozen "took <dur>" of a finished turn reads dimmer than a live
+   timer — it's a settled fact, not a running count. */
+.qd-row-time.took {
+  opacity: 0.75;
+}
+
+/* §37 R-37: the multi-agent activity glyph — a plain clay-tinted icon shown
+   while background subagents run (no count, no spend). Replaces the old
+   R-21.2 `⛭ N · {spend}` chip, which conflated a cumulative token total with
+   per-flow spend; now just a compact icon reading as live activity without
+   competing with the status dot. */
 .qd-row-subagents {
   flex: 0 0 auto;
-  font-size: 10.5px;
+  font-size: 12px;
+  line-height: 1;
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-  border-radius: 999px;
-  padding: 1px 6px;
   white-space: nowrap;
 }
 
-/* R-23.4: the right block stacks the time-in-status over the token-usage line,
-   right-aligned so both hug the row edge. */
-.qd-row-right {
-  flex: 0 0 auto;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 1px;
-}
-
-/* R-23.4: `ctx 62% · 1.4M`, a muted mono second line. Context fill is amber at
-   ≥75% and red at ≥90% (the crit tooltip is added on the row itself). */
+/* R-23.4: `ctx 62% · 1.4M`, a muted mono line. Context fill is amber at ≥75%
+   and red at ≥90% (the crit tooltip is added on the row itself). §42 moved it
+   to line 2, grouped hard-right with the multi-agent glyph. */
 .qd-row-usage {
-  font-size: 10px;
+  font-size: 10.5px;
   color: var(--muted);
   white-space: nowrap;
   letter-spacing: 0.2px;

@@ -36,6 +36,17 @@ pub struct SessionRow {
     /// the row tooltip as "session 2h 14m". Omitted when unknown.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub age_ms: Option<u64>,
+    /// §36 working-time timer anchor: epoch ms the current turn's real work
+    /// started (a `UserPromptSubmit`). While the row is `working` the UI renders
+    /// a live `now − workStartedMs` counter ("Xm Ys") instead of time-in-status.
+    /// Omitted for a row that never saw a real prompt.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub work_started_ms: Option<u64>,
+    /// §36: total working time of the just-finished turn, frozen at its `Stop`.
+    /// While the row is `idle` the UI renders "took <this>" instead of a running
+    /// idle timer. Omitted until a started turn has stopped.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_work_ms: Option<u64>,
     /// Context fill percent (SPEC R-23.2a/R-23.4): the row's second line shows
     /// `ctx {ctxPercent}% · …`, amber ≥75, red ≥90. Omitted until a usage
     /// record has been read (or when `showTokenStats` is off).
@@ -53,6 +64,12 @@ pub struct SessionRow {
     /// suffix on the `⛭ N` badge (`⛭ 3 · 2.1M`). Omitted when zero.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subagent_spend: Option<String>,
+    /// §38 kill-agent-process: the session's Claude host PID, when known. The
+    /// popup shows the right-click "Kill process" item only for a row that
+    /// carries one, and `kill_session` resolves this pid to force-terminate it.
+    /// Omitted for a PID-less row (nothing to kill).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pid: Option<u32>,
 }
 
 /// Session status (SPEC §2). Serializes lowercase to match the TS union.
@@ -60,6 +77,10 @@ pub struct SessionRow {
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Working,
+    /// §43 blue "waiting for workflow": hook-idle parent with open background
+    /// subagents/workflows. Wire token `"waiting"`, matching the TS union.
+    #[serde(rename = "waiting")]
+    WaitingWorkflow,
     Attention,
     Idle,
     Dead,
@@ -152,6 +173,11 @@ pub struct PermRow {
 pub struct Counts {
     pub attention: u32,
     pub working: u32,
+    /// §43 blue "waiting for workflow": hook-idle parent with open background
+    /// subagents/workflows. Defaulted so an older snapshot without the field
+    /// still deserializes.
+    #[serde(default)]
+    pub waiting: u32,
     pub idle: u32,
     pub dead: u32,
 }
@@ -297,6 +323,7 @@ pub fn recompute_counts(sessions: &[SessionRow]) -> Counts {
         match session.status {
             SessionStatus::Attention => counts.attention += 1,
             SessionStatus::Working => counts.working += 1,
+            SessionStatus::WaitingWorkflow => counts.waiting += 1,
             SessionStatus::Idle => counts.idle += 1,
             SessionStatus::Dead => counts.dead += 1,
         }
@@ -448,6 +475,77 @@ pub fn remove_row(
     emit_state(&app, &snapshot)
 }
 
+/// Resolves the Claude host PID for a session id from the current rows (§38
+/// kill-agent-process): the `kill_session` command's pure lookup half. `None`
+/// when the id is unknown or the row carries no pid (nothing to terminate).
+#[must_use]
+pub fn resolve_kill_pid(sessions: &[SessionRow], session_id: &str) -> Option<u32> {
+    sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .and_then(|s| s.pid)
+}
+
+/// The OS command shape that force-terminates a Claude process by pid (§38):
+/// Windows `taskkill /PID <pid> /F`, macOS/Unix `kill -9 <pid>`. Returned as
+/// `(program, args)` so the command half is pure and unit-testable (the actual
+/// spawn happens in `kill_session`).
+#[must_use]
+pub fn kill_command(pid: u32) -> (&'static str, Vec<String>) {
+    #[cfg(windows)]
+    {
+        (
+            "taskkill",
+            vec!["/PID".to_string(), pid.to_string(), "/F".to_string()],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        ("kill", vec!["-9".to_string(), pid.to_string()])
+    }
+}
+
+/// Force-terminates a session's Claude process and removes its row (§38
+/// `kill_session` command): resolves the row's pid from the current snapshot,
+/// runs the platform kill command (best-effort — a already-gone pid is not an
+/// error), then reuses the `remove_row` path (drop any title override + drop the
+/// row + recompute counts) so the row disappears immediately. A no-op kill for a
+/// PID-less/unknown row still removes it (same as "Remove row").
+#[tauri::command]
+pub fn kill_session(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    // Resolve the pid from the last-published snapshot (mirrors the row the UI
+    // showed the "Kill process" item for).
+    let pid = {
+        let guard = state.0.lock().map_err(|err| err.to_string())?;
+        resolve_kill_pid(&guard.sessions, &session_id)
+    };
+    if let Some(pid) = pid {
+        let (program, args) = kill_command(pid);
+        match std::process::Command::new(program).args(&args).status() {
+            Ok(status) => {
+                tracing::info!(session_id = %session_id, pid, %status, "killed agent process (§38)");
+            }
+            Err(err) => {
+                // The process may already be gone, or the kill tool missing —
+                // log and still remove the row (the user asked it gone).
+                tracing::warn!(session_id = %session_id, pid, error = %err, "kill_session command failed");
+            }
+        }
+    }
+    // Reuse the remove-row path (R-7.2 / R-27.6).
+    crate::prune_session_override(&app, &session_id);
+    let snapshot = {
+        let mut guard = state.0.lock().map_err(|err| err.to_string())?;
+        apply_remove_row(&mut guard, &session_id);
+        guard.clone()
+    };
+    emit_state(&app, &snapshot)
+}
+
 /// Renames a session by setting a user title override (`rename_session` command,
 /// SPEC §27 R-27.4): the new name wins over every other title source (registry
 /// name, session title, prompt). An empty/whitespace name clears the override,
@@ -572,10 +670,13 @@ mod tests {
             cwd: "C:/repo".to_string(),
             subagents: 0,
             age_ms: None,
+            work_started_ms: None,
+            last_work_ms: None,
             ctx_percent: None,
             spend: None,
             spend_approx: false,
             subagent_spend: None,
+            pid: None,
         }
     }
 
@@ -614,6 +715,46 @@ mod tests {
         assert_eq!(state.sessions[0].id, "b");
         assert_eq!(state.counts.attention, 0);
         assert_eq!(state.counts.idle, 1);
+    }
+
+    #[test]
+    fn resolve_kill_pid_finds_the_rows_pid_or_none() {
+        // §38: the pure resolve half of `kill_session`. A row carrying a pid
+        // resolves it; a PID-less row and an unknown id resolve to None.
+        let mut with_pid = sample_session("a", SessionStatus::Working);
+        with_pid.pid = Some(4242);
+        let without_pid = sample_session("b", SessionStatus::Idle);
+        let sessions = vec![with_pid, without_pid];
+        assert_eq!(resolve_kill_pid(&sessions, "a"), Some(4242));
+        assert_eq!(resolve_kill_pid(&sessions, "b"), None);
+        assert_eq!(resolve_kill_pid(&sessions, "does-not-exist"), None);
+    }
+
+    #[test]
+    fn kill_command_has_the_platform_taskkill_shape() {
+        // §38: the pure command-shape half. Windows force-kills via `taskkill
+        // /PID <pid> /F`; every other platform via `kill -9 <pid>`.
+        let (program, args) = kill_command(4242);
+        if cfg!(windows) {
+            assert_eq!(program, "taskkill");
+            assert_eq!(args, vec!["/PID", "4242", "/F"]);
+        } else {
+            assert_eq!(program, "kill");
+            assert_eq!(args, vec!["-9", "4242"]);
+        }
+    }
+
+    #[test]
+    fn session_row_serializes_pid_camel_case_and_omits_when_absent() {
+        // §38: `pid` mirrors to the UI as a bare number, omitted when None so an
+        // older/PID-less snapshot doesn't carry a null (matches ipc-contract.ts).
+        let mut row = sample_session("s1", SessionStatus::Working);
+        row.pid = Some(4242);
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["pid"], 4242);
+        let none = sample_session("s2", SessionStatus::Idle);
+        let v2 = serde_json::to_value(&none).unwrap();
+        assert!(v2.get("pid").is_none(), "None pid omitted");
     }
 
     #[test]

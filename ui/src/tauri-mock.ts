@@ -54,6 +54,15 @@ interface InternalSession {
   spendApprox?: boolean;
   /** R-23.3: compact subagent group spend → `⛭ N · {spend}` badge. */
   subagentSpend?: string;
+  /** §36: epoch ms the current turn's work started. Defaults (in `snapshot`) to
+   * `statusChangedAt` for a `working` row so it renders a live work timer. */
+  workStartedMs?: number;
+  /** §36: frozen total working time (ms) of the just-finished turn → an `idle`
+   * row renders "took <this>" instead of a running idle timer. */
+  lastWorkMs?: number;
+  /** §38: the Claude host pid → the right-click "Kill process" context item
+   * shows only for a row that carries one. */
+  pid?: number;
 }
 
 interface InternalAsk {
@@ -155,6 +164,8 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
         inferred: false,
         cwd: 'C:/Users/phily/projects/dream-book-web',
         since: secondsAgo(12),
+        // §38: a known Claude host pid → this row offers "Kill process".
+        pid: 48213,
       }),
       session({
         id: 's3',
@@ -174,6 +185,8 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
         inferred: false,
         cwd: 'C:/Users/phily/projects/shitty_apps_back',
         since: minutesAgo(4) - 7_000,
+        // §36: this turn finished after 3m 20s of work → row shows "took 3m 20s".
+        lastWorkMs: 200_000,
       }),
       session({
         id: 's5',
@@ -262,6 +275,38 @@ const SCENARIOS: Record<string, () => { sessions: InternalSession[]; asks: Inter
         cwd: 'C:/Users/phily/projects/dream-book-web',
         since: minutesAgo(12) - 40_000, // renders as ~12m 40s
         ageMs: 47 * 60_000,
+      }),
+    ],
+    asks: [],
+  }),
+  // SPEC §43: a session whose parent turn ended (Stop → hook idle) but whose
+  // background subagents/workflows are still running renders BLUE
+  // (`waiting`), between yellow working and green idle, with the `⛭ N` badge.
+  // A plain green idle row sits alongside so the color contrast is assertable.
+  'waiting-workflow': () => ({
+    hooksInstalled: true,
+    settings: defaultSettings(),
+    sessions: [
+      session({
+        id: 's1',
+        project: 'quarterdeck',
+        title: 'Fan-out refactor across 6 crates',
+        branch: 'main',
+        // Parent Stop fired, but 2 background subagents are still open → blue.
+        status: 'waiting',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/quarterdeck',
+        since: secondsAgo(22),
+        subagents: 2,
+      }),
+      session({
+        id: 's2',
+        project: 'dream-book-web',
+        title: 'Locale-native generator sweep',
+        status: 'idle',
+        inferred: false,
+        cwd: 'C:/Users/phily/projects/dream-book-web',
+        since: secondsAgo(9),
       }),
     ],
     asks: [],
@@ -837,8 +882,9 @@ loadScenario(params.get('scenario') ?? 'default');
 const STATUS_PRIORITY: Record<SessionStatus, number> = {
   attention: 0,
   working: 1,
-  idle: 2,
-  dead: 3,
+  waiting: 2,
+  idle: 3,
+  dead: 4,
 };
 
 function snapshot(): StateSnapshot {
@@ -864,10 +910,17 @@ function snapshot(): StateSnapshot {
     cwd: s.cwd,
     subagents: s.subagents ?? 0,
     ageMs: s.ageMs,
+    // §36: a working row carries the live work-start anchor (defaulting to the
+    // status-change instant); an idle row carries the frozen "took" total.
+    workStartedMs:
+      s.status === 'working' ? (s.workStartedMs ?? s.statusChangedAt) : undefined,
+    lastWorkMs: s.status === 'idle' ? s.lastWorkMs : undefined,
     ctxPercent: s.ctxPercent,
     spend: s.spend,
     spendApprox: s.spendApprox,
     subagentSpend: s.subagentSpend,
+    // §38: the Claude host pid → drives the "Kill process" context item.
+    pid: s.pid,
   }));
   const askRows: AskRow[] = asks.map((a) => ({
     id: a.id,
@@ -898,6 +951,7 @@ function snapshot(): StateSnapshot {
   const counts = {
     attention: sessions.filter((s) => s.status === 'attention').length,
     working: sessions.filter((s) => s.status === 'working').length,
+    waiting: sessions.filter((s) => s.status === 'waiting').length,
     idle: sessions.filter((s) => s.status === 'idle').length,
     dead: sessions.filter((s) => s.status === 'dead').length,
   };
@@ -1024,6 +1078,14 @@ export async function invoke<K extends keyof Commands>(
       return undefined as any;
     }
     case 'remove_row': {
+      sessions = sessions.filter((s) => s.id !== a.sessionId);
+      emit();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return undefined as any;
+    }
+    case 'kill_session': {
+      // §38: the real backend force-terminates the pid then reuses the
+      // remove-row path; with no OS process in mock mode we just drop the row.
       sessions = sessions.filter((s) => s.id !== a.sessionId);
       emit();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

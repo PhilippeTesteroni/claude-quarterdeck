@@ -56,7 +56,10 @@ pub struct RegistryEntry {
 }
 
 /// Map a registry `status` string to an engine [`Status`] (R-15.3): `busy` →
-/// `working`, anything else (including missing) → `idle`. Case-insensitive.
+/// `working`, anything else (including `idle`, `waiting`, or missing) → `idle`.
+/// Case-insensitive. (The `idle`/`waiting` distinction from an absent status is
+/// not carried here — it's a plain busy/not-busy read; the §44 demote uses
+/// [`registry_status_is_quiescent`] when it needs the explicit-quiescent signal.)
 #[must_use]
 pub fn registry_status_to_engine(status: Option<&str>) -> Status {
     match status
@@ -67,6 +70,24 @@ pub fn registry_status_to_engine(status: Option<&str>) -> Status {
         Some("busy") => Status::Working,
         _ => Status::Idle,
     }
+}
+
+/// True iff the registry `status` string is an EXPLICIT quiescent state —
+/// `idle` or `waiting` (SPEC §44, R-44). Distinct from a missing/unknown status
+/// (which reads as non-busy for the [`registry_status_to_engine`] override but
+/// is NOT an authoritative "the turn ended" signal). Claude Code writes one of
+/// these when a turn finishes or is ESC-interrupted; the interrupt fires no Stop
+/// hook, so this is the only signal that the wedged `working` hook status should
+/// demote. Case-insensitive.
+#[must_use]
+pub fn registry_status_is_quiescent(status: Option<&str>) -> bool {
+    matches!(
+        status
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("idle") | Some("waiting")
+    )
 }
 
 /// Resolve the sessions directory: `QUARTERDECK_SESSIONS_DIR` if set, else
@@ -320,6 +341,19 @@ mod tests {
         // Absent nameSource → None (the derived default is inferred app-side).
         let absent = parse_entry(br#"{"sessionId":"s","name":"phily-42"}"#, None).unwrap();
         assert_eq!(absent.name_source, None);
+    }
+
+    #[test]
+    fn quiescent_classifier_recognizes_idle_and_waiting_only() {
+        // §44 (R-44): idle/waiting are explicit quiescent signals; busy and a
+        // missing/unknown status are not (case-insensitive, whitespace-tolerant).
+        assert!(registry_status_is_quiescent(Some("idle")));
+        assert!(registry_status_is_quiescent(Some("  WAITING ")));
+        assert!(!registry_status_is_quiescent(Some("busy")));
+        assert!(!registry_status_is_quiescent(Some("something-else")));
+        assert!(!registry_status_is_quiescent(None));
+        // busy/not-busy read is unchanged: waiting maps to idle like any non-busy.
+        assert_eq!(registry_status_to_engine(Some("waiting")), Status::Idle);
     }
 
     #[test]

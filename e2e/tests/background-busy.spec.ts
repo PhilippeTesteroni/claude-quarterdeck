@@ -9,17 +9,19 @@ import { gotoPopup, row } from '../helpers/popup';
 // (R-21.1), the estimated `~` time marker (R-22.4), and the session-age tooltip
 // (R-22.3).
 test.describe('background-busy scenario (§21/§22)', () => {
-  test('busy-overridden row shows working with a ⛭ subagent badge (R-21.1/R-21.2)', async ({ page }) => {
+  test('busy-overridden row shows working with a ⛭ multi-agent glyph (R-21.1/§37)', async ({ page }) => {
     await gotoPopup(page, 'background-busy');
 
     const busyRow = row(page, 'quarterdeck');
     // The row displays working (the shell resolved the busy-override).
     await expect(busyRow.locator('.qd-row-dot')).toHaveAttribute('data-status', 'working');
 
-    // R-21.2: the compact `⛭ N` badge is present with the active count.
+    // §37: a plain multi-agent glyph is present — just the icon, no count.
     const badge = busyRow.locator('.qd-row-subagents');
     await expect(badge).toBeVisible();
-    await expect(badge).toHaveText('⛭ 3');
+    await expect(badge).toHaveText('⛭');
+    // The glyph carries no number/spend text.
+    await expect(badge).not.toContainText(/\d/);
   });
 
   test('a non-busy row shows no subagent badge (R-21.2 N=0 hides it)', async ({ page }) => {

@@ -160,6 +160,40 @@ fn registry_pidless_dead_when_registry_updatedat_stale_over_6h() {
 }
 
 #[test]
+fn registry_pidless_ghost_dies_once_updatedat_stale_past_the_short_window() {
+    // §38 lingering-row tighten: a registry-discovered pid-less row whose only
+    // signal is its registry `updatedAt` now dies once that is stale past the
+    // SHORT registry window (15 min), long before the old 6 h transcript grace —
+    // an undeleted `~/.claude/sessions/<id>.json` ghost no longer lingers for
+    // hours. Fresh-within-the-window it still survives.
+    use deck_core::registry::{merge_registry_into_store, RegistryEntry};
+    const FIFTEEN_MIN: u64 = 15 * 60 * 1000;
+    let (mut s, c) = store_at(T0);
+    let entry = RegistryEntry {
+        session_id: "ghost".into(),
+        cwd: Some("/p".into()),
+        updated_at_ms: Some(T0),
+        ..Default::default()
+    };
+    merge_registry_into_store(&mut s, std::slice::from_ref(&entry), T0);
+    let procs = FakeProcessTable::new(); // no pid to verify
+
+    // Still within the 15-min window (and re-fed by the same-updatedAt poll):
+    // alive.
+    c.set(T0 + FIFTEEN_MIN - 1);
+    s.apply_registry(std::slice::from_ref(&entry));
+    s.poll_liveness(&procs, |_p| None);
+    assert_ne!(s.status_of("ghost"), Some(Status::Dead));
+
+    // Past the window, still far under 6 h: the ghost is dead (old behavior kept
+    // it alive until 6 h).
+    c.set(T0 + FIFTEEN_MIN + 1);
+    s.apply_registry(std::slice::from_ref(&entry));
+    s.poll_liveness(&procs, |_p| None);
+    assert_eq!(s.status_of("ghost"), Some(Status::Dead));
+}
+
+#[test]
 fn dead_row_persists_5min_then_is_pruned() {
     // R-2.5
     let (mut s, c) = store_at(T0);

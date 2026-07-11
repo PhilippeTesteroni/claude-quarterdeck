@@ -38,6 +38,12 @@ pub const REGISTRY_BUSY_FRESH_MS: u64 = 30_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
     Working,
+    /// §43 "waiting for workflow" (blue, `#58a6ff`): the parent turn's `Stop`
+    /// fired (hook `idle`) but background subagents/workflows are still running
+    /// (`active_subagents > 0`). Distinct from green `idle` (nothing running) and
+    /// yellow `working` (the parent turn itself is executing). A pending
+    /// ask/perm (attention) and the §21 registry busy-override both outrank it.
+    WaitingWorkflow,
     Attention,
     Idle,
     Dead,
@@ -49,19 +55,22 @@ impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
             Status::Working => "working",
+            Status::WaitingWorkflow => "waiting",
             Status::Attention => "attention",
             Status::Idle => "idle",
             Status::Dead => "dead",
         }
     }
 
-    /// Sort/aggregation priority: attention worst, then working, idle, dead
-    /// (R-7.3 sort order and R-2.6 worst-of aggregation).
+    /// Sort/aggregation priority: attention worst, then working,
+    /// waiting-workflow (§43, between working and idle), idle, dead (R-7.3 sort
+    /// order and R-2.6 worst-of aggregation).
     #[must_use]
     pub fn priority(self) -> u8 {
         match self {
-            Status::Attention => 3,
-            Status::Working => 2,
+            Status::Attention => 4,
+            Status::Working => 3,
+            Status::WaitingWorkflow => 2,
             Status::Idle => 1,
             Status::Dead => 0,
         }
@@ -129,6 +138,22 @@ pub struct SessionView {
     /// `startedAt` → `SessionStart` receivedAt → first-seen. Drives the tooltip
     /// "session 2h 14m" line alongside the cwd.
     pub age_ms: Option<u64>,
+    /// §36 working-time timer anchor: epoch ms the current turn's real work
+    /// started (a `UserPromptSubmit`), or `None`. While the row is `working` the
+    /// UI shows a live counter of `now − work_started_ms` ("Xm Ys") instead of
+    /// the raw time-in-status — anchored at the prompt, so §30 reverse-gear /
+    /// §21 busy-override flips don't reset it.
+    pub work_started_ms: Option<u64>,
+    /// §36: total working time of the just-finished turn, frozen at its `Stop`.
+    /// While the row is `idle` the UI shows "took <this>" instead of a running
+    /// idle timer; `None` until a started turn has stopped, cleared on the next
+    /// prompt.
+    pub last_work_ms: Option<u64>,
+    /// §38 kill-agent-process: the session's nearest-ancestor Claude PID (R-4.3 /
+    /// R-15.3), when known. Exposed so the shell's `kill_session` command can
+    /// resolve and force-terminate it; the UI shows the "Kill process" context
+    /// item only for a row that carries one.
+    pub pid: Option<u32>,
 }
 
 /// Per-status counts (engine-side mirror of `ipc::Counts`).
@@ -136,6 +161,9 @@ pub struct SessionView {
 pub struct StatusCounts {
     pub attention: u32,
     pub working: u32,
+    /// §43 blue "waiting for workflow": hook-idle parent with open background
+    /// subagents/workflows (`WaitingWorkflow`).
+    pub waiting: u32,
     pub idle: u32,
     pub dead: u32,
 }
@@ -209,8 +237,18 @@ struct Session {
     /// even on a tick where the registry poll was empty/skipped.
     registry_busy: bool,
     /// The registry `updatedAt` (epoch ms) from the last poll that mentioned this
-    /// session — the freshness clock for the busy-override (R-21.1).
+    /// session — the freshness clock for the busy-override (R-21.1) AND the §44
+    /// registry-driven demote (R-44).
     registry_updated_at_ms: Option<u64>,
+    /// §44 (R-44): the last registry poll that mentioned this session reported it
+    /// with an EXPLICIT quiescent status (`idle`/`waiting`) — an authoritative
+    /// "the turn ended / was interrupted" signal from Claude Code, distinct from a
+    /// missing/unknown status. Combined with the `registry_updated_at_ms`
+    /// freshness and a stuck `hook_status == Working` (an ESC-interrupt fires no
+    /// Stop hook, so the hook status wedges `working`) to drive the registry-driven
+    /// demote. Cleared when the registry reports the session busy or drops it from
+    /// the poll.
+    registry_quiescent: bool,
     /// Registry busy-override state (R-21.1), derived from `registry_busy` +
     /// `registry_updated_at_ms` freshness. While set AND the hook-derived status
     /// is `idle`, the row displays `working` (background subagents/workflows are
@@ -241,6 +279,19 @@ struct Session {
     /// the reference the next `poll_recovery` tick compares against to decide
     /// whether the transcript advanced (R-30.1). Cleared with `recovery_promoted`.
     last_transcript_mtime_ms: Option<u64>,
+    /// §36 working-time timer: epoch ms of the real work start for the current
+    /// turn — set on a `UserPromptSubmit` (the genuine "user hit enter" moment)
+    /// and NOT restamped by the §30 reverse-gear promote/demote or a §21
+    /// busy-override toggle, so the live "working" counter measures time on THIS
+    /// task, not time-in-status. Reset (re-anchored) by the next prompt. `None`
+    /// for a row that never saw a real prompt (cold-start/discovered), which then
+    /// falls back to the plain time-in-status display.
+    work_started_ms: Option<u64>,
+    /// §36: total working time of the just-finished turn, frozen at the `Stop`
+    /// that ended it (`stop_ts − work_started_ms`). While the row is idle the UI
+    /// shows "took <this>" instead of a running idle timer; cleared on the next
+    /// `UserPromptSubmit`. `None` until a turn with a known start has stopped.
+    last_work_ms: Option<u64>,
 }
 
 impl Session {
@@ -272,18 +323,22 @@ impl Session {
             last_toast_ms: HashMap::new(),
             registry_busy: false,
             registry_updated_at_ms: None,
+            registry_quiescent: false,
             busy_override: false,
             active_subagents: 0,
             registry_started_ms: None,
             created_ms: now_ms,
             recovery_promoted: false,
             last_transcript_mtime_ms: None,
+            work_started_ms: None,
+            last_work_ms: None,
         }
     }
 
     fn effective(&self) -> Status {
         if self.pending_asks > 0 {
-            // Attention (pending ask/perm) always outranks the busy-override (R-21.1).
+            // Attention (pending ask/perm) always outranks the busy-override
+            // (R-21.1) and the §43 waiting-workflow blue.
             return Status::Attention;
         }
         // R-21.1: a hook-idle session the registry says is busy (fresh) displays
@@ -291,17 +346,14 @@ impl Session {
         if self.busy_override && self.hook_status == Status::Idle {
             return Status::Working;
         }
-        self.hook_status
-    }
-
-    /// Reset the subagent counter when the session has settled to a non-`working`
-    /// display (R-21.2 self-correction). Called after status-settling hook events
-    /// (fresh `Stop`, attention) and liveness `dead`, never on the subagent
-    /// events themselves (whose ordering vs. the registry busy signal can lag).
-    fn settle_subagents(&mut self) {
-        if self.effective() != Status::Working {
-            self.active_subagents = 0;
+        // §43: the parent turn's `Stop` fired (hook `idle`) but background
+        // subagents/workflows are still open → blue `WaitingWorkflow` instead of
+        // green `idle`. Below the busy-override (a fresh-busy registry means the
+        // parent itself is active → yellow), above plain idle.
+        if self.active_subagents > 0 && self.hook_status == Status::Idle {
+            return Status::WaitingWorkflow;
         }
+        self.hook_status
     }
 
     /// Recompute [`Session::busy_override`] from the raw registry flag + the
@@ -313,34 +365,83 @@ impl Session {
         let fresh = self
             .registry_updated_at_ms
             .is_some_and(|u| now.saturating_sub(u) < REGISTRY_BUSY_FRESH_MS);
-        let want = self.registry_busy && fresh;
-        let mut changed = false;
-        if want != self.busy_override {
-            self.busy_override = want;
-            // R-22.1: a discovered (inferred) row that the override flips INTO
-            // `working` at cold start did NOT enter `working` at app-launch
-            // `now`. Its status-entry timestamp must stay seeded from the
-            // activity estimate (`entered_at_ms`: transcript mtime, later walked
-            // to the registry `updatedAt` by `seed_inferred_entered_at`), never
-            // restamped to `now` — that is the exact §22 dishonesty (a `~0s`
-            // "just now" on background work whose registry `updatedAt` is
-            // seconds old). Clamp defends against a future-dated estimate. For a
-            // hook-tracked row, or the override CLEARING (`want == false`), the
-            // transition genuinely happens now, so `now` stands.
-            let settle_ts = if self.inferred && want {
-                self.entered_at_ms.min(now)
-            } else {
-                now
-            };
-            if self.resettle_effective(settle_ts).is_some() {
-                self.last_activity_ms = now;
-                changed = true;
-            }
+        // §43 / R-21.2: the subagent counter (and the blue `WaitingWorkflow` it
+        // drives) is owned by the `SubagentStart`/`SubagentStop` balance and MUST
+        // survive a clean `Stop → idle` while children are still open — that was
+        // the §43 bug (the old blanket "zero on any non-working settle" made the
+        // multi-agent indicator vanish the instant the parent hit `Stop`). Only
+        // an AUTHORITATIVE "no background work" signal reaps a leaked count here:
+        // a FRESH registry poll that explicitly reports the session non-busy. An
+        // absent/stale registry, or a mere hook-idle, leaves the balance intact.
+        // A genuinely lost `SubagentStop` is instead reaped by liveness `dead`
+        // (which zeroes directly). Cleared BEFORE re-deriving the shown status so
+        // `resettle_effective` below sees the settled counter.
+        if fresh && !self.registry_busy {
+            self.active_subagents = 0;
         }
-        // R-21.2: keep the badge honest — drop any count once the row no longer
-        // displays working (override lifted / never applied).
-        self.settle_subagents();
-        changed
+        self.busy_override = self.registry_busy && fresh;
+        // R-22.1: a discovered (inferred) row that the override holds INTO
+        // `working` at cold start did NOT enter `working` at app-launch `now`.
+        // Its status-entry timestamp must stay seeded from the activity estimate
+        // (`entered_at_ms`: transcript mtime, later walked to the registry
+        // `updatedAt` by `seed_inferred_entered_at`), never restamped to `now` —
+        // that is the exact §22 dishonesty (a `~0s` "just now" on background work
+        // whose registry `updatedAt` is seconds old). Clamp defends against a
+        // future-dated estimate. For a hook-tracked row, or when the override is
+        // not what puts us into `working`, the transition genuinely happens now.
+        let settle_ts = if self.inferred && self.busy_override {
+            self.entered_at_ms.min(now)
+        } else {
+            now
+        };
+        // `resettle_effective` only restamps when the shown status actually
+        // changed, so calling it unconditionally is safe (and now necessary: the
+        // subagent clear above can flip a row out of blue `WaitingWorkflow`
+        // without any busy-override edge).
+        if self.resettle_effective(settle_ts).is_some() {
+            self.last_activity_ms = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// §44 (R-44) registry-driven demote. Interrupting Claude with ESC fires no
+    /// Stop hook, so `hook_status` wedges on `working` and the deck stays stuck
+    /// 🟡 — but Claude Code writes the session's registry status to `idle`/
+    /// `waiting`. When the registry AUTHORITATIVELY reports the session quiescent
+    /// on a FRESH poll while our hook status is still `working` and no real hook
+    /// event has landed since that registry write, drop the hook status to `idle`.
+    /// This is the demote-side complement to §30's transcript-quiescence demote
+    /// (which owns recovery-promoted rows) — Quarterdeck otherwise only ever uses
+    /// the registry to OVERRIDE idle→working (R-21.1), never to demote. Guards:
+    /// - only a genuine hook `working` is demoted — never a §30 recovery-promoted
+    ///   row (that one is the transcript-quiescence demote's job) nor an
+    ///   override/blue row (whose hook status is already `idle`);
+    /// - a busy registry never reaches here (`registry_quiescent` is false), so
+    ///   this never fights a genuinely-busy registry;
+    /// - the registry `updatedAt` must be FRESH and strictly AFTER the last hook
+    ///   activity, so a new `UserPromptSubmit` that re-armed `working` after the
+    ///   registry went idle is never clobbered ("no fresher hook activity").
+    ///
+    /// Returns whether the shown status changed. Not a real `Stop`, so — like the
+    /// §30 reverse-gear demote — it does NOT freeze the §36 working-time timer.
+    fn maybe_registry_demote(&mut self, now: u64) -> bool {
+        if self.hook_status != Status::Working
+            || self.recovery_promoted
+            || !self.registry_quiescent
+        {
+            return false;
+        }
+        let Some(updated) = self.registry_updated_at_ms else {
+            return false;
+        };
+        let fresh = now.saturating_sub(updated) < REGISTRY_BUSY_FRESH_MS;
+        if fresh && updated > self.last_activity_ms {
+            self.set_hook_status(Status::Idle, now).is_some()
+        } else {
+            false
+        }
     }
 
     /// Best-known session start anchor for the age tooltip (R-22.3): registry
@@ -587,6 +688,20 @@ impl SessionStore {
             .map(|s| now.saturating_sub(s.entered_at_ms))
     }
 
+    /// §36: epoch ms the session's current turn started working (the last real
+    /// `UserPromptSubmit`), or `None`. For tests/tools.
+    #[must_use]
+    pub fn work_started_ms_of(&self, session_id: &str) -> Option<u64> {
+        self.sessions.get(session_id).and_then(|s| s.work_started_ms)
+    }
+
+    /// §36: frozen total working time of the just-finished turn, or `None`. For
+    /// tests/tools.
+    #[must_use]
+    pub fn last_work_ms_of(&self, session_id: &str) -> Option<u64> {
+        self.sessions.get(session_id).and_then(|s| s.last_work_ms)
+    }
+
     /// Rendered title of a session (for tests/tools).
     #[must_use]
     pub fn title_of(&self, session_id: &str) -> Option<String> {
@@ -786,6 +901,11 @@ impl SessionStore {
                 session.set_hook_status(Status::Working, ts);
                 session.attention_from_hook = false;
                 session.last_notification_ms = None;
+                // §36: a real prompt is the genuine work-start of a new turn —
+                // (re-)anchor the working-time timer here and drop the frozen
+                // "took" from the previous turn.
+                session.work_started_ms = Some(ts);
+                session.last_work_ms = None;
             }
             HookEvent::Notification {
                 message,
@@ -857,10 +977,21 @@ impl SessionStore {
                 // stay `working` across this Stop (R-21.3).
                 let finished_a_turn = session.hook_status != Status::Idle;
                 session.set_hook_status(Status::Idle, ts);
-                // R-21.2 self-correcting badge: a fresh Stop that settles the
-                // session to idle (no live busy-override keeping it working)
-                // means no subagents should still be counted.
-                session.settle_subagents();
+                // §36: freeze the working-time timer of the turn that just ended —
+                // the row now shows "took <this>" instead of a running idle timer,
+                // until the next prompt re-anchors. Only when a real work-start is
+                // known (a discovered/never-prompted row keeps `None` and falls
+                // back to the plain time-in-status display). Not restamped by the
+                // §30 reverse-gear demote, which is not a real Stop.
+                if let Some(started) = session.work_started_ms {
+                    session.last_work_ms = Some(ts.saturating_sub(started));
+                }
+                // §43: a fresh Stop no longer zeroes the subagent counter — if
+                // background subagents/workflows are still open the row settles to
+                // blue `WaitingWorkflow` (via `effective`), not green idle, and the
+                // multi-agent indicator stays. The count is reaped by a genuine
+                // `SubagentStop` balance, a fresh registry non-busy poll
+                // (`recompute_busy_override`), or liveness `dead`.
                 // R-9.1 / R-21.3: fire the "finished" toast whenever the turn
                 // finished and the session isn't still blocked on a pending ask —
                 // EVEN if the busy-override immediately keeps the row displayed as
@@ -893,7 +1024,8 @@ impl SessionStore {
             }
             HookEvent::SubagentStop => {
                 // R-21.2: a subagent child finished. Saturating so a stray/extra
-                // stop can't underflow; a LOST stop is caught by `settle_subagents`.
+                // stop can't underflow; a LOST stop is reaped by a fresh registry
+                // non-busy poll (`recompute_busy_override`) or liveness `dead`.
                 session.active_subagents = session.active_subagents.saturating_sub(1);
             }
             HookEvent::SessionEnd { .. } => unreachable!("handled above"),
@@ -1216,6 +1348,10 @@ impl SessionStore {
         let now = self.clock.now_ms();
         for s in self.sessions.values_mut() {
             s.recompute_busy_override(now);
+            // §44/R-44: age the registry-driven demote on the plain tick too, so a
+            // registry idle/waiting seen on the last poll still unsticks an
+            // ESC-wedged `working` even on a tick where no registry poll ran.
+            s.maybe_registry_demote(now);
         }
     }
 
@@ -1370,8 +1506,19 @@ impl SessionStore {
             crate::registry::registry_status_to_engine(entry.status.as_deref()),
             Status::Working
         );
+        // §44/R-44: remember whether this poll EXPLICITLY reported idle/waiting
+        // (an authoritative quiescent signal), so `maybe_registry_demote` below can
+        // unstick an ESC-interrupted `working` hook status. Absent/unknown status
+        // is not quiescent (it only reads as non-busy for the override).
+        s.registry_quiescent =
+            crate::registry::registry_status_is_quiescent(entry.status.as_deref());
         s.registry_updated_at_ms = entry.updated_at_ms;
         changed |= s.recompute_busy_override(now);
+        // §44/R-44: a fresh registry idle/waiting demotes a hook status wedged on
+        // `working` by an ESC-interrupt (no Stop hook fired). Runs after the
+        // busy-override recompute so it sees the settled state; a busy registry
+        // never demotes (guarded by `registry_quiescent`).
+        changed |= s.maybe_registry_demote(now);
         // R-15.2: the registry `name` refreshes on every poll. Only re-derive
         // the title (which may touch the transcript for a fallback) when the
         // name actually changed, so a /rename lands within one poll but a stable
@@ -1414,16 +1561,18 @@ impl SessionStore {
         }
         // R-21.1: a session no longer reported by the registry can't be "busy" —
         // clear the raw busy flag and re-derive, so a removed registry file
-        // doesn't wedge a row displaying `working` forever. `recompute_busy_over-
-        // ride` also self-corrects the badge (R-21.2) without blanket-zeroing a
-        // session that is genuinely hook-`working` but simply absent from the
-        // registry (its subagent counter is then owned by the SubagentStart/Stop
-        // events + `settle_subagents`).
+        // doesn't wedge a row displaying `working` forever. Clearing
+        // `registry_updated_at_ms` also makes the poll non-authoritative for the
+        // §43 subagent clear (`recompute_busy_override` only reaps the counter on
+        // a FRESH non-busy poll), so an absent registry leaves a genuinely
+        // multi-agent row's counter intact — it is owned by the
+        // SubagentStart/Stop balance and reaped only by liveness `dead`.
         for s in self.sessions.values_mut() {
             if present.contains(s.id.as_str()) {
                 continue;
             }
             s.registry_busy = false;
+            s.registry_quiescent = false;
             s.registry_updated_at_ms = None;
             changed |= s.recompute_busy_override(now);
             // R-15.2: "Registry names refresh on every poll." A session the
@@ -1502,6 +1651,9 @@ impl SessionStore {
                 cwd: s.cwd.clone().unwrap_or_default(),
                 subagents: s.active_subagents,
                 age_ms: Some(now.saturating_sub(s.age_anchor_ms())),
+                work_started_ms: s.work_started_ms,
+                last_work_ms: s.last_work_ms,
+                pid: s.claude_pid,
             })
             .collect();
         rows.sort_by(|a, b| {
@@ -1526,6 +1678,7 @@ impl SessionStore {
             match s.effective() {
                 Status::Attention => c.attention += 1,
                 Status::Working => c.working += 1,
+                Status::WaitingWorkflow => c.waiting += 1,
                 Status::Idle => c.idle += 1,
                 Status::Dead => c.dead += 1,
             }
