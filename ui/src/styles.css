@@ -814,6 +814,21 @@ button {
   color: var(--text);
 }
 
+/* §46 dual-answer: the popup mirror's "In terminal" escape — like Dismiss,
+ * muted + borderless, secondary to the option buttons / free-text input. */
+.qd-ask-row-terminal {
+  flex: 0 0 auto;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
+.qd-ask-row-terminal:hover {
+  color: var(--text);
+}
+
 /* Orphaned (expired) ask rows (R-8.7) — muted, no answer inputs. */
 .qd-ask-row-expired {
   border-left-color: var(--muted);
@@ -1260,6 +1275,24 @@ button {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+/* §46 dual-answer: the left cluster of secondary actions ("In terminal" +
+ * Dismiss); the primary Submit (when present) stays pushed to the right. */
+.qd-ask-actions-group {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* §46: the ask-window "In terminal" escape — a muted, secondary ghost button
+ * sitting beside Dismiss, well out of the way of the primary answer surfaces. */
+.qd-ask-terminal {
+  color: var(--muted);
+}
+
+.qd-ask-terminal:hover {
+  color: var(--text);
 }
 
 .qd-ask-empty {

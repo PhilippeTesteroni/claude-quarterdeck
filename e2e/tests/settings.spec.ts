@@ -16,15 +16,13 @@ test.describe('settings pane', () => {
     const toggle = (label: string) =>
       page.locator('.qd-toggle-row', { hasText: label }).locator('.qd-toggle');
 
-    // Defaults: notifyIdle on, notifyAttention on, notifyReminder off,
-    // launchAtLogin off (`ui/src/tauri-mock.ts` defaultSettings()).
+    // Defaults: notifyIdle on, notifyAttention on, launchAtLogin off
+    // (`ui/src/tauri-mock.ts` defaultSettings()). §47: the "still waiting"
+    // reminder toggle is retired and no longer rendered.
     await expect(toggle('Notify when a session finishes')).toHaveAttribute('aria-checked', 'true');
     await expect(toggle('Notify when a session needs you')).toHaveAttribute('aria-checked', 'true');
-    await expect(toggle('Remind me if a session is still waiting')).toHaveAttribute('aria-checked', 'false');
+    await expect(page.locator('.qd-toggle-row', { hasText: 'still waiting' })).toHaveCount(0);
     await expect(toggle('Launch Quarterdeck at login')).toHaveAttribute('aria-checked', 'false');
-
-    await toggle('Remind me if a session is still waiting').click();
-    await expect(toggle('Remind me if a session is still waiting')).toHaveAttribute('aria-checked', 'true');
 
     await toggle('Launch Quarterdeck at login').click();
     await expect(toggle('Launch Quarterdeck at login')).toHaveAttribute('aria-checked', 'true');

@@ -97,6 +97,34 @@ test.describe('ask window', () => {
     expect(last).toEqual({ askId: 'a1', kind: 'dismissed' });
   });
 
+  // SPEC §46 dual-answer: the ask window carries a secondary "In terminal" button
+  // that resolves the ask with kind:"terminal" (the user chose the terminal; the
+  // agent re-asks natively) — distinct from Dismiss.
+  test('ask-window "In terminal" resolves the ask with kind:"terminal" (§46)', async ({ page }) => {
+    await gotoAsk(page, 'ask-detail');
+    // Both secondary actions are present and distinct.
+    await expect(page.getByRole('button', { name: 'In terminal' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Dismiss' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'In terminal' }).click();
+    const last = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastAnswerAsk(): { askId: string; kind: string } | null } }).__qdMock.lastAnswerAsk(),
+    );
+    expect(last).toEqual({ askId: 'a1', kind: 'terminal' });
+    // The ask clears once answered.
+    await expect(page.locator('.qd-ask-empty')).toBeVisible();
+  });
+
+  // SPEC §46: the popup mirror row mirrors the same "In terminal" escape.
+  test('popup mirror "In terminal" sends kind:"terminal" (§46)', async ({ page }) => {
+    await gotoPopup(page, 'ask-detail');
+    await page.locator('.qd-ask-row .qd-ask-row-terminal').first().click();
+    const last = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastAnswerAsk(): { askId: string; kind: string } | null } }).__qdMock.lastAnswerAsk(),
+    );
+    expect(last).toEqual({ askId: 'a1', kind: 'terminal' });
+  });
+
   test('unmatched asks show "Unknown agent (<context>)" (R-8.2)', async ({ page }) => {
     await gotoAsk(page, 'ask-unknown');
     await expect(page.locator('.qd-ask-identity-project')).toContainText('Unknown agent (');

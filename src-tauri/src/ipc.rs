@@ -251,6 +251,12 @@ pub enum AskAnswerKind {
     /// R-19.5: the ask was cancelled by a `cancel_ask` tool call (from a
     /// parallel tool call / another session) before the user answered.
     Cancelled,
+    /// §46 dual-answer: the user clicked "In terminal" in the deck instead of
+    /// answering here — they chose to answer the question in the terminal. The
+    /// `ask_user` call returns `{answer:"", kind:"terminal", ask_id}`; the agent
+    /// then RE-ASKS the same question with the native `AskUserQuestion` tool (the
+    /// terminal picker). Serialized as the lowercase `"terminal"` token.
+    Terminal,
     /// SPEC §29 (R-29.2/R-29.3): the answer to a multi-question / multi-select
     /// form. The `answer` string is a JSON document
     /// `{"answers":[{header,question,selected:[...],text?}, ...]}` carried on the
@@ -974,6 +980,18 @@ mod tests {
         );
         let k: AskAnswerKind = serde_json::from_str("\"form\"").unwrap();
         assert_eq!(k, AskAnswerKind::Form);
+    }
+
+    #[test]
+    fn ask_answer_kind_terminal_serializes_lowercase() {
+        // §46 dual-answer: the new `Terminal` kind is the lowercase `"terminal"`
+        // token on the wire, matching the TS `AskAnswerKind` union.
+        assert_eq!(
+            serde_json::to_string(&AskAnswerKind::Terminal).unwrap(),
+            "\"terminal\""
+        );
+        let k: AskAnswerKind = serde_json::from_str("\"terminal\"").unwrap();
+        assert_eq!(k, AskAnswerKind::Terminal);
     }
 
     #[test]

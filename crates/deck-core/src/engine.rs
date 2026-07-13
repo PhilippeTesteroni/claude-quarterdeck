@@ -279,6 +279,17 @@ struct Session {
     /// the reference the next `poll_recovery` tick compares against to decide
     /// whether the transcript advanced (R-30.1). Cleared with `recovery_promoted`.
     last_transcript_mtime_ms: Option<u64>,
+    /// §45 (R-45): the most recent transcript mtime the shell has reported for
+    /// this row, refreshed every poll by [`SessionStore::refresh_transcript_activity`]
+    /// (never cleared by a hook event — it tracks the FILE, not the status). This
+    /// is the transcript-quiescence reference the §44 registry-demote consults: a
+    /// genuinely-working agent writes its transcript continuously, so its mtime
+    /// sits within `RECOVERY_MIN_ADVANCE_MS` of `now` and must never be demoted by
+    /// a transient mid-turn registry `waiting`; an ESC-interrupt stops the writes,
+    /// so the mtime goes stale and the demote fires. `None` until the first poll
+    /// reports one (a fresh read failure preserves the last-seen value rather than
+    /// clobbering it, so a transient miss can't spoof quiescence).
+    seen_transcript_mtime_ms: Option<u64>,
     /// §36 working-time timer: epoch ms of the real work start for the current
     /// turn — set on a `UserPromptSubmit` (the genuine "user hit enter" moment)
     /// and NOT restamped by the §30 reverse-gear promote/demote or a §21
@@ -330,6 +341,7 @@ impl Session {
             created_ms: now_ms,
             recovery_promoted: false,
             last_transcript_mtime_ms: None,
+            seen_transcript_mtime_ms: None,
             work_started_ms: None,
             last_work_ms: None,
         }
@@ -422,7 +434,18 @@ impl Session {
     ///   this never fights a genuinely-busy registry;
     /// - the registry `updatedAt` must be FRESH and strictly AFTER the last hook
     ///   activity, so a new `UserPromptSubmit` that re-armed `working` after the
-    ///   registry went idle is never clobbered ("no fresher hook activity").
+    ///   registry went idle is never clobbered ("no fresher hook activity");
+    /// - §45 (R-45): the transcript must be QUIESCENT — its last-seen mtime (kept
+    ///   fresh by `refresh_transcript_activity`) must NOT have advanced within
+    ///   `RECOVERY_MIN_ADVANCE_MS` of `now`. Claude Code writes the registry status
+    ///   to `waiting` MID-TURN (waiting on a tool/permission), not only when the
+    ///   turn ends, so a transient `waiting` would otherwise false-demote a busy
+    ///   agent to idle ("finished") and §30 would immediately re-promote it — a
+    ///   🟡→🟢→🟡 flap plus a spurious "finished" toast. A genuinely-working agent
+    ///   writes its transcript continuously (mtime ≈ `now`), so it is never
+    ///   demoted; an ESC-interrupt stops the writes, so the mtime goes stale and
+    ///   the demote still fires. A never-seen (`None`) or vanished mtime reads as
+    ///   quiescent, matching the §30 reverse-gear demote on a gone transcript.
     ///
     /// Returns whether the shown status changed. Not a real `Stop`, so — like the
     /// §30 reverse-gear demote — it does NOT freeze the §36 working-time timer.
@@ -431,6 +454,15 @@ impl Session {
             || self.recovery_promoted
             || !self.registry_quiescent
         {
+            return false;
+        }
+        // §45/R-45: never demote while the transcript is still advancing — that is
+        // an agent actively working through a mid-turn `waiting`, not a finished
+        // (or ESC-interrupted) one.
+        let transcript_quiescent = self
+            .seen_transcript_mtime_ms
+            .is_none_or(|mtime| now.saturating_sub(mtime) >= RECOVERY_MIN_ADVANCE_MS);
+        if !transcript_quiescent {
             return false;
         }
         let Some(updated) = self.registry_updated_at_ms else {
@@ -939,24 +971,12 @@ impl SessionStore {
                     }
                     NotifClass::IdlePrompt => {
                         // R-2.3: `idle_prompt` does NOT change status (the session
-                        // is already `idle` via Stop). It does, however, drive the
-                        // optional "still waiting" reminder toast (R-9.5, default
-                        // OFF): the engine emits the decision, the shell gates it
-                        // on `notifyReminder`. Only meaningful while actually idle.
-                        tracing::debug!(session_id = %session.id, "idle_prompt: no status change (R-2.3)");
-                        if session.effective() == Status::Idle {
-                            effect = Some((
-                                ToastDecision {
-                                    session_id: session.id.clone(),
-                                    kind: ToastKind::Reminder,
-                                    project: session.project(),
-                                    // Reminder copy is fixed (R-2.3); detail unused.
-                                    detail: String::new(),
-                                    at_ms: ts,
-                                },
-                                ts,
-                            ));
-                        }
+                        // is already `idle` via Stop) and fires no toast. §47: the
+                        // "still waiting" reminder is retired — it landed right after
+                        // the Stop "finished" toast and only ever duplicated it, so
+                        // `idle_prompt` is now inert (may return later as a delayed
+                        // nudge, R-9.5).
+                        tracing::debug!(session_id = %session.id, "idle_prompt: no status change, no toast (R-2.3, §47)");
                     }
                     NotifClass::Ignored => {
                         tracing::debug!(
@@ -1339,6 +1359,22 @@ impl SessionStore {
         expired
     }
 
+    /// §45 (R-45): refresh each row's last-seen transcript mtime — the
+    /// transcript-quiescence reference the §44 registry-demote consults. The
+    /// engine never touches transcripts itself; `mtime_of` returns the file's
+    /// current mtime (epoch ms). A read miss (`None`) PRESERVES the last-seen
+    /// value rather than clobbering it, so a transient failure can't spoof
+    /// quiescence and false-demote a busy row. The shell calls this on every
+    /// poll BEFORE `apply_registry` (so the registry-poll demote sees fresh
+    /// activity), and [`SessionStore::tick`] calls it before `poll_busy_override`.
+    pub fn refresh_transcript_activity(&mut self, mut mtime_of: impl FnMut(&str) -> Option<u64>) {
+        for s in self.sessions.values_mut() {
+            if let Some(mtime) = s.transcript_path.as_deref().and_then(&mut mtime_of) {
+                s.seen_transcript_mtime_ms = Some(mtime);
+            }
+        }
+    }
+
     /// Age out stale busy-overrides (R-21.1) from each session's stored raw
     /// registry state, independent of whether this tick's registry poll ran or
     /// was empty. Without this, a registry that goes entirely empty (so the
@@ -1363,6 +1399,9 @@ impl SessionStore {
         procs: &impl ProcessTable,
         mut mtime_of: impl FnMut(&str) -> Option<u64>,
     ) -> Vec<Effect> {
+        // §45/R-45: refresh transcript activity first so `poll_busy_override`'s
+        // §44 registry-demote gates on this tick's transcript quiescence.
+        self.refresh_transcript_activity(&mut mtime_of);
         self.poll_busy_override();
         let mut effects = self.poll_recovery(&mut mtime_of);
         effects.extend(self.poll_liveness(procs, &mut mtime_of));

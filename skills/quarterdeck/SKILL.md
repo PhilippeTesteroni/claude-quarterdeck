@@ -136,8 +136,21 @@ ask_user(
   you sent the questions (`selected` is the chosen option strings for that
   question; `text` is present only if they also typed one). Parse it to read
   each answer.
+- `terminal` — the user clicked **"In terminal"** in the deck: they want to
+  answer this question in the terminal, not the popup. `answer` is empty. **Do
+  not** treat this as declined or proceed on a guess — instead **re-ask the same
+  question in the terminal** with the native `AskUserQuestion` tool (which
+  renders the terminal picker), then act on the answer they give there. The two
+  channels stay alive side by side; `terminal` just means "ask me the native
+  way instead."
 
 Keep `ask_id` if a parallel task might need to revise or withdraw the question.
+
+**The "In terminal" escape (`kind:"terminal"`).** Every `ask_user` question the
+deck shows carries a secondary "In terminal" button next to Dismiss. When the
+user clicks it they are choosing the terminal over the popup — so re-ask the
+*identical* question with `AskUserQuestion`. This is a hand-off, not a rejection:
+do not disable or skip the native tool, and do not fall back to a guess.
 
 **Degrade gracefully.** On `timeout`, `dismissed`, or `cancelled`, do **not**
 stall or ask again in a loop. Proceed on your best judgment, choose the

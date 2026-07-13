@@ -69,6 +69,24 @@ function send(ask: AskRow, answer: string, kind: AskAnswerKind): void {
   });
 }
 
+/** §46 dual-answer: the secondary "In terminal" escape. Resolves the ask with
+ * kind `terminal` (empty answer), the signal for the agent to re-ask the same
+ * question via the native `AskUserQuestion` terminal picker. Grey/ghost styling
+ * so it stays out of the way beside Dismiss; present on the answerable single-
+ * question + form paths (never on an orphaned ask, which can't be answered). */
+function renderTerminalEscape(ask: AskRow): HTMLButtonElement {
+  return h(
+    'button',
+    {
+      className: 'qd-btn qd-btn-ghost qd-ask-terminal',
+      type: 'button',
+      title: 'Answer this in the terminal instead',
+      onclick: () => send(ask, '', 'terminal'),
+    },
+    ['In terminal'],
+  ) as HTMLButtonElement;
+}
+
 function renderIdentity(ask: AskRow, sessions: SessionRow[]): HTMLElement {
   const session = findSession(sessions, ask.sessionId);
   const dot = h('span', { className: 'qd-row-dot', 'data-status': session?.status ?? 'dead' });
@@ -262,7 +280,11 @@ function renderForm(ask: AskRow, questions: AskQuestion[]): HTMLElement {
     ...blocks,
     errorEl,
     h('div', { className: 'qd-ask-actions' }, [
-      h('button', { className: 'qd-btn qd-btn-ghost', type: 'button', onclick: () => send(ask, '', 'dismissed') }, ['Dismiss']),
+      // §46: "In terminal" + Dismiss grouped on the left, Submit on the right.
+      h('div', { className: 'qd-ask-actions-group' }, [
+        renderTerminalEscape(ask),
+        h('button', { className: 'qd-btn qd-btn-ghost', type: 'button', onclick: () => send(ask, '', 'dismissed') }, ['Dismiss']),
+      ]),
       submit,
     ]),
   ]);
@@ -311,12 +333,16 @@ function renderAsk(ask: AskRow, sessions: SessionRow[]): void {
     ...(ask.detail ? [h('div', { className: 'qd-ask-detail' }, [ask.detail])] : []),
     renderOptions(ask),
     renderFreeform(ask),
+    // §46: "In terminal" escape sits beside Dismiss, both secondary.
     h('div', { className: 'qd-ask-actions' }, [
-      h(
-        'button',
-        { className: 'qd-btn qd-btn-ghost', type: 'button', onclick: () => send(ask, '', 'dismissed') },
-        ['Dismiss'],
-      ),
+      h('div', { className: 'qd-ask-actions-group' }, [
+        renderTerminalEscape(ask),
+        h(
+          'button',
+          { className: 'qd-btn qd-btn-ghost', type: 'button', onclick: () => send(ask, '', 'dismissed') },
+          ['Dismiss'],
+        ),
+      ]),
     ]),
   );
 }

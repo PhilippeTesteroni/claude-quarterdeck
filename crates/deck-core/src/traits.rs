@@ -27,10 +27,11 @@ pub enum ToastKind {
     /// `notifyAttention` toggle (asks are the core interactive channel, not
     /// an informational ping).
     Ask,
-    /// R-2.3 — an `idle_prompt` notification while already `idle`: the
-    /// optional "still waiting" nudge, title `"<project> still waiting"`,
-    /// same (non-alert) sound as `Idle`. Gated by the `notifyReminder`
-    /// toggle (default **off**, R-9.5).
+    /// R-2.3 — the "still waiting" nudge, title `"<project> still waiting"`,
+    /// same (non-alert) sound as `Idle`. §47: **retired** — the engine no
+    /// longer emits this (it always duplicated the just-shown `Stop`
+    /// "finished" toast); the variant and its `notifyReminder` toggle survive
+    /// for backward-compat (R-9.5). May return later as a delayed nudge.
     Reminder,
 }
 

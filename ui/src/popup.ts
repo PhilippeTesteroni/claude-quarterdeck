@@ -459,6 +459,16 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
     });
   };
 
+  // §46 dual-answer: the "In terminal" escape mirrored on the popup row —
+  // resolves the ask with kind `terminal` so the agent re-asks via the native
+  // picker. Secondary styling, beside Dismiss (never on an orphaned row).
+  const terminalBtn = (): HTMLElement =>
+    h(
+      'button',
+      { className: 'qd-ask-row-terminal', type: 'button', title: 'Answer in the terminal instead', onclick: () => send('', 'terminal') },
+      ['In terminal'],
+    );
+
   // R-8.7: an ask recovered after a restart can never be answered — show it as
   // expired with only a Dismiss action, "never answered into the void".
   if (ask.orphaned) {
@@ -501,6 +511,7 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
           },
           ['Answer in window'],
         ),
+        terminalBtn(),
         h(
           'button',
           { className: 'qd-ask-row-dismiss', type: 'button', title: 'Dismiss', onclick: () => send('', 'dismissed') },
@@ -543,6 +554,7 @@ function renderAskMirrorRow(ask: AskRow): HTMLElement {
     h('div', { className: 'qd-ask-row-actions' }, [
       ...options,
       input,
+      terminalBtn(),
       h(
         'button',
         {
@@ -1039,7 +1051,9 @@ function renderSettings(snap: StateSnapshot): void {
         h('p', { className: 'qd-settings-section-title' }, ['Notifications']),
         toggleControl('notifyIdle', 'Notify when a session finishes', settings.notifyIdle),
         toggleControl('notifyAttention', 'Notify when a session needs you', settings.notifyAttention),
-        toggleControl('notifyReminder', 'Remind me if a session is still waiting', settings.notifyReminder),
+        // §47: the "still waiting" reminder is retired (it only ever duplicated
+        // the just-shown "finished" toast). The `notifyReminder` field lives on
+        // in the settings contract for backward-compat but is no longer surfaced.
       ]),
       h('div', { className: 'qd-settings-section' }, [
         h('p', { className: 'qd-settings-section-title' }, ['General']),

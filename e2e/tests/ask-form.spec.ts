@@ -109,6 +109,23 @@ test.describe('multi-question ask form (§29)', () => {
     await expect(page.getByRole('checkbox', { name: '--fast' })).toHaveClass(/selected/);
   });
 
+  // SPEC §46 dual-answer: the multi-question form also carries the secondary
+  // "In terminal" escape; clicking it resolves the ask with kind:"terminal"
+  // without validating/submitting the form.
+  test('form "In terminal" resolves the ask with kind:"terminal" (§46)', async ({ page }) => {
+    await gotoAsk(page, 'ask-form');
+    await expect(page.getByRole('button', { name: 'In terminal' })).toBeVisible();
+
+    // No form validation runs — it hands off to the terminal even with the
+    // required radio unanswered.
+    await page.getByRole('button', { name: 'In terminal' }).click();
+    const last = await page.evaluate(
+      () => (window as unknown as { __qdMock: { lastAnswerAsk(): { askId: string; kind: string } | null } }).__qdMock.lastAnswerAsk(),
+    );
+    expect(last).toEqual({ askId: 'a1', kind: 'terminal' });
+    await expect(page.locator('.qd-ask-form-error')).toHaveCount(0);
+  });
+
   test('popup mirror shows "N questions — Answer in window", no inline input (R-29.5)', async ({ page }) => {
     await gotoPopup(page, 'ask-form');
 

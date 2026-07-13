@@ -251,8 +251,10 @@ export interface StateSnapshot {
 export const STATE_EVENT = 'deck://state';
 
 /** Result kind of an MCP `ask_user` call, mirrored to the UI. `cancelled` (R-19.5)
- * is produced by a `cancel_ask` tool call, never by a UI action. */
-export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed' | 'cancelled' | 'form';
+ * is produced by a `cancel_ask` tool call, never by a UI action. `terminal` (§46)
+ * is the "In terminal" escape: the user chose to answer in the terminal, so the
+ * agent re-asks via the native `AskUserQuestion` picker. */
+export type AskAnswerKind = 'option' | 'text' | 'timeout' | 'dismissed' | 'cancelled' | 'form' | 'terminal';
 
 /**
  * Tauri commands exposed by the shell (implemented in T3). Argument objects are

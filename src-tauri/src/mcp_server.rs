@@ -180,6 +180,17 @@ impl AskAnswer {
             kind: AskAnswerKind::Cancelled,
         }
     }
+    /// §46 dual-answer: the user clicked "In terminal" — they chose to answer in
+    /// the terminal rather than the deck. Carries an empty `answer` and
+    /// `kind:"terminal"`, the signal for the agent to re-ask via the native
+    /// `AskUserQuestion` tool.
+    #[cfg(test)]
+    pub fn terminal() -> Self {
+        Self {
+            answer: String::new(),
+            kind: AskAnswerKind::Terminal,
+        }
+    }
     /// The user submitted a multi-question / multi-select form (SPEC §29,
     /// R-29.3): `answer` is the `{"answers":[...]}` JSON document.
     #[cfg(test)]
@@ -997,7 +1008,7 @@ fn tools_list_result() -> Value {
         "tools": [
             {
                 "name": "ask_user",
-                "description": "Ask the human operating this machine a question and BLOCK until they answer. Use during long autonomous runs when you hit a decision only a human can make. Pass your current working directory as `context` so Quarterdeck attributes the question to your session. Provide EITHER a single `question` (+ optional `options`) OR a `questions` array for a multi-question / multi-select form; when `questions` is present, `question`/`options` are ignored. Keep `question` short; put the reasoning/body in `detail`. Prefer `options` for multiple-choice decisions. Omit `timeout_seconds` (or pass 0) to wait indefinitely (persistent). Returns {answer, kind, ask_id} where kind is option|text|timeout|dismissed|cancelled|form; a form answer is a JSON string {\"answers\":[{header,question,selected:[...],text?}, ...]}. On timeout/dismissal, proceed on your best judgment. Keep the returned `ask_id` if a parallel task may need to update_ask/cancel_ask it.",
+                "description": "Ask the human operating this machine a question and BLOCK until they answer. Use during long autonomous runs when you hit a decision only a human can make. Pass your current working directory as `context` so Quarterdeck attributes the question to your session. Provide EITHER a single `question` (+ optional `options`) OR a `questions` array for a multi-question / multi-select form; when `questions` is present, `question`/`options` are ignored. Keep `question` short; put the reasoning/body in `detail`. Prefer `options` for multiple-choice decisions. Omit `timeout_seconds` (or pass 0) to wait indefinitely (persistent). Returns {answer, kind, ask_id} where kind is option|text|timeout|dismissed|cancelled|form|terminal; a form answer is a JSON string {\"answers\":[{header,question,selected:[...],text?}, ...]}. If kind is \"terminal\", the user chose to answer in the terminal instead of the deck: RE-ASK the SAME question using the native AskUserQuestion tool (which renders the terminal picker), then proceed on their answer there. On timeout/dismissal, proceed on your best judgment. Keep the returned `ask_id` if a parallel task may need to update_ask/cancel_ask it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1891,6 +1902,41 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["structuredContent"]["kind"], "form");
         assert_eq!(v["result"]["structuredContent"]["answer"], doc);
+        let _ = shutdown.send(());
+    }
+
+    // --- §46 dual-answer: "In terminal" escape --------------------------------
+
+    #[test]
+    fn ask_answer_terminal_serializes_kind_terminal() {
+        // §46: a terminal answer serializes with kind "terminal" and an empty
+        // answer on the existing channel (the signal to re-ask natively).
+        let content = ask_answer_content("ask-1", &AskAnswer::terminal());
+        assert_eq!(content["structuredContent"]["kind"], "terminal");
+        assert_eq!(content["structuredContent"]["answer"], "");
+        assert_eq!(content["structuredContent"]["ask_id"], "ask-1");
+        assert_eq!(content["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn ask_user_terminal_round_trip_returns_kind_terminal() {
+        // §46 end-to-end: the deck sends an "In terminal" answer, and the blocked
+        // ask_user call returns kind:"terminal" so the agent re-asks natively.
+        let (gw, mut signal) = TestGateway::new();
+        let gw = Arc::new(gw);
+        let (port, shutdown) = spawn_test_server("t", gw.clone()).await;
+        // Persistent ask so it stays blocked until the deck resolves it.
+        let body = r#"{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"Merge to main or open a PR?","options":["Merge","PR"]}}}"#;
+        let call = tokio::spawn(http_post(port, Some("t".into()), body.into()));
+        signal.recv().await.unwrap();
+        assert!(gw.answer_next(AskAnswer::terminal()));
+
+        let (status, resp) = call.await.unwrap();
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        assert_eq!(v["result"]["structuredContent"]["kind"], "terminal");
+        assert_eq!(v["result"]["structuredContent"]["answer"], "");
         let _ = shutdown.send(());
     }
 

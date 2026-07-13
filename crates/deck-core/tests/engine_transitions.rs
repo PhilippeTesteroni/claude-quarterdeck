@@ -55,16 +55,16 @@ fn elicitation_dialog_enters_attention() {
 }
 
 #[test]
-fn idle_prompt_does_not_change_status_but_emits_reminder_toast() {
-    // R-2.3 / R-9.5: `idle_prompt` leaves the status idle, but the engine emits a
-    // Reminder toast decision (the shell gates it on the default-off
-    // `notifyReminder` toggle).
+fn idle_prompt_does_not_change_status_and_emits_no_toast() {
+    // R-2.3 / §47: `idle_prompt` leaves the status idle and fires NO toast. The
+    // "still waiting" reminder is retired — it always duplicated the just-shown
+    // Stop "finished" toast, so `idle_prompt` is now inert.
     let (mut s, _c) = store_at(T0);
     s.on_event(&session_start("a", "/p", T0));
     s.on_event(&stop("a", T0 + 10)); // now idle
     let fx = s.on_event(&notification("a", "idle_prompt", None, T0 + 20));
     assert_eq!(s.status_of("a"), Some(Status::Idle));
-    assert_eq!(toast_kinds(&fx), [ToastKind::Reminder]);
+    assert!(fx.is_empty(), "§47: idle_prompt produces no toast decision");
 }
 
 #[test]
@@ -388,24 +388,24 @@ fn suppressed_toast_refund_releases_the_throttle_slot() {
     // fires once the toggle is re-enabled — even within the 10 s window.
     let (mut s, _c) = store_at(T0);
     s.on_event(&session_start("a", "/p", T0));
+
+    // First turn finishes → Idle toast emitted (engine stamps the slot).
     s.on_event(&prompt("a", "go", T0 + 1));
-    s.on_event(&stop("a", T0 + 100)); // idle toast (kind Idle)
-
-    // First idle_prompt → reminder toast emitted (engine stamps the slot).
-    let first = s.on_event(&notification("a", "idle_prompt", None, T0 + 200));
-    assert_eq!(toast_kinds(&first), [ToastKind::Reminder]);
+    let first = s.on_event(&stop("a", T0 + 100));
+    assert_eq!(toast_kinds(&first), [ToastKind::Idle]);
     let Effect::Toast(decision) = &first[0];
-    assert_eq!(decision.at_ms, T0 + 200);
+    assert_eq!(decision.at_ms, T0 + 100);
 
-    // Shell found notifyReminder OFF → no toast shown → refund the slot.
-    s.refund_toast("a", ToastKind::Reminder, decision.at_ms);
+    // Shell found notifyIdle OFF → no toast shown → refund the slot.
+    s.refund_toast("a", ToastKind::Idle, decision.at_ms);
 
-    // A second idle_prompt ~1 s later (well within 10 s) still fires, because
+    // A second turn finishing ~1 s later (well within 10 s) still fires, because
     // the suppressed one never really spent the window.
-    let second = s.on_event(&notification("a", "idle_prompt", None, T0 + 1_200));
+    s.on_event(&prompt("a", "again", T0 + 1_100));
+    let second = s.on_event(&stop("a", T0 + 1_200));
     assert_eq!(
         toast_kinds(&second),
-        [ToastKind::Reminder],
+        [ToastKind::Idle],
         "a refunded (never-shown) toast must not throttle the next same-kind toast"
     );
 }
@@ -450,13 +450,13 @@ fn a_shown_toast_is_not_refunded_and_still_throttles_the_burst() {
     // R-9.4 throttle still collapses a same-kind burst within 10 s.
     let (mut s, _c) = store_at(T0);
     s.on_event(&session_start("a", "/p", T0));
-    s.on_event(&prompt("a", "go", T0 + 1));
-    s.on_event(&stop("a", T0 + 100));
 
-    let first = s.on_event(&notification("a", "idle_prompt", None, T0 + 200));
-    assert_eq!(toast_kinds(&first), [ToastKind::Reminder]);
+    s.on_event(&prompt("a", "go", T0 + 1));
+    let first = s.on_event(&stop("a", T0 + 100));
+    assert_eq!(toast_kinds(&first), [ToastKind::Idle]);
     // No refund: the toast was shown.
-    let second = s.on_event(&notification("a", "idle_prompt", None, T0 + 1_200));
+    s.on_event(&prompt("a", "again", T0 + 1_100));
+    let second = s.on_event(&stop("a", T0 + 1_200));
     assert!(second.is_empty(), "a shown toast still throttles the burst");
 }
 

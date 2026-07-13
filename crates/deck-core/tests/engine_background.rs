@@ -380,6 +380,107 @@ fn registry_demote_is_re_evaluated_on_the_tick() {
     assert_eq!(store.status_of("s"), Some(Status::Idle));
 }
 
+// --- R-45 flap-fix: gate the §44 demote on transcript quiescence ------------
+
+#[test]
+fn advancing_transcript_blocks_registry_demote_no_flap() {
+    // R-45: Claude Code writes the registry status to `waiting` MID-TURN (waiting
+    // on a tool/permission), not only when the turn ends. A busy agent whose
+    // transcript keeps advancing must NOT be demoted by that transient `waiting`
+    // — otherwise the row flaps 🟡→🟢→🟡 (§44 demote, then §30 re-promote) and
+    // fires a spurious "finished" toast. The shell refreshes transcript activity
+    // BEFORE the registry poll, so the demote sees the still-advancing mtime.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&prompt("s", "go", T0 + 10)); // hook working, last activity T0+10
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+
+    // A poll lands with the transcript just written (mtime ≈ now) and the registry
+    // momentarily reporting `waiting` (fresh, after the last hook event). Without
+    // R-45 every §44 guard passes and the row would demote.
+    clock.set(T0 + 5_000);
+    store.refresh_transcript_activity(|_| Some(T0 + 5_000)); // advancing
+    let mut waiting = idle_entry("s", T0 + 5_000);
+    waiting.status = Some("waiting".to_string());
+    store.apply_registry(&[waiting]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Working),
+        "a mid-turn `waiting` on an advancing transcript must not demote (no flap)"
+    );
+}
+
+#[test]
+fn quiescent_transcript_still_demotes_esc_wedged_working() {
+    // R-45: the flap guard must not defeat the §44 ESC-demote. An ESC-interrupt
+    // stops the transcript writes, so its mtime goes stale (≥ RECOVERY_MIN_ADVANCE_MS
+    // old); a fresh registry idle then still demotes the wedged working row.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&prompt("s", "go", T0 + 10));
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+
+    // ESC: the last transcript write was at T0+3_000; the poll lands well after it.
+    clock.set(T0 + 10_000);
+    store.refresh_transcript_activity(|_| Some(T0 + 3_000)); // stale (> 2 s old)
+    store.apply_registry(&[idle_entry("s", T0 + 10_000)]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Idle),
+        "a quiescent transcript + fresh registry idle still demotes the ESC-wedged row"
+    );
+}
+
+#[test]
+fn registry_demote_fires_once_transcript_goes_quiescent() {
+    // R-45 interplay: the SAME row that resisted the demote while advancing
+    // demotes on a later poll once the transcript stops — the guard DELAYS, never
+    // DEFEATS, the §44 demote.
+    let (mut store, clock) = store_at(T0);
+    store.on_event(&session_start_full(
+        "s",
+        "/p",
+        Some("/p/s.jsonl"),
+        Some(1),
+        None,
+        T0,
+    ));
+    store.on_event(&prompt("s", "go", T0 + 10));
+
+    // Poll 1: advancing transcript + registry `waiting` → held working.
+    clock.set(T0 + 5_000);
+    store.refresh_transcript_activity(|_| Some(T0 + 5_000));
+    let mut waiting = idle_entry("s", T0 + 5_000);
+    waiting.status = Some("waiting".to_string());
+    store.apply_registry(&[waiting]);
+    assert_eq!(store.status_of("s"), Some(Status::Working));
+
+    // Poll 2: the transcript stopped at T0+5_000; now well past it → quiescent, so
+    // a fresh registry idle finally demotes.
+    clock.set(T0 + 12_000);
+    store.refresh_transcript_activity(|_| Some(T0 + 5_000)); // no advance → stale
+    store.apply_registry(&[idle_entry("s", T0 + 12_000)]);
+    assert_eq!(
+        store.status_of("s"),
+        Some(Status::Idle),
+        "once the transcript quiesces the §44 demote fires (guard delays, not defeats)"
+    );
+}
+
 // --- R-21.3 finished toast despite override --------------------------------
 
 #[test]

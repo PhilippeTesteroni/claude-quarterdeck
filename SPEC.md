@@ -34,7 +34,7 @@ This spec is locked; the canonical locked copy lives in Notion, this file mirror
 
 - **R-2.1** Transitions follow the table; unknown `notification_type` values are ignored for status (logged).
 - **R-2.2** `attention → working` recovery: while `attention` (from hooks, not from a pending ask), if the transcript file's size/mtime advances ≥2 s after the Notification timestamp → `working`. (Claude Code emits no event on permission-grant; we stat the file, never parse it for this.)
-- **R-2.3** `idle_prompt` notifications do NOT change status (session is already `idle` via `Stop`); optional "still waiting" reminder toast, default **off**.
+- **R-2.3** `idle_prompt` notifications do NOT change status (session is already `idle` via `Stop`) and fire no toast. (§47: the "still waiting" reminder is retired — it always duplicated the just-shown `Stop` "finished" toast; may return later as a delayed nudge.)
 - **R-2.4** A pending ask forces `attention` regardless of hook-derived status; on answer/timeout the status recomputes from last hook state.
 - **R-2.5** `dead` rows persist 5 min, then are removed. `SessionEnd` always wins immediately.
 - **R-2.6** Tray icon = worst status; zero sessions → neutral/gray icon.
@@ -109,7 +109,7 @@ Installed into **user-level** `~/.claude/settings.json` (applies to all projects
 - **R-7.1** Popup window: frameless, 360×460 (max-height 560 then scroll), anchored to tray icon, hides on blur/Esc, absent from taskbar/Dock/alt-tab.
 - **R-7.2** Row: status dot (soft pulse when `working`, steady otherwise), project (semibold), title (muted, 1-line ellipsis), git branch chip when known, right-aligned mono time-in-status (`4m 07s`, live tick 1 s). Hover → full cwd tooltip. Right-click → Copy session id / Remove row.
 - **R-7.3** Sort: attention → working → idle → dead; within group by latest activity. Counts in footer (`1 needs you · 2 working · 1 idle`).
-- **R-7.4** Header: wordmark, watch line below, gear → settings pane (slide-in, same window): notification toggles (idle/attention/reminder), autostart toggle, Install/Repair hooks, Uninstall hooks, Enable agent questions (MCP setup, R-8.6), data dir path, version.
+- **R-7.4** Header: wordmark, watch line below, gear → settings pane (slide-in, same window): notification toggles (idle/attention; §47 reminder retired), autostart toggle, Install/Repair hooks, Uninstall hooks, Enable agent questions (MCP setup, R-8.6), data dir path, version.
 - **R-7.5** Empty state: "No Claude Code sessions yet — start `claude` in any terminal." + hooks-health line. If hooks not installed: persistent banner with "Install hooks" button (also shown as a dot on the gear).
 - **R-7.6** Copy register: sentence case, plain verbs, actions say what they do ("Install hooks", not "Setup"); errors state what happened + the fix, never apologize.
 
@@ -131,7 +131,7 @@ Installed into **user-level** `~/.claude/settings.json` (applies to all projects
 - **R-9.2** `attention` (permission/elicitation/ask) → alert toast: title "<project> needs you", body = notification message or question. **Distinct system alert sound** (Win: a `ms-winsoundevent:Notification.*` alert-class sound — implementer picks the least obnoxious; mac: `Basso`/`Sosumi`-class system sound). Red-badged icon variant where the platform allows.
 - **R-9.3** Windows: stable `AppUserModelID` (`pro.philippgross.quarterdeck`) registered so toasts work in dev and packaged modes.
 - **R-9.4** Throttle: per session, max 1 toast per status-change per 10 s (bursts collapse); suppressed when the popup is visible AND focused. Ask toasts never suppressed.
-- **R-9.5** Toggles per type (idle/attention/reminder), defaults on/on/off. No sound customization in v1 (v2).
+- **R-9.5** Toggles per type (idle/attention), defaults on/on. (§47: the reminder toggle is retired and no longer surfaced; the `notifyReminder` key is still accepted for backward-compat per R-10.1. May return later as a delayed nudge.) No sound customization in v1 (v2).
 - **R-9.6** Toast click: opens the popup (or the ask window for ask toasts). No terminal focusing in v1.
 
 ## 10. Settings, autostart, persistence

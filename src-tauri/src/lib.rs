@@ -1018,6 +1018,10 @@ impl Shell {
             let enabled = match decision.kind {
                 ToastKind::Idle => settings.notify_idle,
                 ToastKind::Attention => settings.notify_attention,
+                // §47: the reminder is retired — the engine no longer emits
+                // `ToastKind::Reminder`, so this arm is unreachable at runtime.
+                // Kept (still reading the backward-compat `notify_reminder`
+                // toggle) only for match exhaustiveness over `ToastKind`.
                 ToastKind::Reminder => settings.notify_reminder,
                 ToastKind::Ask => true,
             };
@@ -1530,9 +1534,14 @@ impl Shell {
                     AskAnswerKind::Option | AskAnswerKind::Text | AskAnswerKind::Form => {
                         store.note_ask_answered(sid)
                     }
+                    // §46: "In terminal" is not an answer here — the user will
+                    // answer via the native picker, so clear the pending-ask
+                    // override like a dismiss (the status recomputes from the
+                    // last hook state).
                     AskAnswerKind::Timeout
                     | AskAnswerKind::Dismissed
-                    | AskAnswerKind::Cancelled => store.note_ask_cleared(sid),
+                    | AskAnswerKind::Cancelled
+                    | AskAnswerKind::Terminal => store.note_ask_cleared(sid),
                 }
             } else {
                 // Agent already stopped waiting: just drop the pending-ask
@@ -2254,11 +2263,13 @@ fn run_tick(shell: &Arc<Shell>) {
         // `!entries.is_empty()` used to leave the LAST removed registry file's
         // name/busy state wedged on its row forever (nothing else refreshes the
         // name). An empty read is cheap — it just walks the rows and clears.
-        shell
-            .store
-            .lock()
-            .expect("store poisoned")
-            .apply_registry(&entries);
+        let mut store = shell.store.lock().expect("store poisoned");
+        // §45/R-45: refresh each row's last-seen transcript mtime BEFORE
+        // `apply_registry`, so the §44 registry-demote gates on the CURRENT
+        // transcript quiescence — a mid-turn registry `waiting` on an agent whose
+        // transcript is still advancing must not flap the row idle→working.
+        store.refresh_transcript_activity(transcript_mtime_ms);
+        store.apply_registry(&entries);
     }
     let procs = SysProcs::refreshed();
     let effects = {
