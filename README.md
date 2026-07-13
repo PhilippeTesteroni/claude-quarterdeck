@@ -11,7 +11,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-D97757.svg)](LICENSE)
 &nbsp;![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-3a3a3a)
 &nbsp;![Built with Tauri v2](https://img.shields.io/badge/built%20with-Tauri%20v2-D97757)
-&nbsp;[![CI](https://github.com/philippgross/quarterdeck/actions/workflows/ci.yml/badge.svg)](https://github.com/philippgross/quarterdeck/actions/workflows/ci.yml)
+&nbsp;[![CI](https://github.com/PhilippeTesteroni/claude-quarterdeck/actions/workflows/ci.yml/badge.svg)](https://github.com/PhilippeTesteroni/claude-quarterdeck/actions/workflows/ci.yml)
 
 </div>
 
@@ -21,7 +21,7 @@ Quarterdeck is the fix. It watches every Claude Code session on your machine, gi
 
 The half that matters: your agents can reach back. A running agent asks you a question through an always-on-top popup while it works, and your answer routes straight into that session. A twenty-minute autonomous run stops and asks "which of these two migrations?" instead of stalling or guessing wrong. That is the difference between a dashboard you stare at and a monitor you can actually be reached through.
 
-![Quarterdeck popup: six Claude Code sessions with live status, context fill, and token spend](docs/screenshots/popup-dark.png)
+<p align="center"><img src="docs/screenshots/popup-dark.png" alt="Quarterdeck popup: six Claude Code sessions with live status, context fill, and token spend" width="400"></p>
 
 ## Why Quarterdeck
 
@@ -42,12 +42,12 @@ Quarterdeck builds the return trip. An agent that can reach a human at the exact
 
 <table>
 <tr>
-<td width="50%" valign="top">
-<img src="docs/screenshots/lamp-dark.png" alt="Collapsed lamp mode: a single status pie for the whole fleet"><br>
+<td width="50%" align="center" valign="top">
+<img src="docs/screenshots/lamp-dark.png" alt="Collapsed lamp mode: a single status pie for the whole fleet" width="120"><br>
 <sub><b>Lamp mode.</b> Pin the popup, then collapse it to a tiny traffic-light lamp: one pie of your fleet's status mix, always on top.</sub>
 </td>
-<td width="50%" valign="top">
-<img src="docs/screenshots/context-menu-dark.png" alt="Per-row context menu: copy session id, rename, reset name, remove row, kill process"><br>
+<td width="50%" align="center" valign="top">
+<img src="docs/screenshots/context-menu-dark.png" alt="Per-row context menu: copy session id, rename, reset name, remove row, kill process" width="300"><br>
 <sub><b>Per-row actions.</b> Right-click any session to rename it, copy its id, drop the row, or kill the process.</sub>
 </td>
 </tr>
@@ -65,7 +65,7 @@ Every session is in exactly one of five states, driven by Claude Code's own hook
 | 🟢 Idle | Turn finished, nothing running, awaiting instructions | Claude finishes responding, or a session starts |
 | ⚪ Dead | Process is gone | A liveness check no longer finds the process |
 
-![Watch line and fleet rows: one session waiting on a subagent, one working, the rest idle](docs/screenshots/popup-waiting-dark.png)
+<p align="center"><img src="docs/screenshots/popup-waiting-dark.png" alt="Watch line and fleet rows: one session waiting on a subagent, one working, the rest idle" width="400"></p>
 
 A few details worth knowing:
 
@@ -76,7 +76,10 @@ A few details worth knowing:
 
 ## Install
 
-1. Download the installer for your platform from the [releases](https://github.com/philippgross/quarterdeck/releases) page, or build it yourself (see [Development](#development--build)):
+> [!WARNING]
+> **macOS is not tested on real hardware yet.** Quarterdeck is built and dogfooded daily on Windows. The macOS build compiles and shares the same tested core logic, but it has not been run on a real Mac. Mac testing is coming soon. Until then, use it on macOS at your own risk.
+
+1. Download the installer for your platform from the [releases](https://github.com/PhilippeTesteroni/claude-quarterdeck/releases) page, or build it yourself (see [Development](#development--build)):
    - Windows: `Quarterdeck_<version>_x64-setup.exe` (NSIS installer)
    - macOS: `Quarterdeck_<version>_<arch>.dmg`
 2. Launch it. On first run Quarterdeck makes **no system changes until you say so**. It explains what it wants and asks explicitly:
@@ -118,7 +121,7 @@ Once enabled, any Claude Code session on the machine can call:
 
 While a question is blocked, Quarterdeck keeps the MCP connection alive with a heartbeat so long or indefinite waits are not dropped by Claude Code's idle timeout. The bundled skill ([`skills/quarterdeck/SKILL.md`](skills/quarterdeck/SKILL.md)) documents the agent side in full.
 
-![Agent question popup: always-on-top, quick-pick options with keyboard 1 to 9, free-text field](docs/screenshots/ask-dark.png)
+<p align="center"><img src="docs/screenshots/ask-dark.png" alt="Agent question popup: always-on-top, quick-pick options with keyboard 1 to 9, free-text field" width="400"></p>
 
 ## Development / build
 
