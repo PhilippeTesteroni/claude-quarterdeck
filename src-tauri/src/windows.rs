@@ -47,6 +47,10 @@ const LAMP_SIZE: f64 = 56.0;
 const ASK_W: f64 = 420.0;
 const ASK_MIN_H: f64 = 140.0;
 const ASK_MAX_H: f64 = 640.0;
+/// Logical-pixel breathing room kept between the ask window and each edge of the
+/// monitor work area, so the on-screen height cap (below) never butts the window
+/// flush against the taskbar / screen top. Applied twice (top + bottom).
+const ASK_SCREEN_MARGIN: f64 = 12.0;
 
 /// Minimum gap between `popupPos` persist writes while the user drags the
 /// pinned popup (SPEC R-25.2). A drag fires many `Moved` events per second;
@@ -224,12 +228,21 @@ fn popup_target_height(content_px: f64) -> f64 {
     content_px.clamp(POPUP_MIN_H, POPUP_MAX_H)
 }
 
-/// Pure clamp for the ask window's grow-then-scroll band (SPEC §35.2 auto-size):
-/// content shorter than the 140 floor keeps that floor (a compact perm/question),
-/// taller content grows up to 640, beyond which the window stays at 640 and the
+/// Pure clamp for the ask window's grow-then-scroll band (SPEC §35.2 auto-size),
+/// additionally capped so the window never grows past the visible screen (SPEC
+/// §35.2 off-screen fix). Content shorter than the 140 floor keeps that floor (a
+/// compact perm/question); taller content grows up to 640, beyond which the
 /// content area scrolls. Mirror of [`popup_target_height`] for the ask window.
-fn ask_target_height(content_px: f64) -> f64 {
-    content_px.clamp(ASK_MIN_H, ASK_MAX_H)
+/// `screen_max`
+/// is the on-screen height budget (the monitor work-area height minus the top +
+/// bottom [`ASK_SCREEN_MARGIN`]); a tall §29 form / long perm that would exceed
+/// it is held at the cap and the content area scrolls instead of the window
+/// spilling off the bottom edge. A `screen_max` below the [`ASK_MIN_H`] floor
+/// (a very short screen) still yields the minimum window — its content scrolls.
+/// Kept pure so the cap is unit-testable without a live monitor.
+fn ask_target_height_on_screen(content_px: f64, screen_max: f64) -> f64 {
+    let cap = ASK_MAX_H.min(screen_max.max(ASK_MIN_H));
+    content_px.clamp(ASK_MIN_H, cap)
 }
 
 /// SPEC R-14.2: whether the popup should hide when it loses focus. Pinned
@@ -641,15 +654,76 @@ pub fn resize_popup_to_content(app: &AppHandle, content_px: f64) -> Result<(), S
 /// reports a number).
 pub fn resize_ask_to_content(app: &AppHandle, content_px: f64) -> Result<(), String> {
     let ask = ask_window(app)?;
-    let target_h = ask_target_height(content_px);
     let scale = ask.scale_factor().map_err(|err| err.to_string())?;
+    // §35.2 off-screen fix: cap the height to the visible work area (converted to
+    // logical px) so a tall §29 multi-select form / long perm can never grow the
+    // window past the screen edges — its options would land off-screen and read
+    // as "unclickable". Beyond the cap the content area scrolls (styles.css
+    // `.qd-ask-content { overflow-y: auto }`). No monitor info (headless CI) →
+    // the plain 640 band.
+    let screen_max = ask_screen_max_height(&ask, scale).unwrap_or(ASK_MAX_H);
+    let target_h = ask_target_height_on_screen(content_px, screen_max);
     let current_h = ask.inner_size().map_err(|err| err.to_string())?.height as f64 / scale;
     // Avoid churn: only resize when the height meaningfully changes.
-    if (current_h - target_h).abs() < 1.0 {
-        return Ok(());
+    if (current_h - target_h).abs() >= 1.0 {
+        ask.set_size(LogicalSize::new(ASK_W, target_h))
+            .map_err(|err| err.to_string())?;
     }
-    ask.set_size(LogicalSize::new(ASK_W, target_h))
-        .map_err(|err| err.to_string())
+    // Always re-clamp: `set_size` grows the window downward from a fixed top-left,
+    // and a window centered (R-8.3) while larger than the screen sits partly off
+    // the top/bottom — pull the whole window back onto the work area so every
+    // option/button is reachable. Runs even when the height didn't change, so a
+    // window that was already off-screen still gets corrected.
+    clamp_ask_onto_screen(&ask)
+}
+
+/// The on-screen height budget for the ask window in LOGICAL pixels: the current
+/// monitor's work-area height (physical) converted via `scale`, minus the top +
+/// bottom [`ASK_SCREEN_MARGIN`]. `None` when no monitor info is available (a
+/// headless runner), where the caller falls back to the plain [`ASK_MAX_H`] band.
+fn ask_screen_max_height(ask: &WebviewWindow, scale: f64) -> Option<f64> {
+    let monitor = ask
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| ask.primary_monitor().ok().flatten())?;
+    let work_h = monitor.work_area().size.height as f64 / scale;
+    Some(work_h - ASK_SCREEN_MARGIN * 2.0)
+}
+
+/// SPEC §35.2 off-screen fix: keep the always-on-top ask window fully inside the
+/// monitor work area after a content-driven `set_size` grows it (or after it was
+/// centered while taller than the screen). Unlike the popup, the ask window has
+/// no tray anchoring or user-move tracking, so this is a plain best-effort clamp
+/// of its top-left via the shared [`clamp_rect_onto_work_area`] geometry. Missing
+/// monitor info (headless CI) leaves the window where it is.
+fn clamp_ask_onto_screen(ask: &WebviewWindow) -> Result<(), String> {
+    let monitor = ask
+        .current_monitor()
+        .map_err(|err| err.to_string())?
+        .or(ask.primary_monitor().map_err(|err| err.to_string())?);
+    let Some(monitor) = monitor else {
+        return Ok(());
+    };
+
+    let pos = ask.outer_position().map_err(|err| err.to_string())?;
+    let size = ask.outer_size().map_err(|err| err.to_string())?;
+    let work = monitor.work_area();
+
+    let (x, y) = clamp_rect_onto_work_area(
+        (pos.x, pos.y),
+        (size.width, size.height),
+        (
+            (work.position.x, work.position.y),
+            (work.size.width, work.size.height),
+        ),
+    );
+
+    if (x, y) != (pos.x, pos.y) {
+        ask.set_position(PhysicalPosition::new(x, y))
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 /// Pure geometry for [`anchor_near_tray`]: given the tray icon's rect, the
@@ -796,15 +870,27 @@ fn anchor_near_tray(popup: &WebviewWindow, tray_rect: Rect) -> Result<(), String
 /// user takes focus explicitly on first click/Tab, per spec.
 pub fn show_ask_window(app: &AppHandle) -> Result<(), String> {
     let ask = ask_window(app)?;
-    // Already up: don't re-center + re-show on every enqueue. A rapid burst of
-    // asks otherwise thrashes WebView2 show()/center()/hide() churn (a native
-    // fault risk), and re-centering would also yank the window out from under a
-    // user who is mid-answer. The queue is FIFO and the window stays put (R-8.3);
-    // new asks surface via the pushed state snapshot + the "N more waiting" badge.
-    if ask.is_visible().unwrap_or(false) {
-        return Ok(());
+    // §51: ALWAYS call `show()` — it is idempotent (a no-op on an already-shown
+    // window), so calling it every time is cheap, but it is the ONLY thing that
+    // rescues a window whose OS visibility desynced from Tauri's cached
+    // `is_visible()`. Observed live: WS_VISIBLE was unset (Win32 IsWindowVisible
+    // false) while Tauri reported the ask window visible, so the old
+    // early-return-on-`is_visible()` skipped `show()` and the always-on-top ask
+    // window never appeared (only its popup mirror did). Only the RE-CENTER is
+    // gated on visibility, so a burst of asks does not yank a window the user is
+    // mid-answer on (R-8.3) nor thrash WebView2 show()/center() churn; the FIFO
+    // queue + "N more waiting" badge still handle follow-on asks.
+    let visible = ask.is_visible().unwrap_or(false);
+    tracing::debug!(tauri_is_visible = visible, "show_ask_window (§51)");
+    if !visible {
+        center_on_active_display(&ask)?;
+        // §35.2 off-screen fix: on a short / high-DPI display a window still at
+        // its larger previous size can center partly off the top edge before the
+        // first content-driven resize caps + re-clamps it. Clamp now so it never
+        // flashes off-screen; the resize that follows the next render caps the
+        // height to the screen budget.
+        clamp_ask_onto_screen(&ask)?;
     }
-    center_on_active_display(&ask)?;
     ask.show().map_err(|err| err.to_string())
 }
 
@@ -1020,17 +1106,49 @@ mod tests {
     fn ask_height_grows_then_caps_at_640() {
         // SPEC §35.2 auto-size: short content keeps the 140 floor, taller content
         // grows with the form/perm, and a very tall render caps at 640 (then the
-        // content area scrolls) — the ask analog of `popup_target_height`.
+        // content area scrolls) — the ask analog of `popup_target_height`. With a
+        // roomy screen budget the cap is the plain 640 band.
+        let roomy = 4000.0;
         assert_eq!(
-            ask_target_height(80.0),
+            ask_target_height_on_screen(80.0, roomy),
             ASK_MIN_H,
             "short/empty content → the 140 floor"
         );
-        assert_eq!(ask_target_height(420.0), 420.0, "grows with content");
         assert_eq!(
-            ask_target_height(900.0),
+            ask_target_height_on_screen(420.0, roomy),
+            420.0,
+            "grows with content"
+        );
+        assert_eq!(
+            ask_target_height_on_screen(900.0, roomy),
             ASK_MAX_H,
             "capped at 640, then scrolls"
+        );
+    }
+
+    #[test]
+    fn ask_height_capped_to_a_short_screen() {
+        // SPEC §35.2 off-screen fix: on a screen shorter than the 640 band, a tall
+        // form is held at the screen budget (not 640) so the window can't spill off
+        // the bottom — the content area scrolls the overflow instead.
+        let short_screen = 500.0; // e.g. a 150%-scaled laptop's work area budget
+        assert_eq!(
+            ask_target_height_on_screen(900.0, short_screen),
+            short_screen,
+            "tall content capped to the screen budget, not 640"
+        );
+        // Content that already fits under the screen budget is unaffected.
+        assert_eq!(
+            ask_target_height_on_screen(300.0, short_screen),
+            300.0,
+            "content within budget grows normally"
+        );
+        // A budget below the 140 floor still yields the minimum window (its content
+        // scrolls); the cap can never drop the window below ASK_MIN_H.
+        assert_eq!(
+            ask_target_height_on_screen(900.0, 50.0),
+            ASK_MIN_H,
+            "tiny screen still shows the 140 floor, content scrolls"
         );
     }
 
