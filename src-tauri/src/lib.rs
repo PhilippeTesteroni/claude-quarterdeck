@@ -3048,8 +3048,16 @@ pub fn run() {
             if let Err(err) = windows::set_popup_mode(&handle, startup_settings.popup_mode) {
                 tracing::warn!(error = %err, "failed to apply persisted popup mode at startup (R-25.2)");
             }
+            // §48: restore the position for the PERSISTED mode — a pinned app
+            // that last quit collapsed reopens the lamp where it was, one that
+            // quit expanded reopens the list where it was. The two positions are
+            // independent (`lampPos`/`popupPos`) so neither clobbers the other.
             if startup_settings.popup_pinned {
-                if let Some(pos) = startup_settings.popup_pos {
+                if let Some(pos) = windows::saved_pos_for_mode(
+                    startup_settings.popup_mode,
+                    startup_settings.popup_pos,
+                    startup_settings.lamp_pos,
+                ) {
                     windows::restore_popup_position(&handle, pos);
                 }
             }

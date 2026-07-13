@@ -202,10 +202,19 @@ pub struct Settings {
     /// [`crate::windows::should_force_list_on_unpin`].
     #[serde(default)]
     pub popup_mode: PopupMode,
-    /// Last user-dragged popup position while pinned (SPEC R-25.2), restored at
-    /// startup so a pinned (possibly collapsed) popup reopens where it was left.
+    /// Last user-dragged LIST-popup position while pinned (SPEC R-25.2 / §48),
+    /// restored at startup so a pinned popup that last quit expanded reopens
+    /// where it was left. Kept independent of [`Self::lamp_pos`] so the list's
+    /// resize/§39-clamp never overwrites where the lamp returns to.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub popup_pos: Option<PopupPos>,
+    /// Last user-dragged LAMP position while pinned (SPEC §48). Additive and
+    /// optional (`lampPos`, default None): a pre-v1.8 file carrying only
+    /// `popupPos` keeps the list position and simply has no remembered lamp spot
+    /// until the first lamp drag. Independent of [`Self::popup_pos`] so an
+    /// expand→collapse round trip returns the lamp exactly where it was.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lamp_pos: Option<PopupPos>,
     /// Unknown top-level keys, preserved verbatim (SPEC R-10.1).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -224,6 +233,7 @@ impl Default for Settings {
             show_token_stats: true,
             popup_mode: PopupMode::List,
             popup_pos: None,
+            lamp_pos: None,
             extra: Map::new(),
         }
     }
@@ -258,17 +268,21 @@ impl Settings {
             Some(Value::String(s)) => PopupMode::parse(&s).unwrap_or_default(),
             _ => PopupMode::default(),
         };
-        // `popupPos`: stored on disk as `{"x":..,"y":..}` (the derived `Serialize`
-        // shape); a missing/malformed value is simply "no remembered position",
-        // never a load failure.
-        let popup_pos = match map.remove("popupPos") {
-            Some(Value::Object(mut obj)) => {
-                let x = obj.remove("x").and_then(|v| v.as_f64());
-                let y = obj.remove("y").and_then(|v| v.as_f64());
-                x.zip(y).map(|(x, y)| PopupPos { x, y })
+        // `popupPos`/`lampPos`: each stored on disk as `{"x":..,"y":..}` (the
+        // derived `Serialize` shape); a missing/malformed value is simply "no
+        // remembered position" for that mode, never a load failure.
+        fn take_pos(map: &mut Map<String, Value>, key: &str) -> Option<PopupPos> {
+            match map.remove(key) {
+                Some(Value::Object(mut obj)) => {
+                    let x = obj.remove("x").and_then(|v| v.as_f64());
+                    let y = obj.remove("y").and_then(|v| v.as_f64());
+                    x.zip(y).map(|(x, y)| PopupPos { x, y })
+                }
+                _ => None,
             }
-            _ => None,
-        };
+        }
+        let popup_pos = take_pos(&mut map, "popupPos");
+        let lamp_pos = take_pos(&mut map, "lampPos");
 
         Some(Self {
             notify_idle: take_bool(&mut map, "notifyIdle", true),
@@ -281,6 +295,7 @@ impl Settings {
             show_token_stats: take_bool(&mut map, "showTokenStats", true),
             popup_mode,
             popup_pos,
+            lamp_pos,
             extra: map,
         })
     }
@@ -311,6 +326,11 @@ impl Settings {
             "popupPos" => {
                 if let SettingValue::Text(s) = &value {
                     self.popup_pos = PopupPos::parse(s).or(self.popup_pos);
+                }
+            }
+            "lampPos" => {
+                if let SettingValue::Text(s) = &value {
+                    self.lamp_pos = PopupPos::parse(s).or(self.lamp_pos);
                 }
             }
             other => {
@@ -722,6 +742,78 @@ mod tests {
         let pos = PopupPos { x: 12.0, y: -4.5 };
         let s = pos.to_setting_string();
         assert_eq!(s, "12,-4.5");
+    }
+
+    #[test]
+    fn lamp_pos_defaults_none_and_round_trips_independently_of_popup_pos() {
+        // SPEC §48: the lamp remembers its own spot under a new, additive
+        // `lampPos` key, independent of the list's `popupPos`. Both round-trip
+        // through the comma wire form (the `windows.rs` persist channel) and the
+        // on-disk `{x,y}` object shape.
+        assert_eq!(Settings::default().lamp_pos, None);
+
+        let dir = unique_dir("lamp-pos");
+        let updated =
+            set_setting(&dir, "lampPos", SettingValue::Text("70.5,900".to_string())).unwrap();
+        assert_eq!(updated.lamp_pos, Some(PopupPos { x: 70.5, y: 900.0 }));
+        // The list position is untouched by a lamp-only write.
+        assert_eq!(updated.popup_pos, None);
+
+        let reloaded = load(&dir);
+        assert_eq!(reloaded.lamp_pos, Some(PopupPos { x: 70.5, y: 900.0 }));
+
+        // On-disk shape is a `{x,y}` object under the additive `lampPos` key.
+        let raw = fs::read_to_string(settings_path(&dir)).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["lampPos"]["x"], 70.5);
+        assert_eq!(value["lampPos"]["y"], 900.0);
+    }
+
+    #[test]
+    fn pre_v1_8_file_with_only_popup_pos_keeps_the_list_spot_and_has_no_lamp_pos() {
+        // SPEC §48 back-compat: an existing persisted `popupPos` continues to
+        // mean the LIST position; `lampPos` is simply absent (None) until the
+        // first lamp drag. The pre-v1.8 file must not lose its list position.
+        let dir = unique_dir("pre-v1-8-pos");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            settings_path(&dir),
+            br#"{"popupPinned":true,"popupMode":"lamp","popupPos":{"x":300,"y":150}}"#,
+        )
+        .unwrap();
+
+        let loaded = load(&dir);
+        assert_eq!(
+            loaded.popup_pos,
+            Some(PopupPos { x: 300.0, y: 150.0 }),
+            "existing popupPos still means the LIST position"
+        );
+        assert_eq!(loaded.lamp_pos, None, "no lamp spot remembered yet");
+    }
+
+    #[test]
+    fn expand_then_collapse_leaves_the_lamp_position_untouched() {
+        // SPEC §48: the exact bug being fixed. Previously ONE `popupPos` was
+        // shared by lamp and list: dragging the lamp saved `popupPos=A`, then
+        // expanding to the list grew/§39-clamped from A and persisted the moved
+        // spot A' back into the SAME key, so collapsing landed at A', not A.
+        // With a dedicated `lampPos`, a list-side write (the expand's
+        // resize/clamp persisting to `popupPos`) must NOT disturb where the lamp
+        // returns to.
+        let mut settings = Settings::default();
+        // User drags the lamp to A while collapsed → persists under `lampPos`.
+        settings.apply("lampPos", SettingValue::Text("100,200".to_string()));
+        assert_eq!(settings.lamp_pos, Some(PopupPos { x: 100.0, y: 200.0 }));
+        // Expanding to the list and its §39 clamp settle the LIST at A' →
+        // persists under `popupPos` (the list key), not the lamp's.
+        settings.apply("popupPos", SettingValue::Text("640,480".to_string()));
+        assert_eq!(settings.popup_pos, Some(PopupPos { x: 640.0, y: 480.0 }));
+        // Collapsing back reads `lampPos` — still exactly A, uncorrupted.
+        assert_eq!(
+            settings.lamp_pos,
+            Some(PopupPos { x: 100.0, y: 200.0 }),
+            "the lamp's own position survives a list-side persist (the §48 fix)"
+        );
     }
 
     #[test]

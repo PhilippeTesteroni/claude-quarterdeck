@@ -207,9 +207,12 @@ fn maybe_persist_popup_pos(popup: &WebviewWindow, position: PhysicalPosition<i32
         y: logical.y,
     };
     let value = crate::ipc::SettingValue::Text(pos.to_setting_string());
-    if let Err(err) = crate::settings::set_setting(&crate::settings::data_dir(), "popupPos", value)
-    {
-        tracing::warn!(error = %err, "failed to persist popup position (R-25.2)");
+    // §48: persist under the CURRENT mode's own key so the lamp and the list
+    // keep independent remembered positions — a list resize/clamp writing its
+    // settled spot must never corrupt where the lamp returns to.
+    let key = popup_pos_setting_key(popup_mode());
+    if let Err(err) = crate::settings::set_setting(&crate::settings::data_dir(), key, value) {
+        tracing::warn!(error = %err, key, "failed to persist popup position (R-25.2/§48)");
     }
 }
 
@@ -301,6 +304,35 @@ fn should_persist_popup_pos(last: Option<Instant>, now: Instant, gap: Duration) 
     match last {
         None => true,
         Some(t) => now.duration_since(t) >= gap,
+    }
+}
+
+/// SPEC §48: the persisted-position settings key for a given popup mode. The
+/// lamp and the list each remember their own spot, so expanding the list (whose
+/// §39 clamp / content resize can nudge it, then persist the moved spot) never
+/// corrupts where the lamp returns to on collapse. `Lamp` -> `lampPos`, `List`
+/// -> `popupPos` (the back-compat v1.0/v1.2 list key). Kept pure so the
+/// mode->field selection is unit-testable without a live window.
+fn popup_pos_setting_key(mode: PopupMode) -> &'static str {
+    match mode {
+        PopupMode::Lamp => "lampPos",
+        PopupMode::List => "popupPos",
+    }
+}
+
+/// SPEC §48: the saved position to restore when switching INTO `mode` — the
+/// list's own remembered spot (`popup_pos`) for list, the lamp's (`lamp_pos`)
+/// for lamp. `None` means "no saved position for that mode yet", in which case
+/// the caller keeps the current grow/anchor behavior instead of snapping to a
+/// stale coordinate. Kept pure so the selection is unit-testable without disk.
+pub(crate) fn saved_pos_for_mode(
+    mode: PopupMode,
+    list_pos: Option<crate::settings::PopupPos>,
+    lamp_pos: Option<crate::settings::PopupPos>,
+) -> Option<crate::settings::PopupPos> {
+    match mode {
+        PopupMode::Lamp => lamp_pos,
+        PopupMode::List => list_pos,
     }
 }
 
@@ -475,6 +507,22 @@ pub fn set_popup_mode(app: &AppHandle, mode: PopupMode) -> Result<(), String> {
         // waiting on a `resize_popup` report the (now-hidden) list layout will
         // never send.
         popup.set_size(min).map_err(|e| e.to_string())?;
+    }
+    // §48: each mode remembers its own position — restore the target mode's
+    // saved spot (list -> `popup_pos`, lamp -> `lamp_pos`) so an expand→collapse
+    // round trip returns the lamp exactly where the user left it instead of
+    // dragging it onto the list's (resize/clamp-nudged) coordinates. Marked
+    // programmatic so the resulting `Moved` event isn't mistaken for a fresh
+    // user drag (R-14.1). A mode with no saved position yet is left where it is
+    // (grow/anchor as before). The §39 clamp below still runs, so a restored
+    // spot that is now off-screen (a monitor arrangement change) is pulled back
+    // on.
+    let settings = crate::settings::load(&crate::settings::data_dir());
+    if let Some(pos) = saved_pos_for_mode(mode, settings.popup_pos, settings.lamp_pos) {
+        note_programmatic_move();
+        popup
+            .set_position(LogicalPosition::new(pos.x, pos.y))
+            .map_err(|e| e.to_string())?;
     }
     // §39: keep the window on-screen across the transition. The lamp<->list
     // switch changes the size band from a fixed top-left; the list's full
@@ -1099,6 +1147,31 @@ mod tests {
         // either way, so the order genuinely doesn't matter, but the function
         // must still return a definite answer, not panic.
         assert!(min_before_max(POPUP_W, POPUP_W));
+    }
+
+    #[test]
+    fn popup_pos_setting_key_is_per_mode() {
+        // SPEC §48: the `Moved` handler persists under the CURRENT mode's own
+        // key so the lamp and the list keep independent remembered positions.
+        assert_eq!(popup_pos_setting_key(PopupMode::List), "popupPos");
+        assert_eq!(popup_pos_setting_key(PopupMode::Lamp), "lampPos");
+    }
+
+    #[test]
+    fn saved_pos_for_mode_picks_the_target_modes_own_field() {
+        use crate::settings::PopupPos;
+        let list = Some(PopupPos { x: 10.0, y: 20.0 });
+        let lamp = Some(PopupPos { x: 700.0, y: 900.0 });
+
+        // Switching to list restores the list's spot; to lamp restores the
+        // lamp's — never the other mode's coordinate.
+        assert_eq!(saved_pos_for_mode(PopupMode::List, list, lamp), list);
+        assert_eq!(saved_pos_for_mode(PopupMode::Lamp, list, lamp), lamp);
+
+        // A mode with no saved position yet yields None (caller keeps its
+        // grow/anchor behavior) even when the OTHER mode has one.
+        assert_eq!(saved_pos_for_mode(PopupMode::Lamp, list, None), None);
+        assert_eq!(saved_pos_for_mode(PopupMode::List, None, lamp), None);
     }
 
     #[test]
