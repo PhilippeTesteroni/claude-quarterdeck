@@ -951,12 +951,14 @@ impl Shell {
         foreground::session_is_foreground(&terminal, &fg)
     }
 
-    /// R-17.2/R-17.1: surface the ask window for any pending ask whose session's
-    /// terminal is NOT the foreground window (or is unmatched), but only when the
-    /// window is currently hidden. Called after enqueue and on the 2s poll so a
-    /// suppressed (queued-but-hidden) ask appears the moment focus leaves its
-    /// terminal. Never yanks the window when every pending ask's terminal is
-    /// still foreground (R-17.2: the ask stays queued + mirrored in the popup).
+    /// §50: surface the ask window whenever there is a pending ask and the window
+    /// is currently hidden. An `ask_user` question exists only in Quarterdeck (it
+    /// has no terminal UI), so — unlike a toast — it is NOT focus-suppressed: the
+    /// always-on-top window shows even while the asking session's terminal is the
+    /// foreground window, otherwise the question would be invisible. Called after
+    /// enqueue and on the 2s poll (the poll re-surfaces app-restart-recovered
+    /// asks and any ask whose window was hidden). Focus-aware suppression still
+    /// applies to the alert toast (see `submit_ask`).
     fn maybe_surface_asks(&self) {
         if self.asks_empty() {
             return;
@@ -969,35 +971,11 @@ impl Shell {
         if ask_visible {
             return;
         }
-        // Sample the foreground once (caching it for the R-16.3 perm hot path),
-        // then check every pending ask against it.
-        let fg = self.sample_foreground_and_cache();
-        let terminal_pids = self.store.lock().expect("store poisoned").terminal_pids();
-        let sessions: Vec<Option<String>> = self
-            .asks
-            .lock()
-            .expect("asks poisoned")
-            .iter()
-            .map(|a| a.session_id.clone())
-            .collect();
-        let ready = sessions.iter().any(|sid| match sid {
-            None => true, // unmatched ask: nothing to defer to.
-            Some(id) => {
-                let pids = terminal_pids
-                    .iter()
-                    .find(|(t, _)| t == id)
-                    .map(|(_, p)| p.as_slice())
-                    .unwrap_or(&[]);
-                !foreground::session_is_foreground(pids, &fg)
+        run_on_main(&self.app, |app| {
+            if let Err(err) = windows::show_ask_window(app) {
+                tracing::warn!(error = %err, "failed to surface ask window");
             }
         });
-        if ready {
-            run_on_main(&self.app, |app| {
-                if let Err(err) = windows::show_ask_window(app) {
-                    tracing::warn!(error = %err, "failed to surface ask window (R-17.2)");
-                }
-            });
-        }
     }
 
     // --- toast firing ------------------------------------------------------
@@ -1278,20 +1256,23 @@ impl Shell {
 
         self.push_state();
 
-        // R-17.2: if the matched session's terminal is the foreground window,
-        // the ask window does NOT auto-appear (the ask stays queued + mirrored in
-        // the popup, surfacing as soon as focus leaves — see `maybe_surface_asks`
-        // + the 2s poll) and the alert toast is suppressed. Otherwise the
-        // always-on-top ask window comes up (never steals focus; R-8.3).
+        // §50: an `ask_user` question has NO terminal representation (unlike a
+        // native AskUserQuestion, which the user answers in the terminal), so the
+        // always-on-top ask window ALWAYS surfaces — even when the asking
+        // session's terminal is the foreground window — otherwise the question is
+        // invisible and unanswerable. It never steals focus (R-8.3).
+        run_on_main(&self.app, |app| {
+            if let Err(err) = windows::show_ask_window(app) {
+                tracing::warn!(error = %err, "failed to show ask window");
+            }
+        });
+        // R-17.2: only the redundant alert TOAST stays focus-suppressed — when the
+        // asking session's terminal is already the foreground window, the
+        // always-on-top window is enough and a toast on top is noise.
         let terminal_foreground = self.session_foreground(session_id.as_deref());
         if terminal_foreground {
-            tracing::debug!(ask_id = %ask_id, "ask suppressed: session terminal is foreground (R-17.2)");
+            tracing::debug!(ask_id = %ask_id, "ask toast suppressed: session terminal is foreground (R-17.2)");
         } else {
-            run_on_main(&self.app, |app| {
-                if let Err(err) = windows::show_ask_window(app) {
-                    tracing::warn!(error = %err, "failed to show ask window");
-                }
-            });
             // R-8.4: alert toast, exempt from throttle/toggles (but R-17.2 applies).
             let toast_project = project
                 .or_else(|| req.context.as_deref().map(basename))
@@ -2181,10 +2162,11 @@ fn run_engine(shell: Arc<Shell>) {
             run_tick(&shell);
         }
 
-        // R-17.1/R-17.2: every 2s, re-surface any queued ask whose session's
-        // terminal is no longer the foreground window. Gated on there being a
-        // pending ask so the foreground sampler (a powershell spawn on Windows)
-        // never runs when there is nothing to un-suppress.
+        // §50: every 2s, re-surface the ask window if it is hidden while an ask
+        // is still pending (e.g. an app-restart-recovered ask, or one whose window
+        // was closed). Gated on there being a pending ask so it is a cheap no-op
+        // when the queue is empty. (Asks are no longer focus-suppressed — an
+        // ask_user question has no terminal UI, so its window always shows.)
         if last_foreground.elapsed() >= FOREGROUND_POLL {
             last_foreground = Instant::now();
             if !shell.asks_empty() {

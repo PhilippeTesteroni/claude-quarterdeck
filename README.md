@@ -1,6 +1,19 @@
+<div align="center">
+
+<img src="docs/hero.png" alt="Quarterdeck — a command bridge watching over a fleet of Claude Code agents" width="100%">
+
 # Quarterdeck
 
 **The deck from which the captain commands the ship.**
+
+*A Windows + macOS tray app that watches every Claude Code session on your machine, and lets your agents reach back.*
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-D97757.svg)](LICENSE)
+&nbsp;![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-3a3a3a)
+&nbsp;![Built with Tauri v2](https://img.shields.io/badge/built%20with-Tauri%20v2-D97757)
+&nbsp;[![CI](https://github.com/philippgross/quarterdeck/actions/workflows/ci.yml/badge.svg)](https://github.com/philippgross/quarterdeck/actions/workflows/ci.yml)
+
+</div>
 
 Quarterdeck is a Windows + macOS tray app that watches every **Claude Code**
 session running on your machine, shows a live, glanceable status for each one,
@@ -112,7 +125,20 @@ toast and a distinct, harder-to-miss "needs you" alert.
   the `127.0.0.1` MCP endpoint your own agents talk to. See
   [Privacy](#privacy).
 
-![Watch line + fleet rows, light theme](docs/screenshots/popup-light.png)
+![Watch line + fleet rows: one session waiting, one working with a subagent badge, the rest idle](docs/screenshots/popup-waiting-dark.png)
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/screenshots/lamp-dark.png" alt="Collapsed lamp mode — a single status pie for the whole fleet"><br>
+<sub><b>Lamp mode.</b> Pin the popup, then collapse it to a tiny traffic-light lamp: one pie of your fleet's status mix, always on top, out of the way.</sub>
+</td>
+<td width="50%" valign="top">
+<img src="docs/screenshots/context-menu-dark.png" alt="Per-row context menu — copy session id, rename, reset name, remove row, kill process"><br>
+<sub><b>Per-row actions.</b> Right-click any session to rename it, copy its id, drop the row, or kill the process.</sub>
+</td>
+</tr>
+</table>
 
 ## Install
 
