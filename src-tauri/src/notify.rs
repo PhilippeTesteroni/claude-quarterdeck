@@ -724,6 +724,7 @@ impl<R: Runtime> DesktopNotifier<R> {
     /// exposes no click callback. Used on Linux (§13 non-goal) and as the
     /// Windows/macOS fallback when the native click-routing path can't fire
     /// (R-9.1/9.2/9.3). Attaches the red alert icon for alert kinds (R-9.2).
+    #[allow(dead_code)]
     fn fire_via_plugin(&self, kind: ToastKind, title: &str, body: &str, sound: &str) {
         let mut builder = self
             .app

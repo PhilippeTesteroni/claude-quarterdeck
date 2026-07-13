@@ -698,10 +698,10 @@ fn ask_screen_max_height(ask: &WebviewWindow, scale: f64) -> Option<f64> {
 /// of its top-left via the shared [`clamp_rect_onto_work_area`] geometry. Missing
 /// monitor info (headless CI) leaves the window where it is.
 fn clamp_ask_onto_screen(ask: &WebviewWindow) -> Result<(), String> {
-    let monitor = ask
-        .current_monitor()
-        .map_err(|err| err.to_string())?
-        .or(ask.primary_monitor().map_err(|err| err.to_string())?);
+    let monitor =
+        ask.current_monitor()
+            .map_err(|err| err.to_string())?
+            .or(ask.primary_monitor().map_err(|err| err.to_string())?);
     let Some(monitor) = monitor else {
         return Ok(());
     };
