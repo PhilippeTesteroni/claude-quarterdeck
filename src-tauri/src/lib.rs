@@ -2471,9 +2471,11 @@ fn resolve_hooks_src(app: &AppHandle<Wry>) -> Option<PathBuf> {
         }
     }
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join("hooks");
-        if has_hook_scripts(&p) {
-            return Some(p);
+        for sub in ["hooks", "_up_/hooks"] {
+            let p = res.join(sub);
+            if has_hook_scripts(&p) {
+                return Some(p);
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -2674,9 +2676,11 @@ fn resolve_skill_src(app: &AppHandle<Wry>) -> Option<PathBuf> {
         }
     }
     if let Ok(res) = app.path().resource_dir() {
-        let p = res.join("skills").join("quarterdeck");
-        if p.join("SKILL.md").exists() {
-            return Some(p);
+        for sub in ["skills/quarterdeck", "_up_/skills/quarterdeck"] {
+            let p = res.join(sub);
+            if p.join("SKILL.md").exists() {
+                return Some(p);
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
