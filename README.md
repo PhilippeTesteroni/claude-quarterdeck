@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/hero.png" alt="Quarterdeck: a command bridge watching over a fleet of Claude Code agents" width="100%">
+<img src="docs/hero.jpg" alt="Quarterdeck: a command bridge watching over a fleet of Claude Code agents" width="100%">
 
 # Quarterdeck
 
