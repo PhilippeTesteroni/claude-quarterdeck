@@ -560,16 +560,22 @@ function renderPerm(perm: PermRow, sessions: SessionRow[]): void {
   // it locally. An identity tag flags the expired state.
   const expired = perm.expiresAt !== undefined && Date.now() >= perm.expiresAt;
 
+  // R-35.1 / §49: an AskUserQuestion arriving through the permission channel is a
+  // question, not a permission-to-run. It can't be answered here (the hook only
+  // returns allow/deny/defer, never the user's choice) — so it shows NO Allow,
+  // only "In terminal" (defer) + Deny + a hint, and its identity tag reads
+  // "asking you" rather than the generic "requests permission".
+  const isQuestion = perm.toolName === 'AskUserQuestion';
+
   const identity = h('div', { className: 'qd-ask-identity qd-perm-identity' }, [
     dot,
-    h('span', { className: 'qd-ask-identity-project' }, [label]),
-    h('span', { className: 'qd-perm-tag mono' }, [expired ? 'expired' : 'requests permission']),
+    h('span', { className: 'qd-ask-identity-project' }, [
+      label,
+    ]),
+    h('span', { className: 'qd-perm-tag mono' }, [
+      expired ? 'expired' : isQuestion ? 'asking you' : 'requests permission',
+    ]),
   ]);
-
-  // R-35.1: an AskUserQuestion arriving through the permission channel can't be
-  // answered here (the hook only returns allow/deny/defer, never the user's
-  // choice) — so it shows NO Allow, only "In terminal" (defer) + Deny + a hint.
-  const isQuestion = perm.toolName === 'AskUserQuestion';
 
   const deny = h(
     'button',

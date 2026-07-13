@@ -594,9 +594,13 @@ function renderPermMirrorRow(perm: PermRow): HTMLElement {
   return h('div', { className: 'qd-ask-row qd-perm-row', onclick: reopenAskWindowUnlessInteractive }, [
     h('div', { className: 'qd-ask-row-head' }, [
       h('span', { className: 'qd-ask-row-agent' }, [agent]),
-      h('span', { style: 'color:var(--muted)' }, [expired ? 'expired' : 'requests permission']),
+      h('span', { style: 'color:var(--muted)' }, [
+        expired ? 'expired' : perm.toolName === 'AskUserQuestion' ? 'asking you' : 'requests permission',
+      ]),
     ]),
-    h('div', { className: 'qd-ask-row-question qd-perm-row-tool' }, [`Run ${perm.toolName}?`]),
+    h('div', { className: 'qd-ask-row-question qd-perm-row-tool' }, [
+      perm.toolName === 'AskUserQuestion' ? 'Claude is asking a question' : `Run ${perm.toolName}?`,
+    ]),
     h('div', { className: 'qd-ask-row-actions' }, [
       allow,
       deny,

@@ -76,8 +76,10 @@ function Invoke-QuarterdeckPerm {
     if ($Payload.PSObject.Properties.Name -contains 'tool_name') {
         $toolName = [string]$Payload.tool_name
     }
-    # tool_input serialized to compact JSON, then truncated to 2KB (R-16.1 cap).
-    # Compact (-Compress) packs far more real content under the 2KB cap than the
+    # tool_input serialized to compact JSON, then truncated to 16KB (R-16.1 cap,
+    # raised from 2KB in §49 so a multi-question AskUserQuestion stays valid JSON
+    # and the deck renders it structured instead of falling back to a raw blob).
+    # Compact (-Compress) packs far more real content under the cap than the
     # indented form did, so the truncation now rarely lands mid-JSON; the deck
     # re-indents the parsed blob for the modal (R-16.2 §28). A blob that still
     # overflows is truncated and kept verbatim deck-side (never re-structured).
@@ -85,8 +87,8 @@ function Invoke-QuarterdeckPerm {
     if ($Payload.PSObject.Properties.Name -contains 'tool_input') {
         try { $toolInput = $Payload.tool_input | ConvertTo-Json -Depth 20 -Compress } catch { $toolInput = '' }
     }
-    if ($null -ne $toolInput -and $toolInput.Length -gt 2048) {
-        $toolInput = $toolInput.Substring(0, 2048)
+    if ($null -ne $toolInput -and $toolInput.Length -gt 16384) {
+        $toolInput = $toolInput.Substring(0, 16384)
     }
     $sessionId = $null
     if ($Payload.PSObject.Properties.Name -contains 'session_id') { $sessionId = [string]$Payload.session_id }

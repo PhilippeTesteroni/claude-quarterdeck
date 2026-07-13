@@ -111,11 +111,12 @@ try:
 except Exception:
     sys.exit(1)
 ti = p.get("tool_input")
-# Indented (pretty-printed) JSON per R-16.2, capped to 2KB (R-16.1). Pretty-print
+# Indented (pretty-printed) JSON per R-16.2, capped to 16KB (R-16.1, raised from
+# 2KB in §49 so a multi-question AskUserQuestion stays valid). Pretty-print
 # BEFORE the cap so an over-length input stays indented up to the cut.
 ti = json.dumps(ti, indent=2, ensure_ascii=False) if ti is not None else ""
-if len(ti) > 2048:
-    ti = ti[:2048]
+if len(ti) > 16384:
+    ti = ti[:16384]
 rec = {"v": 1, "kind": "perm", "tool_name": p.get("tool_name") or "", "tool_input": ti, "session_id": p.get("session_id"), "cwd": p.get("cwd"), "receivedAt": recv}
 open(tmp, "w", encoding="utf-8").write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))'
     if command -v python3 >/dev/null 2>&1 &&
@@ -131,7 +132,7 @@ open(tmp, "w", encoding="utf-8").write(json.dumps(rec, separators=(",", ":"), en
         if ! printf '%s' "$payload" | jq -c --arg recv "$recv" '{
             v: 1, kind: "perm",
             tool_name: (.tool_name // ""),
-            tool_input: ((.tool_input | if . == null then "" else tojson end)[0:2048]),
+            tool_input: ((.tool_input | if . == null then "" else tojson end)[0:16384]),
             session_id: .session_id,
             cwd: .cwd,
             receivedAt: $recv

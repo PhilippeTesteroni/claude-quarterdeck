@@ -140,6 +140,8 @@ test.describe('permission requests', () => {
 
     await expect(page.locator('.qd-perm')).toHaveCount(1);
     await expect(page.locator('.qd-perm-tool')).toHaveText('Claude is asking a question');
+    // §49: the identity tag reads "asking you", not the generic "requests permission".
+    await expect(page.locator('.qd-perm-tag')).toHaveText('asking you');
     // The read-only question block: header + question + numbered options.
     await expect(page.locator('.qd-ask-q-header')).toHaveText('Deployment');
     await expect(page.locator('.qd-perm-q-question')).toHaveText('Which environment should I deploy to?');

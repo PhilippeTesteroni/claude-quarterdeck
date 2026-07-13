@@ -476,9 +476,12 @@ fn ask_to_row(ask: &ShellAsk) -> AskRow {
     }
 }
 
-/// Display cap for the perm modal's `tool_input` (SPEC R-16.1 "truncated to
-/// 2KB" / R-16.5 length caps). Applied in grapheme units after bidi-stripping.
-const PERM_INPUT_CAP: usize = 2048;
+/// Display cap for the perm modal's `tool_input` (SPEC R-16.1 / R-16.5 length
+/// caps). Applied in grapheme units after bidi-stripping. Raised from 2KB to
+/// 16KB in §49 (in tandem with the hook's byte cap) so a multi-question
+/// `AskUserQuestion` stays valid JSON and renders structured (R-35.1) instead
+/// of overflowing into the raw-blob fallback.
+const PERM_INPUT_CAP: usize = 16384;
 /// Display cap for a tool name (defence in depth; real names are short).
 const PERM_TOOL_NAME_CAP: usize = 200;
 /// SPEC R-32.1: a pending perm's lifetime. The `PermissionRequest` hook that

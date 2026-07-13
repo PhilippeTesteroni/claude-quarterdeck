@@ -281,12 +281,12 @@ fn permission_request_times_out_fail_open_and_writes_perm_file() {
     assert_eq!(v["kind"], "perm");
     assert_eq!(v["tool_name"], "Bash");
     assert_eq!(v["session_id"], "perm-sess-1");
-    // tool_input is serialized as a JSON string (pretty-printed on the ps1/python
-    // paths, compact on the jq fallback — the deck re-indents for display via
-    // pretty_tool_input, R-16.2), capped to 2KB (R-16.1).
+    // tool_input is serialized as a JSON string (compact on the ps1/jq paths,
+    // pretty on the python path — the deck re-indents for display via
+    // pretty_tool_input, R-16.2), capped to 16KB (R-16.1, raised from 2KB in §49).
     let ti = v["tool_input"].as_str().expect("tool_input is a string");
     assert!(ti.contains("rm -rf ./build"), "tool_input preserved: {ti}");
-    assert!(ti.len() <= 2048);
+    assert!(ti.len() <= 16384);
     // A perm never spools.
     assert!(spool_json_files(&data).is_empty(), "perm does not spool");
 
