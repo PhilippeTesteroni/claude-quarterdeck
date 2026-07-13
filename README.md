@@ -43,6 +43,16 @@ Quarterdeck builds the return trip. An agent that can reach a human at the exact
 <table>
 <tr>
 <td width="50%" align="center" valign="top">
+<img src="docs/screenshots/permission-dark.png" alt="Permission takeover modal: Run Bash? with the command rendered and Allow / Deny / In terminal buttons" width="360"><br>
+<sub><b>Permission takeover.</b> Answer a tool-permission prompt from the deck: Allow, Deny, or fall back to the terminal. Fail-open, so it can never leave an agent stuck.</sub>
+</td>
+<td width="50%" align="center" valign="top">
+<img src="docs/screenshots/toast-dark.png" alt="Native attention toast: quarterdeck asks how to handle orphaned records found by a migration" width="360"><br>
+<sub><b>Native notifications.</b> A quiet toast when a session finishes, a distinct alert-styled one when it needs you.</sub>
+</td>
+</tr>
+<tr>
+<td width="50%" align="center" valign="top">
 <img src="docs/screenshots/lamp-dark.png" alt="Collapsed lamp mode: a single status pie for the whole fleet" width="120"><br>
 <sub><b>Lamp mode.</b> Pin the popup, then collapse it to a tiny traffic-light lamp: one pie of your fleet's status mix, always on top.</sub>
 </td>
@@ -121,7 +131,7 @@ Once enabled, any Claude Code session on the machine can call:
 
 While a question is blocked, Quarterdeck keeps the MCP connection alive with a heartbeat so long or indefinite waits are not dropped by Claude Code's idle timeout. The bundled skill ([`skills/quarterdeck/SKILL.md`](skills/quarterdeck/SKILL.md)) documents the agent side in full.
 
-<p align="center"><img src="docs/screenshots/ask-dark.png" alt="Agent question popup: always-on-top, quick-pick options with keyboard 1 to 9, free-text field" width="400"></p>
+<p align="center"><img src="docs/screenshots/ask-form-dark.png" alt="Agent question popup: a multi-question form with radio options, checkboxes, a free-text field, and In terminal / Dismiss / Submit buttons" width="360"></p>
 
 ## Development / build
 
