@@ -4,8 +4,8 @@ use std::fs;
 
 use deck_core::naming::{
     derive_title, extract_ai_title, normalize_title, project_name, strip_bidi_controls,
-    title_from_sources, title_full, title_with_override, transcript_cwd, transcript_first_user_text,
-    NO_TITLE, UNKNOWN_PROJECT,
+    title_from_sources, title_full, title_with_override, transcript_cwd,
+    transcript_first_user_text, NO_TITLE, UNKNOWN_PROJECT,
 };
 use tempfile::tempdir;
 
@@ -83,14 +83,33 @@ fn s34_each_rung_wins_in_order() {
     );
     // 5. session_title, 6. prompt, 7. fallback each surface in turn.
     assert_eq!(
-        full(None, None, None, None, Some("session"), Some("prompt"), Some("fallback")),
+        full(
+            None,
+            None,
+            None,
+            None,
+            Some("session"),
+            Some("prompt"),
+            Some("fallback")
+        ),
         "session"
     );
     assert_eq!(
-        full(None, None, None, None, None, Some("prompt"), Some("fallback")),
+        full(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("prompt"),
+            Some("fallback")
+        ),
         "prompt"
     );
-    assert_eq!(full(None, None, None, None, None, None, Some("fallback")), "fallback");
+    assert_eq!(
+        full(None, None, None, None, None, None, Some("fallback")),
+        "fallback"
+    );
     // Nothing at all → placeholder.
     assert_eq!(full(None, None, None, None, None, None, None), NO_TITLE);
 }
@@ -145,7 +164,10 @@ fn extract_ai_title_survives_cyrillic_and_json_escapes() {
 #[test]
 fn extract_ai_title_missing_null_and_empty_yield_none() {
     // No aiTitle key at all.
-    assert_eq!(extract_ai_title(b"{\"type\":\"user\",\"content\":\"hi\"}"), None);
+    assert_eq!(
+        extract_ai_title(b"{\"type\":\"user\",\"content\":\"hi\"}"),
+        None
+    );
     // Explicit null.
     assert_eq!(extract_ai_title(b"{\"aiTitle\":null}"), None);
     // Empty / whitespace-only value.
@@ -153,7 +175,10 @@ fn extract_ai_title_missing_null_and_empty_yield_none() {
     assert_eq!(extract_ai_title(b"{\"aiTitle\":\"   \"}"), None);
     // A later null does NOT clobber an earlier real title (scan skips it).
     let body = "{\"aiTitle\":\"Real name\"}\n{\"aiTitle\":null}";
-    assert_eq!(extract_ai_title(body.as_bytes()).as_deref(), Some("Real name"));
+    assert_eq!(
+        extract_ai_title(body.as_bytes()).as_deref(),
+        Some("Real name")
+    );
 }
 
 #[test]

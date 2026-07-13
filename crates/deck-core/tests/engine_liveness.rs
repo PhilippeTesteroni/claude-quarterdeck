@@ -312,7 +312,14 @@ fn stale_reordered_session_end_does_not_report_gone() {
     // previous incarnation of a reused id and is ignored (R-2.5) — it must NOT
     // report the live session as gone (that would wrongly cancel its asks).
     let (mut s, _c) = store_at(T0);
-    s.on_event(&session_start_full("a", "/p", None, Some(1), None, T0 + 100));
+    s.on_event(&session_start_full(
+        "a",
+        "/p",
+        None,
+        Some(1),
+        None,
+        T0 + 100,
+    ));
     let _ = s.take_gone_sessions();
     // End stamped BEFORE this incarnation's start → ignored.
     s.on_event(&session_end("a", "clear", T0 + 50));

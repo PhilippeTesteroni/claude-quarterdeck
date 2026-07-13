@@ -207,7 +207,7 @@ fn registry_idle_demotes_esc_wedged_working() {
     let (mut store, clock) = store_at(T0);
     store.on_event(&session_start("s", "/p", T0));
     store.on_event(&prompt("s", "go", T0 + 10)); // hook working, last activity T0+10
-    // Registry was busy while the turn genuinely ran.
+                                                 // Registry was busy while the turn genuinely ran.
     clock.set(T0 + 1_000);
     store.apply_registry(&[busy_entry("s", T0 + 1_000)]);
     assert_eq!(store.status_of("s"), Some(Status::Working));
@@ -279,7 +279,7 @@ fn fresher_hook_prompt_is_not_clobbered_by_a_stale_idle_registry() {
     // `working` after the registry went idle wins.
     let (mut store, clock) = store_at(T0);
     store.on_event(&session_start("s", "/p", T0)); // hook idle
-    // Registry reports idle at T0+100 (harmless: hook is already idle).
+                                                   // Registry reports idle at T0+100 (harmless: hook is already idle).
     clock.set(T0 + 100);
     store.apply_registry(&[idle_entry("s", T0 + 100)]);
     // A genuine new turn starts AFTER that registry write.
@@ -330,7 +330,7 @@ fn reverse_gear_recovery_promoted_row_is_owned_by_transcript_not_registry() {
         T0,
     ));
     store.on_event(&stop("s", T0 + 10)); // hook idle at T0+10
-    // Transcript advances ≥2 s past the idle anchor → §30 promotes to working.
+                                         // Transcript advances ≥2 s past the idle anchor → §30 promotes to working.
     clock.set(T0 + 20_000);
     store.poll_recovery(|_| Some(T0 + 13_000));
     assert_eq!(store.status_of("s"), Some(Status::Working));

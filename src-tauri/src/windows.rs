@@ -950,7 +950,11 @@ mod tests {
         // SPEC §39: a negative origin (off the top-left, e.g. after a monitor
         // arrangement change) snaps back to the work-area corner.
         let (x, y) = clamp_rect_onto_work_area((-40, -30), POPUP_SIZE, WORK_AREA);
-        assert_eq!((x, y), (0, 0), "negative origin clamps to the work-area top-left");
+        assert_eq!(
+            (x, y),
+            (0, 0),
+            "negative origin clamps to the work-area top-left"
+        );
     }
 
     #[test]
@@ -960,7 +964,11 @@ mod tests {
         // reachable) rather than clamping it to a negative value.
         let oversized = (WORK_AREA.1 .0 + 200, WORK_AREA.1 .1 + 200);
         let (x, y) = clamp_rect_onto_work_area((500, 500), oversized, WORK_AREA);
-        assert_eq!((x, y), (0, 0), "oversized window pins its origin to the work-area corner");
+        assert_eq!(
+            (x, y),
+            (0, 0),
+            "oversized window pins its origin to the work-area corner"
+        );
     }
 
     #[test]

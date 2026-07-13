@@ -178,8 +178,7 @@ fn record_tray_state_for_tests(status: TrayStatus, counts: &Counts) {
 /// "Quarterdeck — 1 needs you · 2 working · 1 idle", or "Quarterdeck — no
 /// sessions" when the fleet is empty.
 pub fn tooltip_for(counts: &Counts) -> String {
-    let total =
-        counts.attention + counts.working + counts.waiting + counts.idle + counts.dead;
+    let total = counts.attention + counts.working + counts.waiting + counts.idle + counts.dead;
     if total == 0 {
         return "Quarterdeck — no sessions".to_string();
     }

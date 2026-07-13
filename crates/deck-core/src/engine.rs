@@ -450,9 +450,7 @@ impl Session {
     /// Returns whether the shown status changed. Not a real `Stop`, so — like the
     /// §30 reverse-gear demote — it does NOT freeze the §36 working-time timer.
     fn maybe_registry_demote(&mut self, now: u64) -> bool {
-        if self.hook_status != Status::Working
-            || self.recovery_promoted
-            || !self.registry_quiescent
+        if self.hook_status != Status::Working || self.recovery_promoted || !self.registry_quiescent
         {
             return false;
         }
@@ -724,7 +722,9 @@ impl SessionStore {
     /// `UserPromptSubmit`), or `None`. For tests/tools.
     #[must_use]
     pub fn work_started_ms_of(&self, session_id: &str) -> Option<u64> {
-        self.sessions.get(session_id).and_then(|s| s.work_started_ms)
+        self.sessions
+            .get(session_id)
+            .and_then(|s| s.work_started_ms)
     }
 
     /// §36: frozen total working time of the just-finished turn, or `None`. For
@@ -772,7 +772,12 @@ impl SessionStore {
             .filter(|s| !s.is_empty())
             .map(naming::normalize_title);
         let map_changed = match &normalized {
-            Some(n) => self.overrides.insert(session_id.to_string(), n.clone()).as_deref() != Some(n.as_str()),
+            Some(n) => {
+                self.overrides
+                    .insert(session_id.to_string(), n.clone())
+                    .as_deref()
+                    != Some(n.as_str())
+            }
             None => self.overrides.remove(session_id).is_some(),
         };
         if map_changed {
@@ -886,11 +891,14 @@ impl SessionStore {
         // override for its id (computed before the mutable `entry` borrow; only
         // consumed when the entry is actually vacant).
         let seed_override = self.overrides.get(&ev.session_id).cloned();
-        let session = self.sessions.entry(ev.session_id.clone()).or_insert_with(|| {
-            let mut s = Session::new(ev.session_id.clone(), ts);
-            s.override_name = seed_override;
-            s
-        });
+        let session = self
+            .sessions
+            .entry(ev.session_id.clone())
+            .or_insert_with(|| {
+                let mut s = Session::new(ev.session_id.clone(), ts);
+                s.override_name = seed_override;
+                s
+            });
 
         // Common payload fields update whenever present (never blanked by absence).
         if let Some(cwd) = &ev.cwd {
@@ -1640,9 +1648,7 @@ impl SessionStore {
     pub fn terminal_pids(&self) -> Vec<(String, Vec<u32>)> {
         self.sessions
             .values()
-            .filter_map(|s| {
-                s.claude_pid.map(|pid| (s.id.clone(), vec![pid]))
-            })
+            .filter_map(|s| s.claude_pid.map(|pid| (s.id.clone(), vec![pid])))
             .collect()
     }
 

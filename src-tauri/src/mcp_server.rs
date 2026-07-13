@@ -766,7 +766,10 @@ fn ask_user_sse(state: &AppState, id: Value, args: &Value, token: Value) -> Resp
     // so it needs the gateway handle.
     let gateway = state.gateway.clone();
     tokio::spawn(async move {
-        let final_msg = drive_ask(rx, timeout, interval, &id, &ask_id, &token, &tx_ev, &gateway).await;
+        let final_msg = drive_ask(
+            rx, timeout, interval, &id, &ask_id, &token, &tx_ev, &gateway,
+        )
+        .await;
         let _ = tx_ev
             .send(Ok(Event::default().data(final_msg.to_string())))
             .await;
@@ -1840,10 +1843,22 @@ mod tests {
         ]});
         let req2 = parse_ask_request(&json!(2), &args2).unwrap();
         let qs2 = req2.questions.as_ref().unwrap();
-        assert_eq!(qs2[0].options.len(), MAX_OPTIONS_PER_QUESTION, "options clamped to 12");
-        assert_eq!(qs2[1].header.as_deref(), Some("H"), "bidi stripped from header");
+        assert_eq!(
+            qs2[0].options.len(),
+            MAX_OPTIONS_PER_QUESTION,
+            "options clamped to 12"
+        );
+        assert_eq!(
+            qs2[1].header.as_deref(),
+            Some("H"),
+            "bidi stripped from header"
+        );
         assert_eq!(qs2[1].question, "spoof?", "bidi stripped from question");
-        assert_eq!(qs2[1].options, ["a"], "bidi stripped + blank option dropped");
+        assert_eq!(
+            qs2[1].options,
+            ["a"],
+            "bidi stripped + blank option dropped"
+        );
         // 200-cap keeps 199 chars + the ellipsis.
         assert_eq!(qs2[2].question.chars().count(), MAX_QUESTION_CHARS);
         assert!(qs2[2].question.ends_with('…'));
@@ -1856,7 +1871,9 @@ mod tests {
         // not enough.
         assert!(parse_ask_request(&json!(1), &json!({})).is_err());
         assert!(parse_ask_request(&json!(1), &json!({ "questions": [] })).is_err());
-        assert!(parse_ask_request(&json!(1), &json!({ "questions": [{ "question": "  " }] })).is_err());
+        assert!(
+            parse_ask_request(&json!(1), &json!({ "questions": [{ "question": "  " }] })).is_err()
+        );
         // But an empty top-level `question` WITH a valid form is fine.
         assert!(parse_ask_request(
             &json!(1),

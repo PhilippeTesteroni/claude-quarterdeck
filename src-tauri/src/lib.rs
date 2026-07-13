@@ -3425,7 +3425,10 @@ mod tests {
         let valid = pretty_tool_input("{\"question\":\"It\\u0027s fine\"}");
         let v: serde_json::Value = serde_json::from_str(&valid).unwrap();
         assert_eq!(v["question"], "It's fine");
-        assert!(valid.contains('\n'), "valid input pretty-printed: {valid:?}");
+        assert!(
+            valid.contains('\n'),
+            "valid input pretty-printed: {valid:?}"
+        );
     }
 
     #[test]

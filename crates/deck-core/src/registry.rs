@@ -334,9 +334,11 @@ mod tests {
     #[test]
     fn name_source_is_parsed_and_defaults_to_none() {
         // Explicit derived source is carried through.
-        let derived =
-            parse_entry(br#"{"sessionId":"s","name":"phily-42","nameSource":"derived"}"#, None)
-                .unwrap();
+        let derived = parse_entry(
+            br#"{"sessionId":"s","name":"phily-42","nameSource":"derived"}"#,
+            None,
+        )
+        .unwrap();
         assert_eq!(derived.name_source.as_deref(), Some("derived"));
         // Absent nameSource → None (the derived default is inferred app-side).
         let absent = parse_entry(br#"{"sessionId":"s","name":"phily-42"}"#, None).unwrap();

@@ -38,7 +38,10 @@ fn s34_ai_title_is_the_default_over_the_derived_registry_handle() {
     // The aiTitle now supersedes it.
     let changed = s.set_ai_title("a", Some("Работа над поиском работы".to_string()));
     assert!(changed, "aiTitle changed the display title");
-    assert_eq!(s.title_of("a").as_deref(), Some("Работа над поиском работы"));
+    assert_eq!(
+        s.title_of("a").as_deref(),
+        Some("Работа над поиском работы")
+    );
 }
 
 #[test]
@@ -97,7 +100,14 @@ fn s34_ai_title_survives_a_registry_name_vanishing() {
     // When the registry file vanishes, the derived name clears but the aiTitle
     // remains the default (it is not registry-sourced).
     let (mut s, _c) = store_at(T0);
-    s.on_event(&session_start_full("a", "/p", Some("/p/t.jsonl"), Some(42), None, T0));
+    s.on_event(&session_start_full(
+        "a",
+        "/p",
+        Some("/p/t.jsonl"),
+        Some(42),
+        None,
+        T0,
+    ));
     s.apply_registry(&[reg_named("a", "phily-9", "derived")]);
     s.set_ai_title("a", Some("Chat name".to_string()));
     assert_eq!(s.title_of("a").as_deref(), Some("Chat name"));
@@ -187,7 +197,14 @@ fn session_end_prunes_the_override_and_marks_the_map_dirty() {
     // R-27.6: a reused id never inherits a stale name — SessionEnd drops it from
     // the map (and flags a re-persist).
     let (mut s, _c) = store_at(T0);
-    s.on_event(&session_start_full("a", "/p", None, None, Some("Title"), T0));
+    s.on_event(&session_start_full(
+        "a",
+        "/p",
+        None,
+        None,
+        Some("Title"),
+        T0,
+    ));
     s.set_override_name("a", Some("Renamed".to_string()));
     assert_eq!(s.override_name_of("a").as_deref(), Some("Renamed"));
     let _ = s.take_overrides_dirty();
@@ -218,5 +235,8 @@ fn set_override_name_flags_the_map_dirty_for_persistence() {
     assert!(s.take_overrides_dirty());
     // And the snapshot exposes it for the on-disk write.
     s.set_override_name("a", Some("Y".to_string()));
-    assert_eq!(s.overrides_snapshot().get("a").map(String::as_str), Some("Y"));
+    assert_eq!(
+        s.overrides_snapshot().get("a").map(String::as_str),
+        Some("Y")
+    );
 }
