@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Philipp Gross"]
 license = "MIT"
-repository = "https://github.com/philippgross/quarterdeck"
+repository = "https://github.com/PhilippeTesteroni/claude-quarterdeck"
 
 [profile.release]
 # Keep the packaged binary lean.

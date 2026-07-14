@@ -1,10 +1,10 @@
-# Quarterdeck — Specification v1.0 (LOCKED 2026-07-02)
+# Quarterdeck — Specification v1.0
 
 **Quarterdeck** — the deck from which the captain commands the ship. A cross-platform (Windows + macOS) tray/menubar app that monitors every running **Claude Code** session on the machine, shows live statuses, fires native notifications when an agent finishes or needs a human — and lets agents **ask the user questions** through an always-on-top popup, with the answer routed back into the session via MCP.
 
-This spec is locked; the canonical locked copy lives in Notion, this file mirrors it for the repo and implementation agents. Every implementation task and QA scenario traces to a numbered requirement (`R-*`).
+This document is the reference spec for the implementation. Every behavior and test scenario traces to a numbered requirement (`R-*`).
 
-**Decisions log:** stack = Tauri v2; name = Quarterdeck (GitHub niche verified free 2026-07-02); design = Mission Control, adaptive light/dark, GitHub/Claude-Code-inspired; sounds = system sounds, distinct per type; autostart = ask on first run; ask-feature = **in v1, MCP-first**; click-to-focus terminal = deferred to v2; publish = local until QA passes, then public GitHub (MIT).
+**Key decisions:** stack = Tauri v2; design = Mission Control, adaptive light/dark, GitHub/Claude-Code-inspired; sounds = system sounds, distinct per type; autostart = ask on first run; ask-feature = MCP-first in v1; click-to-focus terminal = deferred to v2; license = MIT.
 
 ---
 
@@ -18,7 +18,7 @@ This spec is locked; the canonical locked copy lives in Notion, this file mirror
 - Native notifications: "finished, awaiting instructions" (standard) and "needs attention" (alert-styled, distinct sound).
 - **Agent questions**: a Claude Code agent calls the `ask_user` MCP tool served by Quarterdeck → always-on-top popup over whatever the user is doing → the answer returns as the tool result. A bundled skill teaches agents when/how to use it.
 
-**Competitive position.** Existing projects (hydropix/claude-deck, XueTianyu24/ClaudeDeck, etc.) are passive Windows-only monitors, all ≤7 stars. Quarterdeck differentiates on: Win+Mac, hook-driven precision (no transcript polling for status), native two-tier notifications, and the interactive ask channel — a monitor you can be *reached through*, not just a dashboard.
+**Position.** Most existing Claude Code monitors are passive and Windows-only. Quarterdeck differentiates on: Win+Mac, hook-driven precision (no transcript polling for status), native two-tier notifications, and the interactive ask channel — a monitor you can be *reached through*, not just a dashboard.
 
 **Non-goals v1** (§13): terminal focusing, subagent rows, Linux, history/analytics, auto-update, code signing, i18n (UI English-only).
 
@@ -85,7 +85,7 @@ Installed into **user-level** `~/.claude/settings.json` (applies to all projects
 
 - **R-5.1** Identity = `session_id`. `/clear` produces `SessionEnd(reason=clear)` + new `SessionStart` — old row removed, new row created (correct by construction).
 - **R-5.2 Title precedence**: `session_title` (SessionStart, when present) → latest `UserPromptSubmit.prompt` (stripped, collapsed, ≤60 chars) → cold-start transcript fallback (first user text line, best-effort guarded parse) → `(no title)`. Row shows `<project> — <title>`, project = basename(cwd).
-- **R-5.3** Cyrillic/Unicode paths MUST work end-to-end (developer's machine has them).
+- **R-5.3** Cyrillic/Unicode paths MUST work end-to-end.
 - **R-5.4 Cold-start discovery**: on startup, after spool replay, scan `~/.claude/projects/*/*.jsonl` (base dir overridable via `QUARTERDECK_CLAUDE_DIR` for tests) with mtime <6 h; unknown sessions get inferred rows: transcript grew <30 s ago → `working` else `idle`, flagged `inferred` (UI shows `~`). No PID → pruned by R-6.2.
 
 ## 6. Liveness
@@ -141,14 +141,14 @@ Installed into **user-level** `~/.claude/settings.json` (applies to all projects
 - **R-10.3** Autostart via tauri-plugin-autostart (Win registry Run key / mac LaunchAgent), toggle in settings.
 - **R-10.4** Logs `<data>/logs/quarterdeck.log`, 1 MB × 3 rotation; `QUARTERDECK_DEBUG=1` → debug level.
 
-## 11. Testing strategy (the QA fleet runs all of this)
+## 11. Testing strategy
 
 - **Rust unit/integration (`cargo test`, bulk of coverage):** every R-2 transition (injectable clock); spool parse/quarantine incl. truncated/garbage/huge files; hooks_config merge/uninstall vs fixtures (missing, empty, foreign hooks, malformed, BOM, CRLF); naming precedence incl. Cyrillic; liveness with fake process table; ask lifecycle (queue, timeout, orphaning); throttle.
 - **Hook script tests (real machine):** pipe fixture stdin → assert spool shape, atomicity, exit 0 on garbage, silence; SessionStart ancestor walk finds a real claude PID; `shellcheck` on the .sh.
 - **UI tests (Playwright against Vite dev server, Tauri IPC mocked):** rows/sorting/watch-line/empty/settings/ask-window flows, light+dark, reduced-motion.
 - **E2E smoke (real built app on this machine):** launch with isolated `QUARTERDECK_DATA_DIR` + `QUARTERDECK_CLAUDE_DIR`; inject synthetic spool events → assert tray icon changes (via test hook), fake-notifier jsonl, screenshot popup. MCP: scripted Node client calls `ask_user`, test answers via `answer_ask` command, asserts returned value.
 - **Live smoke (final):** isolated `CLAUDE_CONFIG_DIR`, real `claude` session → hooks fire, row appears, Stop toast fires; `ask_user` round-trip from a real Claude Code session using the skill.
-- **R-11.1** All green before the app is shown to the user. CI mirrors: fmt, clippy -D warnings, cargo test, UI tests, tauri build artifacts (win+mac, unsigned).
+- **R-11.1** All green before release. CI mirrors: fmt, clippy -D warnings, cargo test, UI tests, tauri build artifacts (win+mac, unsigned).
 
 ## 12. Privacy
 
@@ -160,9 +160,9 @@ Click-to-focus terminal (deliberately deferred); subagent rows (SubagentStart/St
 
 ---
 
-# Spec v1.1 addendum (LOCKED 2026-07-03) — first-user feedback round
+# Spec v1.1 addendum — first-user feedback round
 
-Nine items from Philipp's live dogfooding + agent-side API feedback. Same rules: R-numbers are law, every item gets tests, nothing here weakens v1.0 requirements. Facts verified against official docs 2026-07-03 (PreToolUse/PermissionRequest decision contracts, MCP timeout model) — see docs/hooks-facts.md addendum.
+Nine items from live dogfooding + agent-side API feedback. Same rules: R-numbers are law, every item gets tests, nothing here weakens v1.0 requirements. Facts verified against official docs (PreToolUse/PermissionRequest decision contracts, MCP timeout model) — see docs/hooks-facts.md addendum.
 
 ## 14. Window behavior (items 1, 2, 3)
 
@@ -215,7 +215,7 @@ Nine items from Philipp's live dogfooding + agent-side API feedback. Same rules:
 
 Everything in §11 stays green. New: unit tests for registry parsing (fixtures incl. malformed/missing fields), R-14.3 shrink regression, R-19.2/19.3/19.4/19.5 lifecycle tests (fake clock), perm hook script piped-stdin tests (answer/timeout/fail-open), Playwright specs for pin/drag-region presence/close-X/detail rendering/perm modal, e2e real-app: dismiss round-trip asserting kind=dismissed, persistent ask surviving >6min with keepalive (time-compressed via env knob where possible), and Part C live re-run incl. a REAL permission round-trip (claude asks to run a tool → deck Allow → tool runs; deck Deny → claude sees denial; timeout → terminal dialog appears).
 
-## 21. Background work must show as working (v1.1.1, LOCKED 2026-07-03)
+## 21. Background work must show as working
 
 Found live by the first user: a session waiting on background subagents/workflows shows 🟢 idle (its `Stop` hook fired) while heavy agent work is running. The session registry (§15, R-15.1) reflects this correctly: `status: "busy"` with a fresh `updatedAt` while background children run.
 
@@ -224,7 +224,7 @@ Found live by the first user: a session waiting on background subagents/workflow
 - **R-21.3** No toast on idle→working via override (it is not a user-actionable event); the R-9.1 "finished" toast still fires on the hook-derived Stop even if the override immediately flips the row back to working (the turn DID finish; the user may still want to know). Tray color follows the displayed (overridden) status.
 - **R-21.4** Tests: engine unit tests for override precedence/staleness/reset; registry fixture with busy/idle flips; e2e mock scenario showing badge + yellow row while "background" busy.
 
-## 22. Honest time-in-status for pre-existing sessions (v1.1.1, LOCKED 2026-07-03)
+## 22. Honest time-in-status for pre-existing sessions
 
 Live-found: rows for sessions that were running before Quarterdeck started tick their time-in-status from APP LAUNCH, not from when the agent actually entered that status.
 
@@ -234,7 +234,7 @@ Live-found: rows for sessions that were running before Quarterdeck started tick 
 - **R-22.4 Estimated marker.** Seeded (estimated) times render with the existing inferred "~" convention (e.g. `~12m 40s`) until an exact hook event arrives.
 - **R-22.5 Tests:** discovery seeding precedence (registry vs transcript vs now), estimate→exact upgrade on first hook event, tooltip content.
 
-## 23. Token usage & context health (v1.2, LOCKED 2026-07-03)
+## 23. Token usage & context health
 
 Per-session token telemetry sourced from transcript `usage` records (undocumented internal format — parse defensively, tolerate absence, never crash; a format drift disables the feature for that session with one WARN log, everything else keeps working).
 
@@ -247,14 +247,14 @@ Per-session token telemetry sourced from transcript `usage` records (undocumente
 - **R-23.5 Perf guard.** Usage reading must add no measurable jank: all parsing on the Rust side off the UI thread, ≤1 read per session per change-tick, and the whole feature behind a settings toggle `showTokenStats` (default ON).
 - **R-23.6 Tests:** fixture transcripts (real-shape usage records incl. cache fields and [1m] model ids), incremental append/truncate/rotate cases, window inference, subagent aggregation with cap, UI badge rendering + thresholds (mock), toggle off hides all of it.
 
-## 24. Toast content & identity (v1.2, LOCKED 2026-07-03)
+## 24. Toast content & identity
 
 - **R-24.1 Finished-toast body = the model's last words.** The R-9.1 idle toast body becomes the LAST assistant text message of that session (sourced from the §23 incremental transcript reader: last assistant record's text blocks, joined, whitespace-collapsed, sanitized per R-16.5), truncated to the SAME character budget as today's body. Fallback chain when unavailable (reader off, no text yet, format drift): current behavior (title + "Waiting for new instructions."). The attention/ask toast bodies are unchanged (they already carry the actual message/question).
 - **R-24.2 Toast identity (Windows).** Toasts must be visibly Quarterdeck's, not the host shell's: register the AppUserModelID (`pro.philippgross.quarterdeck`) in HKCU\Software\Classes\AppUserModelId with DisplayName "Quarterdeck" and IconUri = the clay app icon (done at app startup, idempotent, HKCU only — no elevation; removed by Settings → Uninstall hooks → "also remove toast registration" line item and by the NSIS uninstaller). Toast XML uses appLogoOverride with the app icon; the alert class (R-9.2) uses the red-badged variant. Result: header shows "Quarterdeck" + icon in dev AND packaged runs — never "Windows PowerShell".
 - **R-24.3 mac parity** best-effort: bundle identity already provides name/icon in Notification Center; no extra work beyond verifying the bundle icon is set (compile-gated).
 - **R-24.4 Tests:** fake-notifier jsonl gains a `body_source: "assistant"|"fallback"` field asserted in e2e (inject a transcript with a known assistant tail → Stop → body matches); registry-key registration idempotency unit test (HKCU, guarded to test hive via env override); manual demo script extended to visually confirm both toast identities.
 
-## 25. Traffic-light compact mode + onboarding refresh (v1.2, LOCKED 2026-07-03)
+## 25. Traffic-light compact mode + onboarding refresh
 
 - **R-25.1 Lamp mode.** The pinned popup gains a second display mode: a compact frameless always-on-top square (~56x56 logical px) containing one large status lamp = the aggregate worst-of status (same source as the tray icon, R-2.6), with a small count badge of attention-sessions when > 0 (e.g. red lamp + "2"). Working aggregate keeps the soft pulse (reduced-motion respected). Drag anywhere (whole lamp = drag region except the click target).
 - **R-25.2 Mode switching.** Header gains a collapse-to-lamp button (visible only while pinned, next to the pin); click on the lamp (not drag) expands back to the full list IN PLACE (lamp position preserved as the list's top-left; auto-height per R-14.3). Mode + position persist (`popupMode: "list"|"lamp"`, `popupPos`). Unpin while in lamp mode → expand to list + revert to v1.0 tray-anchored behavior.

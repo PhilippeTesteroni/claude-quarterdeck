@@ -4,12 +4,12 @@
 //! expressed through the trait stubs in [`traits`] so the engine can be tested
 //! with fakes (SPEC R-3.2).
 //!
-//! The module bodies below are scaffolded empty by T0 and filled in by later
-//! implementation tasks (see `TASKS.md`):
+//! Module map:
 //!
-//! * [`events`], [`engine`], [`naming`], [`discovery`], [`liveness`] — T1
-//! * [`hooks_config`] — T2
-//! * [`ask`] — engine-side ask lifecycle (T1/T6 seam)
+//! * [`events`], [`engine`], [`naming`], [`discovery`], [`liveness`] — event
+//!   ingestion, the status engine, session naming, cold-start discovery, liveness
+//! * [`hooks_config`] — Claude Code hook install/uninstall
+//! * [`ask`] — engine-side ask lifecycle
 
 pub mod ask;
 pub mod discovery;
