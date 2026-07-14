@@ -39,6 +39,9 @@ impl SpoolWatcher {
                 return;
             }
             for path in event.paths {
+                if !should_forward(&path) {
+                    continue;
+                }
                 let _ = raw_tx.send(path);
             }
         })?;
@@ -75,6 +78,22 @@ impl SpoolWatcher {
 /// be ingested, so dropping `Remove` loses nothing.
 fn is_relevant(kind: &EventKind) -> bool {
     !matches!(kind, EventKind::Access(_) | EventKind::Remove(_))
+}
+
+/// Only actual spool *files* carry data to ingest; never forward a directory.
+///
+/// macOS `FSEvents` reports directory-level changes: writing a child bumps the
+/// watched spool directory's own mtime, so the backend emits an event whose
+/// `paths` include the directory itself alongside the created file. The
+/// Windows/Linux backends report only the child. Forwarding the directory would
+/// hand the engine a path it then reads as a spool file, failing and
+/// spuriously quarantine-logging. We filter by inode type rather than by string
+/// comparison against the watched dir because `FSEvents` returns the realpath
+/// (e.g. `/private/var/…`) which differs from the `/var/…` symlink form the
+/// caller passed. A vanished path reports `is_dir() == false` and is still
+/// forwarded — ingesting a since-removed file is already a documented no-op.
+fn should_forward(path: &Path) -> bool {
+    !path.is_dir()
 }
 
 fn debounce_loop(raw_rx: Receiver<PathBuf>, out_tx: Sender<PathBuf>, debounce: Duration) {
@@ -210,6 +229,23 @@ mod tests {
 
         let _watcher = SpoolWatcher::spawn(&dir, DEFAULT_DEBOUNCE).unwrap();
         assert!(dir.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_forward_skips_directories_but_keeps_files_and_vanished_paths() {
+        // macOS FSEvents reports the watched directory itself alongside the
+        // created child; the directory must never be forwarded as a spool file.
+        let dir = unique_dir("forward");
+        let file = dir.join("event-1.json");
+        fs::write(&file, b"{}").unwrap();
+
+        assert!(!should_forward(&dir), "the watched directory is not a file");
+        assert!(should_forward(&file), "a real spool file is forwarded");
+        // A since-removed file is not a dir, so it is still forwarded; the
+        // engine treats an ingest of a vanished path as a no-op.
+        assert!(should_forward(&dir.join("gone.json")));
 
         let _ = fs::remove_dir_all(&dir);
     }
